@@ -622,6 +622,35 @@ impl TelegramChannel {
     }
 
     /// Wire the shared Config handle so `persist_allowed_identity` can
+    /// Pre-seed voice-chat mode from peer-group static preferences.
+    ///
+    /// Iterates `[peer_groups.*]` entries that reference this channel and
+    /// carry `output_modality = "voice"`, then inserts every `external_peers`
+    /// entry into the `voice_chats` set so TTS fires unconditionally for
+    /// those peers — including cron/proactive messages that have no inbound
+    /// voice note to mirror.
+    pub fn with_voice_peer_prefs(
+        self,
+        config: &zeroclaw_config::schema::Config,
+        channel_type: &str,
+        alias: impl AsRef<str>,
+    ) -> Self {
+        use zeroclaw_config::multi_agent::OutputModality;
+        let alias = alias.as_ref();
+        let dotted = format!("{channel_type}.{alias}");
+        if let Ok(mut vc) = self.voice_chats.lock() {
+            for group in config.peer_groups.values() {
+                let matches = group.channel == channel_type || group.channel == dotted;
+                if matches && group.output_modality == OutputModality::Voice {
+                    for peer in &group.external_peers {
+                        vc.insert(peer.to_string());
+                    }
+                }
+            }
+        }
+        self
+    }
+
     /// write a paired user into `peer_groups` and save. The long-running
     /// daemon sets this from the orchestrator; tests and one-shot
     /// callers leave it unset (pairing works at runtime, doesn't persist).
