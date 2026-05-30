@@ -5920,6 +5920,20 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
         };
+        let channel_key = format!("telegram.{alias}");
+        let agent_transcription_provider = config
+            .agents
+            .values()
+            .filter(|a| a.enabled && a.channels.iter().any(|c| c.as_str() == channel_key))
+            .find_map(|a| {
+                let s = a.transcription_provider.as_str();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            })
+            .unwrap_or_default();
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -5934,6 +5948,7 @@ fn collect_configured_channels(
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
+                .with_agent_transcription_provider(agent_transcription_provider)
                 .with_tts(&config)
                 .with_voice_peer_prefs(&config, "telegram", alias)
                 .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))

@@ -30,6 +30,12 @@ pub trait TtsProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
     /// Synthesize `text` using the given `voice`, returning raw audio bytes.
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>>;
 
+    /// The audio container/format of the bytes returned by
+    /// [`synthesize`](Self::synthesize) (e.g. `"opus"`, `"wav"`, `"mp3"`).
+    /// Channels use this to pick the correct upload MIME type and Telegram
+    /// send method — only `opus`/`ogg` is a true voice note.
+    fn output_format(&self) -> &str;
+
     /// Voices supported by this model_provider.
     fn supported_voices(&self) -> Vec<String>;
 
@@ -103,6 +109,10 @@ impl OpenAiTtsProvider {
 impl TtsProvider for OpenAiTtsProvider {
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn output_format(&self) -> &str {
+        &self.response_format
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
@@ -207,6 +217,11 @@ impl ElevenLabsTtsProvider {
 impl TtsProvider for ElevenLabsTtsProvider {
     fn name(&self) -> &str {
         "elevenlabs"
+    }
+
+    fn output_format(&self) -> &str {
+        // ElevenLabs default output is MP3 (mp3_44100_128).
+        "mp3"
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
@@ -314,6 +329,11 @@ impl GoogleTtsProvider {
 impl TtsProvider for GoogleTtsProvider {
     fn name(&self) -> &str {
         "google"
+    }
+
+    fn output_format(&self) -> &str {
+        // audioConfig.audioEncoding is hard-coded to MP3 below.
+        "mp3"
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
@@ -430,6 +450,11 @@ impl TtsProvider for EdgeTtsProvider {
         "edge"
     }
 
+    fn output_format(&self) -> &str {
+        // edge-tts writes an MP3 temp file (see `--write-media …mp3`).
+        "mp3"
+    }
+
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
         let temp_dir = std::env::temp_dir();
         let output_file = temp_dir.join(format!("zeroclaw_tts_{}.mp3", uuid::Uuid::new_v4()));
@@ -520,6 +545,12 @@ impl PiperTtsProvider {
 impl TtsProvider for PiperTtsProvider {
     fn name(&self) -> &str {
         "piper"
+    }
+
+    fn output_format(&self) -> &str {
+        // Piper's OpenAI-compatible server returns WAV when no response_format
+        // is requested (the body below omits it).
+        "wav"
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
@@ -742,6 +773,19 @@ impl TtsManager {
         names.sort();
         names
     }
+
+    /// Audio output format of the runtime-active agent's resolved TTS provider
+    /// (e.g. `"wav"`, `"opus"`, `"mp3"`). `None` when the agent has no
+    /// `tts_provider` configured or the alias is not registered. Channels use
+    /// this to label the upload with the correct MIME type and pick the right
+    /// Telegram send method.
+    pub fn agent_output_format(&self) -> Option<&str> {
+        let alias = self.agent_tts_provider.as_str();
+        if alias.is_empty() {
+            return None;
+        }
+        self.tts_providers.get(alias).map(|p| p.output_format())
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -950,6 +994,68 @@ mod tests {
         assert_eq!(config.default_voice, "alloy");
         assert_eq!(config.default_format, "mp3");
         assert_eq!(config.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
+    }
+
+    fn config_with_openai_wav_alias() -> Config {
+        let mut cfg = Config::default();
+        cfg.agents.insert(
+            "default".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                tts_provider: "openai.default".into(),
+                ..Default::default()
+            },
+        );
+        cfg.providers.tts.openai.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::OpenAITtsProviderConfig {
+                base: TtsProviderConfig {
+                    api_key: Some("sk-test".to_string()),
+                    response_format: Some("wav".to_string()),
+                    ..TtsProviderConfig::default()
+                },
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn openai_provider_reports_configured_output_format() {
+        let cfg = TtsProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            response_format: Some("wav".to_string()),
+            ..TtsProviderConfig::default()
+        };
+        let provider = OpenAiTtsProvider::new("default", &cfg).unwrap();
+        assert_eq!(provider.output_format(), "wav");
+    }
+
+    #[test]
+    fn openai_provider_defaults_output_format_to_opus() {
+        let cfg = TtsProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            ..TtsProviderConfig::default()
+        };
+        let provider = OpenAiTtsProvider::new("default", &cfg).unwrap();
+        assert_eq!(provider.output_format(), "opus");
+    }
+
+    #[test]
+    fn piper_provider_reports_wav_output_format() {
+        let provider = PiperTtsProvider::new("default", &TtsProviderConfig::default());
+        assert_eq!(provider.output_format(), "wav");
+    }
+
+    #[test]
+    fn agent_output_format_resolves_active_provider() {
+        let cfg = config_with_openai_wav_alias();
+        let manager = TtsManager::from_config(&cfg).unwrap();
+        assert_eq!(manager.agent_output_format(), Some("wav"));
+    }
+
+    #[test]
+    fn agent_output_format_none_when_no_provider() {
+        let manager = TtsManager::from_config(&Config::default()).unwrap();
+        assert_eq!(manager.agent_output_format(), None);
     }
 
     #[test]
