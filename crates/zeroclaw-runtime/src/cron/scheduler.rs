@@ -306,6 +306,7 @@ async fn run_manual_job_inner(
         crate::cron::store::RunProvenance {
             principal: Some(&run_principal),
             executing_agent: executing_agent.as_deref(),
+            job_source: Some(&job.source),
         },
         Some(&outcome.output),
         duration_ms,
@@ -1052,6 +1053,7 @@ async fn persist_job_result(
             // empty `agent_alias` falls back to config ownership at
             // execution, and the record must report that same identity.
             executing_agent: Some(executing_agent),
+            job_source: Some(&job.source),
         },
         Some(&outcome.output),
         duration_ms,

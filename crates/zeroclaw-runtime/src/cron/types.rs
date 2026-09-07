@@ -218,6 +218,12 @@ pub struct CronRun {
     /// rows recorded before provenance existed.
     #[serde(default)]
     pub executing_agent: Option<String>,
+    /// The job's `source` (`imperative` / `declarative`) at time of action;
+    /// keeps a run row retained past its job's deletion reachable by the
+    /// cleanup that owns that id space. `None` on rows recorded before
+    /// provenance existed.
+    #[serde(default)]
+    pub job_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

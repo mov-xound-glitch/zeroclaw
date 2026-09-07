@@ -170,6 +170,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_retained_history_after_job_deletion() {
+        // A successful auto-delete one-shot keeps its run record after the
+        // job row is gone; the tool must still return it, provenance
+        // included.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let now = Utc::now();
+        cron::record_run(
+            &cfg,
+            "retained-one-shot",
+            now,
+            now + ChronoDuration::milliseconds(1),
+            "ok",
+            cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            cron::RunProvenance {
+                principal: None,
+                executing_agent: Some(TEST_AGENT),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            1,
+        )
+        .unwrap();
+
+        let tool = CronRunsTool::new(cfg.clone());
+        let result = tool
+            .execute(json!({ "job_id": "retained-one-shot" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("retained-one-shot"));
+        assert!(result.output.contains("executing_agent"));
+    }
+
+    #[tokio::test]
     async fn lists_runs_with_truncation() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -191,6 +230,7 @@ mod tests {
             cron::RunProvenance {
                 principal: None,
                 executing_agent: None,
+                job_source: None,
             },
             Some(&long_output),
             1,
