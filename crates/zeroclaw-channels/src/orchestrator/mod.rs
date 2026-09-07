@@ -6930,6 +6930,28 @@ async fn process_channel_message_body(
     // provider resolution or construction fails never re-enters the loop,
     // and the record must not outlive the turn.
     let _hint_scope = zeroclaw_runtime::agent::loop_::TurnHintScope::new(&turn_id);
+    // The elicitation decision is made HERE, once per logical turn, against
+    // the immutable inbound text — before the provider-visible turn is
+    // composed with the channel preamble (whose channel names real tool
+    // triggers contain) and before any memory enrichment a retry would
+    // otherwise rescan. The engine only consumes the recorded decision.
+    {
+        let prescan_excluded: &[String] =
+            if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
+                &[]
+            } else {
+                ctx.non_cli_excluded_tools.as_ref()
+            };
+        zeroclaw_runtime::agent::loop_::prescan_inbound_for_elicitation(
+            Some(ctx.prompt_config.as_ref()),
+            Some(ctx.agent_alias.as_str()),
+            &turn_id,
+            &msg.content,
+            ctx.tools_registry.as_ref(),
+            ctx.activated_tools.as_ref(),
+            prescan_excluded,
+        );
+    }
     // Bracket the channel turn so lifecycle events
     // reach observers (and, via the broadcast hook, /api/events and
     // /api/events/history) for channel-originated turns — mirroring the CLI

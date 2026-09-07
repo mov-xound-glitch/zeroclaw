@@ -452,7 +452,7 @@ pub fn filter_by_allowed_tools(
 }
 
 // Re-export from zeroclaw-types for backwards compatibility.
-pub use crate::agent::turn::elicitation::TurnHintScope;
+pub use crate::agent::turn::elicitation::{TurnHintScope, prescan_inbound_for_elicitation};
 pub use zeroclaw_api::TOOL_LOOP_SESSION_KEY;
 pub use zeroclaw_api::TOOL_LOOP_THREAD_ID;
 

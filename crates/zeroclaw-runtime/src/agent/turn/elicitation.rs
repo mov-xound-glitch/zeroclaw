@@ -1,9 +1,11 @@
-//! Pre-turn tool-elicitation prefilter: a deterministic scan of the
-//! latest user message against activated tools' `invocation_triggers()`, and
-//! the one-line ephemeral hint injected on a hit. Gated on the per-agent
+//! Pre-turn tool-elicitation: a deterministic prescan of the IMMUTABLE
+//! inbound message against callable tools' `invocation_triggers()`, decided
+//! once per logical turn at the dispatch edge — before channel or memory
+//! enrichment becomes provider-visible — and the one-line ephemeral hint the
+//! engine injects on a recorded hit. Gated on the per-agent
 //! `tool_elicitation` runtime-profile flag (default off) and on
 //! `TurnOrigin::Channel` in v1. The model stays the decision-maker: the hint
-//! nudges, it never forces a call, and the prefilter never executes a tool.
+//! nudges, it never forces a call, and the prescan never executes a tool.
 
 use crate::tools::Tool;
 use std::collections::HashMap;
@@ -11,101 +13,84 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Marker prefix identifying an injected elicitation hint to the model.
 /// Informational only — idempotence is tracked in runtime-owned state (see
-/// [`hinted_tool_for`]), never by scanning content: user text can contain
+/// [`TurnElicitation`]), never by scanning content: user text can contain
 /// this literal, and a content guard would let it suppress a real hint and
 /// contaminate the hit-rate telemetry.
 pub(crate) const HINT_PREFIX: &str = "[tool-hint]";
 
-/// Runtime-owned per-turn hint state: which tool was hinted, and whether
-/// the invocation-correlation event has already fired.
+/// Runtime-owned per-turn elicitation state, keyed by turn id. The
+/// decision is made ONCE per logical turn by [`prescan_inbound_for_elicitation`]
+/// against the immutable inbound text — before any channel or memory
+/// enrichment becomes provider-visible — and preserved for the whole turn,
+/// no-match included, so a model-switch retry can never rescan enriched
+/// history into a new hit. The engine only consumes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HintRecord {
-    pub tool: String,
+pub(crate) struct TurnElicitation {
+    /// The prescan decision: the hinted tool, or `None` for a recorded
+    /// no-match. Immutable once recorded.
+    pub decision: Option<String>,
+    /// Whether the engine has appended the hint to the provider-facing
+    /// history (idempotence across model-switch re-entries).
+    pub injected: bool,
+    /// Whether the invocation-correlation event already fired.
     pub call_recorded: bool,
 }
 
-/// Runtime-owned records of in-flight hinted turns, keyed by turn id. A
-/// model-switch retry re-enters the engine with the same turn id and the
-/// same (already-mutated) history; the record is what tells the re-entry
-/// that the hint is already present and whether its call event already
-/// fired. Entries live exactly as long as their turn: [`HintTurnGuard`]
-/// removes them on every exit except the model-switch handoff.
-fn hinted_turns() -> &'static Mutex<HashMap<String, HintRecord>> {
-    static HINTED_TURNS: OnceLock<Mutex<HashMap<String, HintRecord>>> = OnceLock::new();
+/// Entries live exactly as long as their turn: the frame that owns the turn
+/// id (and any model-switch retries) holds a [`TurnHintScope`] whose drop
+/// removes them on every exit.
+fn hinted_turns() -> &'static Mutex<HashMap<String, TurnElicitation>> {
+    static HINTED_TURNS: OnceLock<Mutex<HashMap<String, TurnElicitation>>> = OnceLock::new();
     HINTED_TURNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn hinted_turns_lock() -> std::sync::MutexGuard<'static, HashMap<String, HintRecord>> {
+fn hinted_turns_lock() -> std::sync::MutexGuard<'static, HashMap<String, TurnElicitation>> {
     match hinted_turns().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
 }
 
-/// This turn's hint state, if the runtime injected a hint on a prior entry
-/// (model-switch retry path).
-pub(crate) fn hint_record_for(turn_id: &str) -> Option<HintRecord> {
+/// This turn's elicitation state, if an inbound prescan recorded one.
+pub(crate) fn state_for(turn_id: &str) -> Option<TurnElicitation> {
     hinted_turns_lock().get(turn_id).cloned()
 }
 
-/// Record that the runtime injected a hint for `tool_name` on this turn.
-pub(crate) fn record_hint(turn_id: &str, tool_name: &str) {
-    hinted_turns_lock().insert(
-        turn_id.to_string(),
-        HintRecord {
-            tool: tool_name.to_string(),
+/// Record the prescan decision for this turn — hit or no-match — exactly
+/// once; a later call for the same turn is ignored (first decision wins).
+pub(crate) fn record_scan_decision(turn_id: &str, decision: Option<String>) {
+    hinted_turns_lock()
+        .entry(turn_id.to_string())
+        .or_insert(TurnElicitation {
+            decision,
+            injected: false,
             call_recorded: false,
-        },
-    );
+        });
+}
+
+/// Record that the engine appended this turn's hint to provider-facing
+/// history, so a model-switch re-entry neither stacks it nor re-fires the
+/// injection event.
+pub(crate) fn mark_injected(turn_id: &str) {
+    if let Some(state) = hinted_turns_lock().get_mut(turn_id) {
+        state.injected = true;
+    }
 }
 
 /// Record that this turn's hinted tool was called and the correlation
 /// event fired, so a model-switch retry does not fire it again.
 pub(crate) fn record_hint_call(turn_id: &str) {
-    if let Some(record) = hinted_turns_lock().get_mut(turn_id) {
-        record.call_recorded = true;
+    if let Some(state) = hinted_turns_lock().get_mut(turn_id) {
+        state.call_recorded = true;
     }
 }
 
-/// Clears a turn's hint record on drop unless defused. Defused only on the
-/// model-switch handoff, where the same turn re-enters the engine and must
-/// still see the record; every other exit (completion, error, panic) ends
-/// the turn and the record with it.
-pub(crate) struct HintTurnGuard {
-    turn_id: String,
-    armed: bool,
-}
-
-impl HintTurnGuard {
-    pub(crate) fn new(turn_id: &str) -> Self {
-        Self {
-            turn_id: turn_id.to_string(),
-            armed: true,
-        }
-    }
-
-    pub(crate) fn defuse(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for HintTurnGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            hinted_turns_lock().remove(&self.turn_id);
-        }
-    }
-}
-
-/// Caller-owned backstop for the turn's hint record, held by the frame that
-/// owns the turn id and any model-switch retries (the entry points and the
-/// channel orchestrator). The engine's own guard is defused on the
-/// model-switch handoff so the retry still sees the record — but the retry
-/// owner can then fail to re-enter the loop at all (provider resolution or
-/// construction failure), and without this scope the record would outlive
-/// the turn. Dropping the scope removes the record unconditionally; after a
-/// normal turn completion the engine has already removed it and the drop is
-/// a no-op.
+/// Caller-owned lifetime for the turn's elicitation state, held by the
+/// frame that owns the turn id and any model-switch retries (the entry
+/// points and the channel orchestrator). A retry re-enters the engine while
+/// this frame still lives, so the recorded decision survives the handoff;
+/// every exit of the frame — completion, abandoned handoff, error — drops
+/// the scope and the state with it.
 pub struct TurnHintScope {
     turn_id: String,
 }
@@ -123,6 +108,74 @@ impl Drop for TurnHintScope {
     fn drop(&mut self) {
         hinted_turns_lock().remove(&self.turn_id);
     }
+}
+
+/// The per-turn elicitation decision point, called at the dispatch edge
+/// (the channel orchestrator) with the IMMUTABLE inbound text — the raw
+/// channel message, before the provider-visible turn is composed. Generated
+/// context is never scanned: the orchestrator's turn preamble names channel
+/// types that real tool triggers contain, and memory enrichment can splice
+/// trigger text into history that a retry would otherwise rescan. Gated on
+/// the per-agent `tool_elicitation` runtime-profile flag (fail closed
+/// without config or alias); scans the static registry plus the activated
+/// deferred set under execution's exclusion semantics; records the decision
+/// — hit or no-match — for the whole logical turn.
+#[allow(clippy::too_many_arguments)]
+pub fn prescan_inbound_for_elicitation(
+    config: Option<&zeroclaw_config::schema::Config>,
+    agent_alias: Option<&str>,
+    turn_id: &str,
+    inbound_text: &str,
+    tools: &[Box<dyn Tool>],
+    activated: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    excluded_tools: &[String],
+) {
+    let enabled = config
+        .zip(agent_alias)
+        .is_some_and(|(cfg, alias)| cfg.effective_tool_elicitation(alias));
+    if !enabled {
+        return;
+    }
+
+    let activated_snapshot: Vec<Arc<dyn Tool>> = activated
+        .map(|at| {
+            let guard = match at.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "activated-tool lock poisoned while scanning invocation triggers; recovering guard for read"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            guard.tools()
+        })
+        .unwrap_or_default();
+
+    let decision = scan_for_trigger_hit(
+        &inbound_text.to_lowercase(),
+        tools,
+        &activated_snapshot,
+        excluded_tools,
+    );
+    if let Some(tool_name) = &decision {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "tool": tool_name,
+                    "trace_id": turn_id,
+                })),
+            "prefilter_hit"
+        );
+    }
+    record_scan_decision(turn_id, decision);
 }
 
 /// The invocation-correlation telemetry event: the hinted tool was actually
@@ -193,7 +246,9 @@ pub(crate) fn scan_for_trigger_hit(
             }));
     for tool in registry_then_activated {
         let name = tool.name();
-        if excluded_tools.iter().any(|e| e == name) {
+        // Execution's own exclusion predicate (trimmed, case-insensitive):
+        // a name the executor would refuse must never be hinted.
+        if crate::agent::tool_execution::is_excluded_tool(name, excluded_tools) {
             continue;
         }
         for trigger in tool.invocation_triggers() {
@@ -395,35 +450,47 @@ mod tests {
     }
 
     #[test]
-    fn hint_record_round_trip_and_guard() {
-        let turn = "test-hint-record-turn";
-        assert!(hint_record_for(turn).is_none());
-        record_hint(turn, "send_via");
+    fn scan_exclusions_use_execution_normalization() {
+        // Execution trims and compares case-insensitively; the scanner must
+        // never hint a name the executor would refuse.
+        let tools = vec![tool("send_via", &["via voice"])];
         assert_eq!(
-            hint_record_for(turn),
-            Some(HintRecord {
-                tool: "send_via".to_string(),
+            scan_for_trigger_hit("reply via voice", &tools, &[], &["SEND_VIA".to_string()]),
+            None
+        );
+        assert_eq!(
+            scan_for_trigger_hit("reply via voice", &tools, &[], &[" send_via ".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_state_round_trip_and_scope() {
+        let turn = "test-scan-state-turn";
+        assert!(state_for(turn).is_none());
+
+        // The first decision wins — a retry's repeated prescan cannot
+        // overwrite it — and a no-match is equally binding.
+        record_scan_decision(turn, None);
+        record_scan_decision(turn, Some("send_via".to_string()));
+        assert_eq!(
+            state_for(turn),
+            Some(TurnElicitation {
+                decision: None,
+                injected: false,
                 call_recorded: false,
             })
         );
+        // Progress markers are no-ops on a no-match decision's fields
+        // other than their own.
+        mark_injected(turn);
         record_hint_call(turn);
-        assert_eq!(
-            hint_record_for(turn),
-            Some(HintRecord {
-                tool: "send_via".to_string(),
-                call_recorded: true,
-            })
-        );
+        let state = state_for(turn).expect("state persists");
+        assert!(state.injected && state.call_recorded);
 
-        // A defused guard keeps the record (model-switch handoff)...
-        let mut guard = HintTurnGuard::new(turn);
-        guard.defuse();
-        drop(guard);
-        assert!(hint_record_for(turn).is_some());
-
-        // ...an armed one ends it with the turn.
-        drop(HintTurnGuard::new(turn));
-        assert!(hint_record_for(turn).is_none());
+        // The owner's scope ends the state with the turn.
+        drop(TurnHintScope::new(turn));
+        assert!(state_for(turn).is_none());
     }
 
     #[test]
@@ -439,17 +506,6 @@ mod tests {
             Some(3),
             "tool name, iteration, and trace id only — never message text"
         );
-    }
-
-    #[test]
-    fn turn_hint_scope_backstops_abandoned_records() {
-        let turn = "test-hint-scope-turn";
-        let scope = TurnHintScope::new(turn);
-        record_hint(turn, "send_via");
-        // The engine's defused guard left the record behind (switch
-        // handoff); the owner's scope must reclaim it.
-        drop(scope);
-        assert!(hint_record_for(turn).is_none());
     }
 
     #[test]
@@ -525,6 +581,28 @@ runtime_profile = "hinted"
         .expect("test config parses")
     }
 
+    /// The dispatch-edge half of the harness: exactly what the channel
+    /// orchestrator does with the immutable inbound text before composing
+    /// the provider-visible turn.
+    fn prescan(
+        cfg: Option<&zeroclaw_config::schema::Config>,
+        turn_id: &str,
+        inbound_text: &str,
+        tools: &[Box<dyn Tool>],
+        activated: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+        excluded: &[String],
+    ) {
+        prescan_inbound_for_elicitation(
+            cfg,
+            Some("default"),
+            turn_id,
+            inbound_text,
+            tools,
+            activated,
+            excluded,
+        );
+    }
+
     struct RunSpec<'a> {
         config: Option<&'a zeroclaw_config::schema::Config>,
         ingress: IngressContext,
@@ -596,6 +674,8 @@ runtime_profile = "hinted"
         .await
     }
 
+    /// Prescan the raw text (as the orchestrator would), then run one
+    /// channel turn whose history holds exactly that text.
     async fn run_once(
         config: Option<&zeroclaw_config::schema::Config>,
         ingress: IngressContext,
@@ -604,6 +684,14 @@ runtime_profile = "hinted"
     ) {
         let provider = PlainProvider;
         let turn_id = uuid::Uuid::new_v4().to_string();
+        let _scope = TurnHintScope::new(&turn_id);
+        let raw = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        prescan(config, &turn_id, &raw, tools_registry, None, &[]);
         run_spec(
             RunSpec {
                 config,
@@ -661,8 +749,9 @@ runtime_profile = "hinted"
     }
 
     #[tokio::test]
-    async fn flag_off_never_injects() {
-        // No config at all (fail closed) and a config without the profile flag.
+    async fn flag_off_records_no_decision_and_never_injects() {
+        // No config at all (fail closed) and a config without the profile
+        // flag: the prescan records nothing and the engine injects nothing.
         let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
         let mut history = vec![ChatMessage::user("please send this to marta")];
         run_once(None, IngressContext::channel(), &mut history, &tools).await;
@@ -677,6 +766,7 @@ runtime_profile = "hinted"
 
     #[tokio::test]
     async fn non_channel_origin_never_injects() {
+        // Even a recorded hit is consumed only on channel turns.
         let cfg = elicitation_config();
         let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
         for ingress in [
@@ -684,8 +774,26 @@ runtime_profile = "hinted"
             IngressContext::cron(),
             IngressContext::interactive(),
         ] {
+            let provider = PlainProvider;
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let _scope = TurnHintScope::new(&turn_id);
+            record_scan_decision(&turn_id, Some("send_via".to_string()));
             let mut history = vec![ChatMessage::user("please send this to marta")];
-            run_once(Some(&cfg), ingress, &mut history, &tools).await;
+            run_spec(
+                RunSpec {
+                    config: Some(&cfg),
+                    ingress,
+                    tools_registry: &tools,
+                    excluded_tools: &[],
+                    activated_tools: None,
+                    provider: &provider,
+                    turn_id: &turn_id,
+                    model_switch_to: None,
+                },
+                &mut history,
+            )
+            .await
+            .expect("loop should succeed");
             assert_eq!(hint_count(&history), 0);
         }
     }
@@ -700,15 +808,124 @@ runtime_profile = "hinted"
     }
 
     #[tokio::test]
+    async fn generated_channel_context_is_never_scanned() {
+        // The provider-visible turn carries the orchestrator preamble, whose
+        // channel names real tool triggers contain. The decision is made on
+        // the immutable inbound text alone: a neutral message produces
+        // neither a hit nor a hint even though the history entry matches.
+        let cfg = elicitation_config();
+        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["discord", "send this to"])];
+        let provider = PlainProvider;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let _scope = TurnHintScope::new(&turn_id);
+        prescan(
+            Some(&cfg),
+            &turn_id,
+            "what's the weather?",
+            &tools,
+            None,
+            &[],
+        );
+        let mut history = vec![ChatMessage::user(
+            "[turn-context] time=12:00:00 channel=discord reply_target=123 \
+             sender=u1.\n\nwhat's the weather?",
+        )];
+        run_spec(
+            RunSpec {
+                config: Some(&cfg),
+                ingress: IngressContext::channel(),
+                tools_registry: &tools,
+                excluded_tools: &[],
+                activated_tools: None,
+                provider: &provider,
+                turn_id: &turn_id,
+                model_switch_to: None,
+            },
+            &mut history,
+        )
+        .await
+        .expect("loop should succeed");
+        assert_eq!(hint_count(&history), 0);
+        assert_eq!(
+            state_for(&turn_id).expect("decision recorded").decision,
+            None,
+            "the neutral inbound text must record a binding no-match"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_cannot_rescan_enriched_history_into_a_hit() {
+        // An initial no-match binds the whole logical turn: after memory
+        // context splices trigger text into the history entry, a
+        // model-switch retry must still produce neither a hint nor events.
+        let cfg = elicitation_config();
+        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let provider = PlainProvider;
+        let turn_id = format!("enriched-retry-{}", uuid::Uuid::new_v4());
+        let _scope = TurnHintScope::new(&turn_id);
+        prescan(
+            Some(&cfg),
+            &turn_id,
+            "what's the weather?",
+            &tools,
+            None,
+            &[],
+        );
+
+        let mut history = vec![ChatMessage::user("what's the weather?")];
+        let err = run_spec(
+            RunSpec {
+                config: Some(&cfg),
+                ingress: IngressContext::channel(),
+                tools_registry: &tools,
+                excluded_tools: &[],
+                activated_tools: None,
+                provider: &provider,
+                turn_id: &turn_id,
+                model_switch_to: Some(("other", "other-model")),
+            },
+            &mut history,
+        )
+        .await
+        .expect_err("prefilled switch state must exit the loop");
+        assert!(crate::agent::loop_::is_model_switch_requested(&err).is_some());
+
+        // Memory enrichment lands trigger text in the entry before the retry.
+        history[0].content = format!(
+            "[memory context]\\nEarlier you said: send this to my email.\\n\\n{}",
+            history[0].content
+        );
+        run_spec(
+            RunSpec {
+                config: Some(&cfg),
+                ingress: IngressContext::channel(),
+                tools_registry: &tools,
+                excluded_tools: &[],
+                activated_tools: None,
+                provider: &provider,
+                turn_id: &turn_id,
+                model_switch_to: None,
+            },
+            &mut history,
+        )
+        .await
+        .expect("retry completes");
+        assert_eq!(hint_count(&history), 0);
+        assert_eq!(
+            state_for(&turn_id).expect("decision persists").decision,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn user_authored_marker_does_not_suppress_the_hint() {
         // Idempotence is runtime-owned, not content-derived: a user message
         // that already contains the hint marker (even a verbatim hint) must
-        // still receive the real injection, so untrusted content can neither
-        // suppress the feature nor arm the call telemetry without one.
+        // still receive the real injection.
         let cfg = elicitation_config();
         let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
         let mut history = vec![ChatMessage::user(format!(
-            "please send this to marta\n\n{}",
+            "please send this to marta\\n\\n{}",
             hint_message("send_via")
         ))];
         run_once(Some(&cfg), IngressContext::channel(), &mut history, &tools).await;
@@ -729,76 +946,93 @@ runtime_profile = "hinted"
     async fn model_switch_retry_does_not_stack_hint_or_events() {
         // A model-switch retry re-enters the engine with the same turn id
         // and the already-hinted history; the note must not duplicate. The
-        // guard is the runtime-owned per-turn record, defused across the
-        // switch handoff and cleared when the turn completes.
+        // decision and injection marker live in runtime-owned state whose
+        // lifetime this owning frame's scope controls.
         let cfg = elicitation_config();
         let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
         let mut history = vec![ChatMessage::user("please send this to marta")];
         let turn_id = format!("switch-retry-{}", uuid::Uuid::new_v4());
         let provider = PlainProvider;
+        {
+            let _scope = TurnHintScope::new(&turn_id);
+            prescan(
+                Some(&cfg),
+                &turn_id,
+                "please send this to marta",
+                &tools,
+                None,
+                &[],
+            );
 
-        // First entry: hint injected, then the loop hands off for a switch.
-        let err = run_spec(
-            RunSpec {
-                config: Some(&cfg),
-                ingress: IngressContext::channel(),
-                tools_registry: &tools,
-                excluded_tools: &[],
-                activated_tools: None,
-                provider: &provider,
-                turn_id: &turn_id,
-                model_switch_to: Some(("other", "other-model")),
-            },
-            &mut history,
-        )
-        .await
-        .expect_err("prefilled switch state must exit the loop");
-        assert!(
-            crate::agent::loop_::is_model_switch_requested(&err).is_some(),
-            "loop must exit via ModelSwitchRequested, got: {err:?}"
-        );
-        assert_eq!(hint_count(&history), 1);
-        assert!(
-            hint_record_for(&turn_id).is_some(),
-            "switch handoff must keep the turn's hint record"
-        );
+            // First entry: hint injected, then the loop hands off for a switch.
+            let err = run_spec(
+                RunSpec {
+                    config: Some(&cfg),
+                    ingress: IngressContext::channel(),
+                    tools_registry: &tools,
+                    excluded_tools: &[],
+                    activated_tools: None,
+                    provider: &provider,
+                    turn_id: &turn_id,
+                    model_switch_to: Some(("other", "other-model")),
+                },
+                &mut history,
+            )
+            .await
+            .expect_err("prefilled switch state must exit the loop");
+            assert!(
+                crate::agent::loop_::is_model_switch_requested(&err).is_some(),
+                "loop must exit via ModelSwitchRequested, got: {err:?}"
+            );
+            assert_eq!(hint_count(&history), 1);
+            assert!(
+                state_for(&turn_id).is_some_and(|s| s.injected),
+                "the handoff must keep the injected decision for the retry"
+            );
 
-        // Retry: same turn id, same mutated history — no second hint.
-        run_spec(
-            RunSpec {
-                config: Some(&cfg),
-                ingress: IngressContext::channel(),
-                tools_registry: &tools,
-                excluded_tools: &[],
-                activated_tools: None,
-                provider: &provider,
-                turn_id: &turn_id,
-                model_switch_to: None,
-            },
-            &mut history,
-        )
-        .await
-        .expect("retry completes");
-        assert_eq!(hint_count(&history), 1);
+            // Retry: same turn id, same mutated history — no second hint.
+            run_spec(
+                RunSpec {
+                    config: Some(&cfg),
+                    ingress: IngressContext::channel(),
+                    tools_registry: &tools,
+                    excluded_tools: &[],
+                    activated_tools: None,
+                    provider: &provider,
+                    turn_id: &turn_id,
+                    model_switch_to: None,
+                },
+                &mut history,
+            )
+            .await
+            .expect("retry completes");
+            assert_eq!(hint_count(&history), 1);
+        }
         assert!(
-            hint_record_for(&turn_id).is_none(),
-            "completing the turn must clear its hint record"
+            state_for(&turn_id).is_none(),
+            "the owner's scope must end the turn's state"
         );
     }
 
     #[tokio::test]
-    async fn abandoned_switch_handoff_does_not_leak_hint_record() {
-        // The engine keeps the record alive across a model-switch handoff,
-        // but the retry owner can fail provider resolution or construction
-        // and exit without ever re-entering the loop. The owner's
-        // TurnHintScope must reclaim the record on that path.
+    async fn abandoned_switch_handoff_does_not_leak_state() {
+        // The owning frame can fail provider resolution after the handoff
+        // and exit without re-entering the loop; its scope must reclaim the
+        // turn's state on that path.
         let cfg = elicitation_config();
         let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
         let mut history = vec![ChatMessage::user("please send this to marta")];
         let turn_id = format!("abandoned-handoff-{}", uuid::Uuid::new_v4());
         {
-            // What every production retry owner holds for the turn's lifetime.
-            let _scope = crate::agent::loop_::TurnHintScope::new(&turn_id);
+            let _scope = TurnHintScope::new(&turn_id);
+            prescan(
+                Some(&cfg),
+                &turn_id,
+                "please send this to marta",
+                &tools,
+                None,
+                &[],
+            );
             let provider = PlainProvider;
             let err = run_spec(
                 RunSpec {
@@ -816,24 +1050,21 @@ runtime_profile = "hinted"
             .await
             .expect_err("prefilled switch state must exit the loop");
             assert!(crate::agent::loop_::is_model_switch_requested(&err).is_some());
-            assert!(
-                hint_record_for(&turn_id).is_some(),
-                "handoff must keep the record for a would-be retry"
-            );
+            assert!(state_for(&turn_id).is_some());
             // The owner now fails to build the new provider and exits
             // without re-entering the loop: the scope drops here.
         }
         assert!(
-            hint_record_for(&turn_id).is_none(),
-            "an abandoned handoff must not leak the turn's hint record"
+            state_for(&turn_id).is_none(),
+            "an abandoned handoff must not leak the turn's state"
         );
     }
 
     #[tokio::test]
     async fn activated_deferred_tool_is_hinted_and_excludable() {
         // A deferred tool activated on an earlier turn is advertised and
-        // executable on this one; elicitation must scan it too, under the
-        // same exclusion rules.
+        // executable on this one; the prescan covers it under execution's
+        // exclusion semantics.
         let cfg = elicitation_config();
         let tools: Vec<Box<dyn Tool>> = vec![tool("plain", &[])];
         let mut set = crate::tools::ActivatedToolSet::new();
@@ -846,6 +1077,15 @@ runtime_profile = "hinted"
 
         let mut history = vec![ChatMessage::user("please send this to marta")];
         let turn_id = uuid::Uuid::new_v4().to_string();
+        let _scope = TurnHintScope::new(&turn_id);
+        prescan(
+            Some(&cfg),
+            &turn_id,
+            "please send this to marta",
+            &tools,
+            Some(&activated),
+            &[],
+        );
         run_spec(
             RunSpec {
                 config: Some(&cfg),
@@ -874,15 +1114,25 @@ runtime_profile = "hinted"
         );
 
         // The same exclusion list that gates advertisement and execution
-        // gates elicitation.
+        // gates the prescan — case-insensitively, as execution matches.
         let mut history = vec![ChatMessage::user("please send this to marta")];
         let turn_id = uuid::Uuid::new_v4().to_string();
+        let _scope = TurnHintScope::new(&turn_id);
+        let excluded = vec!["MCP__MAIL__SEND".to_string()];
+        prescan(
+            Some(&cfg),
+            &turn_id,
+            "please send this to marta",
+            &tools,
+            Some(&activated),
+            &excluded,
+        );
         run_spec(
             RunSpec {
                 config: Some(&cfg),
                 ingress: IngressContext::channel(),
                 tools_registry: &tools,
-                excluded_tools: &["mcp__mail__send".to_string()],
+                excluded_tools: &excluded,
                 activated_tools: Some(&activated),
                 provider: &provider,
                 turn_id: &turn_id,
@@ -1020,6 +1270,15 @@ runtime_profile = "hinted"
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut history = vec![ChatMessage::user("please send this to marta")];
+        let _scope = TurnHintScope::new(&turn_id);
+        prescan(
+            Some(&cfg),
+            &turn_id,
+            "please send this to marta",
+            &tools,
+            None,
+            &[],
+        );
         run_spec(
             RunSpec {
                 config: Some(&cfg),
