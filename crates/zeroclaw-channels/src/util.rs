@@ -29,16 +29,14 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Largest byte index `<= max_bytes` that is still a valid UTF-8 boundary.
+/// Returns the largest UTF-8 character boundary at or before `max_bytes`.
+///
+/// This compatibility wrapper preserves the previously exported helper while
+/// directing new callers to the standard-library implementation.
+#[deprecated(since = "0.8.4", note = "use str::floor_char_boundary instead")]
 pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
-    if max_bytes >= s.len() {
-        return s.len();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
+    // Keep downstream callers source-compatible without retaining duplicate boundary logic.
+    s.floor_char_boundary(max_bytes)
 }
 
 #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
@@ -514,6 +512,96 @@ pub(crate) fn build_approve_deny_approval_prompt(
     )
 }
 
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
+pub(crate) struct PendingApproval {
+    pub(crate) sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    pub(crate) destination: String,
+    pub(crate) tool_name: String,
+}
+
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingApprovalResolution {
+    NotFound,
+    Rejected,
+    Resolved,
+    ReceiverClosed,
+}
+
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
+impl PendingApprovalResolution {
+    #[cfg(any(feature = "channel-matrix", feature = "channel-slack", test))]
+    pub(crate) fn suppresses_message(self) -> bool {
+        !matches!(self, Self::NotFound)
+    }
+}
+
+#[cfg(any(feature = "channel-matrix", feature = "channel-slack", test))]
+pub(crate) async fn resolve_pending_approval(
+    pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
+    token: &str,
+    response: zeroclaw_api::channel::ChannelApprovalResponse,
+    responder_allowed: bool,
+    destination: &str,
+) -> PendingApprovalResolution {
+    resolve_pending_approval_with_tool(
+        pending_approvals,
+        token,
+        response,
+        responder_allowed,
+        destination,
+    )
+    .await
+    .0
+}
+
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
+pub(crate) async fn resolve_pending_approval_with_tool(
+    pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
+    token: &str,
+    response: zeroclaw_api::channel::ChannelApprovalResponse,
+    responder_allowed: bool,
+    destination: &str,
+) -> (PendingApprovalResolution, Option<String>) {
+    let mut pending_approvals = pending_approvals.lock().await;
+    let Some(pending) = pending_approvals.get(token) else {
+        return (PendingApprovalResolution::NotFound, None);
+    };
+    if !responder_allowed || destination.is_empty() || pending.destination != destination {
+        return (PendingApprovalResolution::Rejected, None);
+    }
+
+    let Some(pending) = pending_approvals.remove(token) else {
+        return (PendingApprovalResolution::NotFound, None);
+    };
+    drop(pending_approvals);
+    if pending.sender.send(response).is_ok() {
+        (PendingApprovalResolution::Resolved, Some(pending.tool_name))
+    } else {
+        (PendingApprovalResolution::ReceiverClosed, None)
+    }
+}
+
 /// Generate a conversation history key from a channel message.
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     match &msg.thread_ts {
@@ -528,6 +616,16 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verifies the exported compatibility wrapper retains the legacy UTF-8 boundary contract.
+    #[allow(deprecated)]
+    #[test]
+    fn floor_char_boundary_compatibility_wrapper_delegates_to_std() {
+        let text = "abc😀def";
+
+        assert_eq!(floor_char_boundary(text, 5), 3);
+        assert_eq!(floor_char_boundary(text, usize::MAX), text.len());
+    }
 
     #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
     async fn response_from_raw_http(
@@ -622,14 +720,6 @@ mod tests {
                 "channel-runtime-progress-finalizing-response",
             ]
         );
-    }
-
-    #[test]
-    fn floor_char_boundary_handles_mid_codepoint_offset() {
-        let text = "abc😀def";
-
-        assert_eq!(super::floor_char_boundary(text, 5), 3);
-        assert_eq!(super::floor_char_boundary(text, usize::MAX), text.len());
     }
 
     #[test]
@@ -1000,5 +1090,110 @@ mod tests {
                 "adapter source references Fluent key {key:?}, but it resolves to the missing-string sentinel (undefined or typo'd)"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn approval_resolution_requires_authorized_responder_and_destination() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending.lock().await.insert(
+            "approval-id".to_string(),
+            PendingApproval {
+                sender: tx,
+                destination: "room-a".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+
+        let rejected_responder = resolve_pending_approval(
+            &pending,
+            "approval-id",
+            ChannelApprovalResponse::Approve,
+            false,
+            "room-a",
+        )
+        .await;
+        assert_eq!(rejected_responder, PendingApprovalResolution::Rejected);
+        assert!(
+            rejected_responder.suppresses_message(),
+            "a rejected reply for a known approval must not reach normal dispatch"
+        );
+        assert!(pending.lock().await.contains_key("approval-id"));
+
+        let rejected_destination = resolve_pending_approval(
+            &pending,
+            "approval-id",
+            ChannelApprovalResponse::Deny,
+            true,
+            "room-b",
+        )
+        .await;
+        assert_eq!(rejected_destination, PendingApprovalResolution::Rejected);
+        assert!(
+            rejected_destination.suppresses_message(),
+            "a cross-destination reply for a known approval must not reach normal dispatch"
+        );
+        assert!(pending.lock().await.contains_key("approval-id"));
+
+        let resolved = resolve_pending_approval(
+            &pending,
+            "approval-id",
+            ChannelApprovalResponse::AlwaysApprove,
+            true,
+            "room-a",
+        )
+        .await;
+        assert_eq!(resolved, PendingApprovalResolution::Resolved);
+        assert!(resolved.suppresses_message());
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert!(pending.lock().await.is_empty());
+
+        let not_found = resolve_pending_approval(
+            &pending,
+            "missing-approval-id",
+            ChannelApprovalResponse::Approve,
+            true,
+            "room-a",
+        )
+        .await;
+        assert_eq!(not_found, PendingApprovalResolution::NotFound);
+        assert!(
+            !not_found.suppresses_message(),
+            "ordinary text must continue when no pending approval owns its token"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_resolution_reports_closed_receiver_as_failure() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        pending.lock().await.insert(
+            "approval-id".to_string(),
+            PendingApproval {
+                sender: tx,
+                destination: "room-a".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+
+        let resolution = resolve_pending_approval(
+            &pending,
+            "approval-id",
+            ChannelApprovalResponse::Approve,
+            true,
+            "room-a",
+        )
+        .await;
+        assert_eq!(resolution, PendingApprovalResolution::ReceiverClosed);
+        assert!(
+            resolution.suppresses_message(),
+            "a consumed approval must not fall through after its receiver closes"
+        );
+        assert!(pending.lock().await.is_empty());
     }
 }
