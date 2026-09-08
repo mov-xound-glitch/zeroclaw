@@ -224,6 +224,12 @@ pub struct CronRun {
     /// provenance existed.
     #[serde(default)]
     pub job_source: Option<String>,
+    /// Durable CURRENT cleanup owner: starts as the executing agent and
+    /// follows agent renames, unlike the immutable `executing_agent`
+    /// historical fact. Owner-scoped deletion and authorized retained-row
+    /// reads key on this. `None` on rows recorded before it existed.
+    #[serde(default)]
+    pub owner_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

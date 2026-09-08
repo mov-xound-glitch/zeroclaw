@@ -305,11 +305,23 @@ pub fn resolve_job_id_or_name(
 /// so the guard does not become an existence oracle.
 pub fn remove_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<()> {
     let changed = with_initialized_connection(config, |conn| {
-        conn.execute(
-            "DELETE FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
-            params![id, agent_alias],
-        )
-        .context("Failed to delete cron job")
+        // Owner-guarded job removal deletes the history in the SAME
+        // transaction: the run rows no longer cascade, and the ownership
+        // guard stays on the job delete — history goes only when the
+        // guarded job delete matched.
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx
+            .execute(
+                "DELETE FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+                params![id, agent_alias],
+            )
+            .context("Failed to delete cron job")?;
+        if changed > 0 {
+            tx.execute("DELETE FROM cron_runs WHERE job_id = ?1", params![id])
+                .context("Failed to delete cron job run history")?;
+        }
+        tx.commit().context("Failed to commit cron job removal")?;
+        Ok(changed)
     })?;
 
     if changed == 0 {
@@ -389,7 +401,7 @@ pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize>
     let changed = with_initialized_connection(config, |conn| {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "DELETE FROM cron_runs WHERE executing_agent = ?1 OR job_id IN
+            "DELETE FROM cron_runs WHERE owner_agent = ?1 OR job_id IN
                  (SELECT id FROM cron_jobs WHERE agent_alias = ?1)",
             params![agent_alias],
         )
@@ -413,11 +425,24 @@ pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize>
 /// is a direct column update.
 pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usize> {
     let changed = with_initialized_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs SET agent_alias = ?2 WHERE agent_alias = ?1",
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx
+            .execute(
+                "UPDATE cron_jobs SET agent_alias = ?2 WHERE agent_alias = ?1",
+                params![from, to],
+            )
+            .context("Failed to rename cron job owner")?;
+        // Run rows follow the rename through their durable CLEANUP owner —
+        // including retained rows whose job is already gone — while the
+        // historical executing_agent stays the immutable at-time-of-action
+        // fact.
+        tx.execute(
+            "UPDATE cron_runs SET owner_agent = ?2 WHERE owner_agent = ?1",
             params![from, to],
         )
-        .context("Failed to rename cron job owner")
+        .context("Failed to re-point run-history cleanup owner")?;
+        tx.commit().context("Failed to commit cron owner rename")?;
+        Ok(changed)
     })?;
     Ok(changed)
 }
@@ -1074,8 +1099,8 @@ fn insert_run_and_prune(
     conn.execute(
         "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms,
                                 execution, delivery, persistence, principal, executing_agent,
-                                job_source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                job_source, owner_agent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             job_id,
             started_at.to_rfc3339(),
@@ -1089,6 +1114,9 @@ fn insert_run_and_prune(
             principal_json,
             provenance.executing_agent,
             provenance.job_source,
+            // The cleanup owner STARTS as the executing agent and then
+            // follows renames; the executing_agent column above never does.
+            provenance.executing_agent,
         ],
     )
     .context("Failed to insert cron run")?;
@@ -1151,7 +1179,8 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
         let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
         let mut stmt = conn.prepare(
             "SELECT id, job_id, started_at, finished_at, status, output, duration_ms,
-                    execution, delivery, persistence, principal, executing_agent, job_source
+                    execution, delivery, persistence, principal, executing_agent, job_source,
+                    owner_agent
              FROM cron_runs
              WHERE job_id = ?1
              ORDER BY started_at DESC, id DESC
@@ -1178,6 +1207,7 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
                     .and_then(|raw| serde_json::from_str(raw).ok()),
                 executing_agent: row.get(11)?,
                 job_source: row.get(12)?,
+                owner_agent: row.get(13)?,
             })
         })?;
 
@@ -1916,7 +1946,8 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             persistence TEXT,
             principal   TEXT,
             executing_agent TEXT,
-            job_source  TEXT
+            job_source  TEXT,
+            owner_agent TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
@@ -1984,6 +2015,11 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "cron_runs", "principal", "TEXT")?;
     add_column_if_missing(conn, "cron_runs", "executing_agent", "TEXT")?;
     add_column_if_missing(conn, "cron_runs", "job_source", "TEXT")?;
+    // Durable CURRENT cleanup owner of a run row — starts as the executing
+    // agent and follows agent renames, unlike the immutable historical
+    // executing_agent, so owner-scoped deletion can always find retained
+    // rows whose job is gone.
+    add_column_if_missing(conn, "cron_runs", "owner_agent", "TEXT")?;
 
     drop_cron_runs_job_fk(conn)?;
 
@@ -2020,22 +2056,27 @@ fn drop_cron_runs_job_fk(conn: &Connection) -> Result<()> {
         if !table_exists(&tx, "cron_runs")? {
             // Interrupted between DROP and RENAME, before anything
             // recreated `cron_runs`: the working table IS the data —
-            // finishing the rename recovers it wholesale.
+            // finishing the rename recovers it wholesale. Any columns the
+            // stranded table predates are added by the additive migration
+            // that follows this recovery.
             tx.execute_batch("ALTER TABLE cron_runs_no_fk RENAME TO cron_runs;")
                 .context("Failed to finish interrupted cron_runs rebuild")?;
         } else {
-            tx.execute_batch(
-                "INSERT OR IGNORE INTO cron_runs (id, job_id, started_at, finished_at, status,
-                                                  output, duration_ms, execution, delivery,
-                                                  persistence, principal, executing_agent,
-                                                  job_source)
-                    SELECT id, job_id, started_at, finished_at, status,
-                           output, duration_ms, execution, delivery,
-                           persistence, principal, executing_agent,
-                           job_source
-                    FROM cron_runs_no_fk;
-                DROP TABLE cron_runs_no_fk;",
-            )
+            // Merge by the columns the stranded table ACTUALLY has: a
+            // predecessor migration's working table predates later additive
+            // columns, and selecting a column it never had would fail and
+            // leave the history inaccessible.
+            let stranded_columns: Vec<String> = {
+                let mut stmt = tx.prepare("PRAGMA table_info(cron_runs_no_fk)")?;
+                stmt.query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let column_list = stranded_columns.join(", ");
+            tx.execute_batch(&format!(
+                "INSERT OR IGNORE INTO cron_runs ({column_list})
+                    SELECT {column_list} FROM cron_runs_no_fk;
+                DROP TABLE cron_runs_no_fk;"
+            ))
             .context("Failed to recover interrupted cron_runs rebuild state")?;
         }
         tx.commit()
@@ -2066,14 +2107,15 @@ fn drop_cron_runs_job_fk(conn: &Connection) -> Result<()> {
             persistence TEXT,
             principal   TEXT,
             executing_agent TEXT,
-            job_source  TEXT
+            job_source  TEXT,
+            owner_agent TEXT
         );
         INSERT INTO cron_runs_no_fk (id, job_id, started_at, finished_at, status, output,
                                      duration_ms, execution, delivery, persistence,
-                                     principal, executing_agent, job_source)
+                                     principal, executing_agent, job_source, owner_agent)
             SELECT id, job_id, started_at, finished_at, status, output,
                    duration_ms, execution, delivery, persistence,
-                   principal, executing_agent, job_source
+                   principal, executing_agent, job_source, owner_agent
             FROM cron_runs;
         DROP TABLE cron_runs;
         ALTER TABLE cron_runs_no_fk RENAME TO cron_runs;
@@ -2990,6 +3032,161 @@ mod tests {
         );
         // The still-declared job's state is untouched.
         assert!(get_job(&config, "still-declared").is_ok());
+    }
+
+    #[test]
+    fn predecessor_stranded_table_without_new_columns_recovers() {
+        // The actual predecessor migration's working table predates the
+        // later additive columns; recovery must merge by the columns the
+        // stranded table really has, not the current full set.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER
+            );
+            CREATE TABLE cron_runs_no_fk (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                execution   TEXT,
+                delivery    TEXT,
+                persistence TEXT,
+                principal   TEXT,
+                executing_agent TEXT
+            );",
+        )
+        .unwrap();
+        insert_legacy_run(&conn, "cron_runs_no_fk", "predecessor-strand");
+        drop(conn);
+
+        // Recovery through the public open path must preserve the row even
+        // though the stranded table lacks job_source and owner_agent.
+        let runs = list_runs(&config, "predecessor-strand", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(runs[0].job_source.is_none());
+        assert!(runs[0].owner_agent.is_none());
+
+        // A subsequent open finds a clean single-table state.
+        let runs = list_runs(&config, "predecessor-strand", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn retained_history_cleanup_survives_owner_rename() {
+        // Complete a one-shot as agent A (job auto-deleted, row retained),
+        // rename A to B: the historical executor stays A, but the durable
+        // cleanup owner follows to B — deleting B purges the record, and a
+        // NEW agent reusing the alias A owns none of it.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+        record_run(
+            &config,
+            "renamed-one-shot",
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("agent-a"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        rename_jobs_by_agent(&config, "agent-a", "agent-b").unwrap();
+        let runs = list_runs(&config, "renamed-one-shot", 10).unwrap();
+        assert_eq!(
+            runs[0].executing_agent.as_deref(),
+            Some("agent-a"),
+            "historical attribution is immutable"
+        );
+        assert_eq!(
+            runs[0].owner_agent.as_deref(),
+            Some("agent-b"),
+            "cleanup ownership follows the rename"
+        );
+
+        // Alias reuse: deleting a NEW agent called agent-a must not purge
+        // agent-b's retained record.
+        remove_jobs_by_agent(&config, "agent-a").unwrap();
+        assert_eq!(list_runs(&config, "renamed-one-shot", 10).unwrap().len(), 1);
+
+        // Deleting the current owner purges it.
+        remove_jobs_by_agent(&config, "agent-b").unwrap();
+        assert!(
+            list_runs(&config, "renamed-one-shot", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scoped_removal_purges_history_with_ownership_guard() {
+        // The owner-qualified removal path deletes job and history in one
+        // transaction — and a mismatched owner deletes neither.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        assert!(remove_job_for_agent(&config, &job.id, "someone-else").is_err());
+        assert_eq!(list_runs(&config, &job.id, 10).unwrap().len(), 1);
+
+        remove_job_for_agent(&config, &job.id, "test-agent").unwrap();
+        assert!(get_job(&config, &job.id).is_err());
+        assert!(
+            list_runs(&config, &job.id, 10).unwrap().is_empty(),
+            "owner-qualified removal must not leave history behind"
+        );
     }
 
     #[test]

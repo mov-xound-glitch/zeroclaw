@@ -85,14 +85,27 @@ impl Tool for CronRunsTool {
             }
         };
 
+        // Live job: the ownership gate is the job row itself. No live job: a
+        // successful auto-delete one-shot retains its run record, which stays
+        // readable to its own agent through the rows' durable cleanup owner —
+        // and only to it: another agent's retained history (or a row without
+        // an owner) reports the same not-found error as a foreign live job.
         let job_id = match cron::get_job_for_agent(&self.config, job_id, &self.agent_alias) {
             Ok(job) => job.id,
             Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(e.to_string()),
-                });
+                let retained_own = cron::list_runs(&self.config, job_id, 1)
+                    .ok()
+                    .and_then(|runs| runs.into_iter().next())
+                    .is_some_and(|run| run.owner_agent.as_deref() == Some(&self.agent_alias));
+                if retained_own {
+                    job_id.to_string()
+                } else {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(e.to_string()),
+                    });
+                }
             }
         };
 
@@ -214,7 +227,7 @@ mod tests {
         )
         .unwrap();
 
-        let tool = CronRunsTool::new(cfg.clone());
+        let tool = CronRunsTool::new(cfg.clone(), TEST_AGENT);
         let result = tool
             .execute(json!({ "job_id": "retained-one-shot" }))
             .await
@@ -222,6 +235,47 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("retained-one-shot"));
         assert!(result.output.contains("executing_agent"));
+    }
+
+    #[tokio::test]
+    async fn cannot_read_another_agents_retained_history() {
+        // A retained one-shot record owned by another agent reports the
+        // same not-found error as that agent's live jobs — no existence or
+        // output leak through the missing-job fallback.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let now = Utc::now();
+        cron::record_run(
+            &cfg,
+            "their-retained-one-shot",
+            now,
+            now + ChronoDuration::milliseconds(1),
+            "ok",
+            cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            cron::RunProvenance {
+                principal: None,
+                executing_agent: Some("other-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("their-private-output"),
+            1,
+        )
+        .unwrap();
+
+        let tool = CronRunsTool::new(cfg.clone(), TEST_AGENT);
+        let result = tool
+            .execute(json!({ "job_id": "their-retained-one-shot" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            !format!("{:?}", result.output).contains("their-private-output"),
+            "another agent's retained output must not leak"
+        );
     }
 
     #[tokio::test]
@@ -306,7 +360,26 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let theirs = other_agents_job(&cfg);
         let now = chrono::Utc::now();
-        cron::record_run(&cfg, &theirs.id, now, now, "ok", Some("private-output"), 5).unwrap();
+        cron::record_run(
+            &cfg,
+            &theirs.id,
+            now,
+            now,
+            "ok",
+            cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            cron::RunProvenance {
+                principal: None,
+                executing_agent: Some("other-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("private-output"),
+            5,
+        )
+        .unwrap();
 
         let tool = CronRunsTool::new(cfg.clone(), TEST_AGENT);
         let result = tool.execute(json!({"job_id": theirs.id})).await.unwrap();
