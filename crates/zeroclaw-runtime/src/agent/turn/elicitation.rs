@@ -606,7 +606,7 @@ runtime_profile = "hinted"
     struct RunSpec<'a> {
         config: Option<&'a zeroclaw_config::schema::Config>,
         ingress: IngressContext,
-        tools_registry: &'a [Box<dyn Tool>],
+        tools_registry: &'a crate::tools::scoped::ScopedToolRegistry,
         excluded_tools: &'a [String],
         activated_tools: Option<&'a Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
         provider: &'a dyn zeroclaw_providers::ModelProvider,
@@ -680,7 +680,7 @@ runtime_profile = "hinted"
         config: Option<&zeroclaw_config::schema::Config>,
         ingress: IngressContext,
         history: &mut Vec<ChatMessage>,
-        tools_registry: &[Box<dyn Tool>],
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
     ) {
         let provider = PlainProvider;
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -720,7 +720,10 @@ runtime_profile = "hinted"
     #[tokio::test]
     async fn channel_turn_with_flag_on_appends_hint_to_user_message() {
         let cfg = elicitation_config();
-        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool(
+            "send_via",
+            &["send this to"],
+        )]);
         let mut history = vec![ChatMessage::user("please send this to marta")];
         run_once(Some(&cfg), IngressContext::channel(), &mut history, &tools).await;
 
@@ -752,7 +755,10 @@ runtime_profile = "hinted"
     async fn flag_off_records_no_decision_and_never_injects() {
         // No config at all (fail closed) and a config without the profile
         // flag: the prescan records nothing and the engine injects nothing.
-        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool(
+            "send_via",
+            &["send this to"],
+        )]);
         let mut history = vec![ChatMessage::user("please send this to marta")];
         run_once(None, IngressContext::channel(), &mut history, &tools).await;
         assert_eq!(hint_count(&history), 0);
@@ -768,7 +774,10 @@ runtime_profile = "hinted"
     async fn non_channel_origin_never_injects() {
         // Even a recorded hit is consumed only on channel turns.
         let cfg = elicitation_config();
-        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool(
+            "send_via",
+            &["send this to"],
+        )]);
         for ingress in [
             IngressContext::sub_turn(),
             IngressContext::cron(),
@@ -801,7 +810,10 @@ runtime_profile = "hinted"
     #[tokio::test]
     async fn no_trigger_match_never_injects() {
         let cfg = elicitation_config();
-        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool(
+            "send_via",
+            &["send this to"],
+        )]);
         let mut history = vec![ChatMessage::user("what's the weather like")];
         run_once(Some(&cfg), IngressContext::channel(), &mut history, &tools).await;
         assert_eq!(hint_count(&history), 0);
@@ -814,7 +826,10 @@ runtime_profile = "hinted"
         // the immutable inbound text alone: a neutral message produces
         // neither a hit nor a hint even though the history entry matches.
         let cfg = elicitation_config();
-        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["discord", "send this to"])];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool(
+            "send_via",
+            &["discord", "send this to"],
+        )]);
         let provider = PlainProvider;
         let turn_id = uuid::Uuid::new_v4().to_string();
         let _scope = TurnHintScope::new(&turn_id);
@@ -859,7 +874,10 @@ runtime_profile = "hinted"
         // context splices trigger text into the history entry, a
         // model-switch retry must still produce neither a hint nor events.
         let cfg = elicitation_config();
-        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool(
+            "send_via",
+            &["send this to"],
+        )]);
         let provider = PlainProvider;
         let turn_id = format!("enriched-retry-{}", uuid::Uuid::new_v4());
         let _scope = TurnHintScope::new(&turn_id);
@@ -923,7 +941,10 @@ runtime_profile = "hinted"
         // that already contains the hint marker (even a verbatim hint) must
         // still receive the real injection.
         let cfg = elicitation_config();
-        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool(
+            "send_via",
+            &["send this to"],
+        )]);
         let mut history = vec![ChatMessage::user(format!(
             "please send this to marta\\n\\n{}",
             hint_message("send_via")
@@ -949,7 +970,10 @@ runtime_profile = "hinted"
         // decision and injection marker live in runtime-owned state whose
         // lifetime this owning frame's scope controls.
         let cfg = elicitation_config();
-        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool(
+            "send_via",
+            &["send this to"],
+        )]);
         let mut history = vec![ChatMessage::user("please send this to marta")];
         let turn_id = format!("switch-retry-{}", uuid::Uuid::new_v4());
         let provider = PlainProvider;
@@ -1020,7 +1044,10 @@ runtime_profile = "hinted"
         // and exit without re-entering the loop; its scope must reclaim the
         // turn's state on that path.
         let cfg = elicitation_config();
-        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool(
+            "send_via",
+            &["send this to"],
+        )]);
         let mut history = vec![ChatMessage::user("please send this to marta")];
         let turn_id = format!("abandoned-handoff-{}", uuid::Uuid::new_v4());
         {
@@ -1066,7 +1093,8 @@ runtime_profile = "hinted"
         // executable on this one; the prescan covers it under execution's
         // exclusion semantics.
         let cfg = elicitation_config();
-        let tools: Vec<Box<dyn Tool>> = vec![tool("plain", &[])];
+        let tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool("plain", &[])]);
         let mut set = crate::tools::ActivatedToolSet::new();
         set.activate(
             "mcp__mail__send".to_string(),
@@ -1202,6 +1230,7 @@ runtime_profile = "hinted"
     }
 
     async fn run_hinted_call(tools: Vec<Box<dyn Tool>>) -> usize {
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools);
         // Hold the process-global hook lock for the complete
         // subscribe → turn → sentinel → collection window, so no parallel
         // test can clear or replace the broadcast hook and detach this
