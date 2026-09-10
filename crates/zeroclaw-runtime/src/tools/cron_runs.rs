@@ -85,67 +85,63 @@ impl Tool for CronRunsTool {
             }
         };
 
-        // Live job: the ownership gate is the job row itself. No live job: a
-        // successful auto-delete one-shot retains its run record, which stays
-        // readable to its own agent through the rows' durable cleanup owner —
-        // and only to it: another agent's retained history (or a row without
-        // an owner) reports the same not-found error as a foreign live job.
-        let job_id = match cron::get_job_for_agent(&self.config, job_id, &self.agent_alias) {
-            Ok(job) => job.id,
-            Err(e) => {
-                let retained_own = cron::list_runs(&self.config, job_id, 1)
-                    .ok()
-                    .and_then(|runs| runs.into_iter().next())
-                    .is_some_and(|run| run.owner_agent.as_deref() == Some(&self.agent_alias));
-                if retained_own {
-                    job_id.to_string()
-                } else {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(e.to_string()),
-                    });
-                }
-            }
-        };
-
         let limit = args
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| usize::try_from(v).unwrap_or(10));
 
-        match cron::list_runs(&self.config, &job_id, limit) {
-            Ok(runs) => {
-                let runs: Vec<RunView> = runs
-                    .into_iter()
-                    .map(|run| RunView {
-                        id: run.id,
-                        job_id: run.job_id,
-                        started_at: run.started_at,
-                        finished_at: run.finished_at,
-                        status: run.status,
-                        output: run.output.map(|out| truncate(&out, MAX_RUN_OUTPUT_CHARS)),
-                        duration_ms: run.duration_ms,
-                        execution: run.execution,
-                        delivery: run.delivery,
-                        persistence: run.persistence,
-                        principal: run.principal,
-                        executing_agent: run.executing_agent,
-                    })
-                    .collect();
-
-                Ok(ToolResult {
-                    success: true,
-                    output: serde_json::to_string_pretty(&runs)?.into(),
-                    error: None,
-                })
+        // ONE owner-scoped read is both the authorization and the
+        // retrieval: the ownership predicate rides the same query that
+        // returns the rows, so no rename or owner re-point can slip
+        // between a check and the read. It covers the live job (legacy
+        // rows without an owner resolve through the live job's current
+        // owner) and an agent's own retained one-shot history alike.
+        // Empty result: an owned live job with no runs yet lists as
+        // empty; anything else — foreign or unknown — reports the same
+        // not-found error, leaking neither existence nor output.
+        let runs = match cron::list_runs_for_agent(&self.config, job_id, &self.agent_alias, limit) {
+            Ok(runs) => runs,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(e.to_string()),
+                });
             }
-            Err(e) => Ok(ToolResult {
+        };
+        if runs.is_empty()
+            && let Err(e) = cron::get_job_for_agent(&self.config, job_id, &self.agent_alias)
+        {
+            return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
-            }),
+            });
         }
+
+        let runs: Vec<RunView> = runs
+            .into_iter()
+            .map(|run| RunView {
+                id: run.id,
+                job_id: run.job_id,
+                started_at: run.started_at,
+                finished_at: run.finished_at,
+                status: run.status,
+                output: run.output.map(|out| truncate(&out, MAX_RUN_OUTPUT_CHARS)),
+                duration_ms: run.duration_ms,
+                execution: run.execution,
+                delivery: run.delivery,
+                persistence: run.persistence,
+                principal: run.principal,
+                executing_agent: run.executing_agent,
+            })
+            .collect();
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&runs)?.into(),
+            error: None,
+        })
     }
 }
 
@@ -235,6 +231,48 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("retained-one-shot"));
         assert!(result.output.contains("executing_agent"));
+    }
+
+    #[tokio::test]
+    async fn former_owner_reads_nothing_after_rename() {
+        // The ownership predicate rides the tool's single read: after the
+        // retained record's owner is re-pointed, the former owner receives
+        // neither output nor provenance — only the not-found error.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let now = Utc::now();
+        cron::record_run(
+            &cfg,
+            "renamed-away-one-shot",
+            now,
+            now + ChronoDuration::milliseconds(1),
+            "ok",
+            cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            cron::RunProvenance {
+                principal: None,
+                executing_agent: Some(TEST_AGENT),
+                job_source: Some("imperative"),
+            },
+            Some("was-mine-once"),
+            1,
+        )
+        .unwrap();
+        cron::rename_jobs_by_agent(&cfg, TEST_AGENT, "successor-agent").unwrap();
+
+        let tool = CronRunsTool::new(cfg.clone(), TEST_AGENT);
+        let result = tool
+            .execute(json!({ "job_id": "renamed-away-one-shot" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            !format!("{:?}", result.output).contains("was-mine-once"),
+            "the former owner must not receive the output"
+        );
     }
 
     #[tokio::test]

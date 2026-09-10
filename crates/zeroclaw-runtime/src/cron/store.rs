@@ -1174,42 +1174,85 @@ fn truncate_cron_output(output: &str) -> String {
     truncated
 }
 
+const RUN_SELECT_COLUMNS: &str = "id, job_id, started_at, finished_at, status, output, duration_ms,
+                    execution, delivery, persistence, principal, executing_agent, job_source,
+                    owner_agent";
+
+fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronRun> {
+    Ok(CronRun {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        started_at: parse_rfc3339(&row.get::<_, String>(2)?).map_err(sql_conversion_error)?,
+        finished_at: parse_rfc3339(&row.get::<_, String>(3)?).map_err(sql_conversion_error)?,
+        status: row.get(4)?,
+        output: row.get(5)?,
+        duration_ms: row.get(6)?,
+        execution: row.get(7)?,
+        delivery: row.get(8)?,
+        persistence: row.get(9)?,
+        principal: row
+            .get::<_, Option<String>>(10)?
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok()),
+        executing_agent: row.get(11)?,
+        job_source: row.get(12)?,
+        owner_agent: row.get(13)?,
+    })
+}
+
 pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<CronRun>> {
     let Some(runs) = with_read_connection(config, |conn| {
         let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
-        let mut stmt = conn.prepare(
-            "SELECT id, job_id, started_at, finished_at, status, output, duration_ms,
-                    execution, delivery, persistence, principal, executing_agent, job_source,
-                    owner_agent
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_SELECT_COLUMNS}
              FROM cron_runs
              WHERE job_id = ?1
              ORDER BY started_at DESC, id DESC
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        ))?;
 
-        let rows = stmt.query_map(params![job_id, lim], |row| {
-            Ok(CronRun {
-                id: row.get(0)?,
-                job_id: row.get(1)?,
-                started_at: parse_rfc3339(&row.get::<_, String>(2)?)
-                    .map_err(sql_conversion_error)?,
-                finished_at: parse_rfc3339(&row.get::<_, String>(3)?)
-                    .map_err(sql_conversion_error)?,
-                status: row.get(4)?,
-                output: row.get(5)?,
-                duration_ms: row.get(6)?,
-                execution: row.get(7)?,
-                delivery: row.get(8)?,
-                persistence: row.get(9)?,
-                principal: row
-                    .get::<_, Option<String>>(10)?
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str(raw).ok()),
-                executing_agent: row.get(11)?,
-                job_source: row.get(12)?,
-                owner_agent: row.get(13)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![job_id, lim], map_run_row)?;
+
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(runs)
+}
+
+/// Owner-scoped run-history read: the ownership predicate rides the SAME
+/// query that returns the rows, so authorization and retrieval can never
+/// straddle a concurrent rename or owner re-point — the row set is decided
+/// atomically by one statement. A row belongs to the caller when its
+/// durable cleanup owner matches; a legacy row recorded before ownership
+/// existed belongs to whoever currently owns the live job.
+pub fn list_runs_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    limit: usize,
+) -> Result<Vec<CronRun>> {
+    let Some(runs) = with_read_connection(config, |conn| {
+        let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_SELECT_COLUMNS}
+             FROM cron_runs
+             WHERE job_id = ?1
+               AND (owner_agent = ?2
+                    OR (owner_agent IS NULL
+                        AND EXISTS (SELECT 1 FROM cron_jobs
+                                    WHERE id = ?1 AND agent_alias = ?2)))
+             ORDER BY started_at DESC, id DESC
+             LIMIT ?3"
+        ))?;
+
+        let rows = stmt.query_map(params![job_id, agent_alias, lim], map_run_row)?;
 
         let mut runs = Vec::new();
         for row in rows {
@@ -2020,6 +2063,19 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // executing_agent, so owner-scoped deletion can always find retained
     // rows whose job is gone.
     add_column_if_missing(conn, "cron_runs", "owner_agent", "TEXT")?;
+    // Rows written by the provenance schema that predates the cleanup owner
+    // carry executing_agent but a NULL owner_agent — which would strand a
+    // retained one-shot outside both its own agent's reads and the
+    // owner-scoped deletion. Seed the owner from the stamped executor once;
+    // idempotent because backfilled rows no longer match the predicate.
+    conn.execute(
+        "UPDATE cron_runs SET owner_agent = executing_agent
+         WHERE owner_agent IS NULL
+           AND executing_agent IS NOT NULL
+           AND executing_agent != ''",
+        [],
+    )
+    .context("Failed to backfill cron run cleanup ownership")?;
 
     drop_cron_runs_job_fk(conn)?;
 
@@ -3090,6 +3146,214 @@ mod tests {
         // A subsequent open finds a clean single-table state.
         let runs = list_runs(&config, "predecessor-strand", 10).unwrap();
         assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn owner_scoped_read_carries_ownership_through_rename() {
+        // The ownership predicate rides the read itself, so a rename or
+        // owner re-point between any prior check and the read changes what
+        // the read returns: the former owner receives neither output nor
+        // provenance, on the live and the retained path alike.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+
+        // Live path: owned job with a run row.
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("live-secret"),
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "test-agent", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        rename_jobs_by_agent(&config, "test-agent", "agent-b").unwrap();
+        assert!(
+            list_runs_for_agent(&config, &job.id, "test-agent", 10)
+                .unwrap()
+                .is_empty(),
+            "the former owner must receive nothing after the rename"
+        );
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "agent-b", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Retained path: a one-shot record with no live job.
+        record_run(
+            &config,
+            "retained-scoped",
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("agent-c"),
+                job_source: Some("imperative"),
+            },
+            Some("retained-secret"),
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, "retained-scoped", "agent-c", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        rename_jobs_by_agent(&config, "agent-c", "agent-d").unwrap();
+        assert!(
+            list_runs_for_agent(&config, "retained-scoped", "agent-c", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_runs_for_agent(&config, "retained-scoped", "agent-d", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Legacy rows without an owner resolve through the LIVE job's
+        // current owner only.
+        let legacy_job = add_job(&config, "test-agent", "*/5 * * * *", "echo legacy").unwrap();
+        record_run(
+            &config,
+            &legacy_job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
+                job_source: Some("imperative"),
+            },
+            Some("legacy-row"),
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, &legacy_job.id, "test-agent", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            list_runs_for_agent(&config, &legacy_job.id, "someone-else", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn upgrade_from_prior_provenance_schema_backfills_owner() {
+        // The immediately preceding provenance schema stored
+        // executing_agent and job_source but no owner_agent: without the
+        // backfill, a retained one-shot upgraded from it would be
+        // unreadable to its own agent and invisible to owner-scoped
+        // deletion. The backfill seeds the owner from the stamped executor.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                execution   TEXT,
+                delivery    TEXT,
+                persistence TEXT,
+                principal   TEXT,
+                executing_agent TEXT,
+                job_source  TEXT
+            );",
+        )
+        .unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output,
+                                    duration_ms, execution, delivery, persistence,
+                                    executing_agent, job_source)
+             VALUES ('upgraded-one-shot', ?1, ?2, 'ok', 'done', 5,
+                     'ok', 'not_required', 'not_bound', 'agent-a', 'imperative')",
+            params![
+                now.to_rfc3339(),
+                (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Owner read works after the upgrade...
+        let runs = list_runs_for_agent(&config, "upgraded-one-shot", "agent-a", 10).unwrap();
+        assert_eq!(runs.len(), 1, "backfilled owner must authorize the read");
+        assert_eq!(runs[0].owner_agent.as_deref(), Some("agent-a"));
+        assert_eq!(runs[0].executing_agent.as_deref(), Some("agent-a"));
+
+        // ...the owner follows a rename...
+        rename_jobs_by_agent(&config, "agent-a", "agent-b").unwrap();
+        assert!(
+            list_runs_for_agent(&config, "upgraded-one-shot", "agent-a", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_runs_for_agent(&config, "upgraded-one-shot", "agent-b", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // ...and owner-scoped deletion finds the retained row.
+        remove_jobs_by_agent(&config, "agent-b").unwrap();
+        assert!(
+            list_runs(&config, "upgraded-one-shot", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
