@@ -224,10 +224,13 @@ pub struct CronRun {
     /// provenance existed.
     #[serde(default)]
     pub job_source: Option<String>,
-    /// Durable CURRENT cleanup owner: starts as the executing agent and
-    /// follows agent renames, unlike the immutable `executing_agent`
-    /// historical fact. Owner-scoped deletion and authorized retained-row
-    /// reads key on this. `None` on rows recorded before it existed.
+    /// Durable CURRENT cleanup owner: stamped as the executing agent at
+    /// insert and re-pointed by agent renames, unlike the immutable
+    /// `executing_agent` historical fact. Owner-scoped deletion and
+    /// authorized retained-row reads key on this. How a `None` (pre-column
+    /// row) resolves — live-job fallback or quarantine — is owned by the
+    /// store's read/upgrade paths; see `list_runs_for_agent` and
+    /// `initialize_schema` in `cron::store`.
     #[serde(default)]
     pub owner_agent: Option<String>,
 }
