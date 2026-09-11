@@ -5,7 +5,7 @@ use crate::cron::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
@@ -1808,21 +1808,13 @@ fn convert_delivery_decl(decl: &zeroclaw_config::schema::DeliveryConfigDecl) -> 
     }
 }
 
-/// Returns whether the column was actually added, so a caller can run
-/// one-time data migration exactly once per database lifetime instead of
-/// on every connection open.
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    name: &str,
-    sql_type: &str,
-) -> Result<bool> {
+fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &str) -> Result<()> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let col_name: String = row.get(1)?;
         if col_name == name {
-            return Ok(false);
+            return Ok(());
         }
     }
     // Drop the statement/rows before executing ALTER to release any locks
@@ -1835,7 +1827,7 @@ fn add_column_if_missing(
         &format!("ALTER TABLE {table} ADD COLUMN {name} {sql_type}"),
         [],
     ) {
-        Ok(_) => Ok(true),
+        Ok(_) => Ok(()),
         Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
             if msg.contains("duplicate column name") =>
         {
@@ -1847,7 +1839,7 @@ fn add_column_if_missing(
                     ),
                 "Column already exists (concurrent migration)"
             );
-            Ok(false)
+            Ok(())
         }
         Err(e) => Err(e).with_context(|| format!("Failed to add {table}.{name}")),
     }
@@ -1990,6 +1982,14 @@ fn apply_run_completion_state(
 }
 
 fn initialize_schema(conn: &Connection) -> Result<()> {
+    // Before anything references cron_runs: in the between-DROP-and-RENAME
+    // state an interrupted (predecessor, non-atomic) rebuild leaves behind,
+    // the stranded working table is the ONLY holder of the run history, and
+    // creating cron_runs first would fork the history away from it. The
+    // beside-cron_runs stranded state is instead merged later, once the
+    // additive migrations guarantee every stranded column exists.
+    recover_stranded_cron_runs_table(conn)?;
+
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS cron_jobs (
@@ -2100,27 +2100,91 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // re-pointed by renames, unlike the immutable historical
     // executing_agent, so owner-scoped deletion can always find retained
     // rows whose job is gone.
-    let owner_column_added = add_column_if_missing(conn, "cron_runs", "owner_agent", "TEXT")?;
+    add_column_if_missing(conn, "cron_runs", "owner_agent", "TEXT")?;
 
+    merge_stranded_cron_runs_rows(conn)?;
     drop_cron_runs_job_fk(conn)?;
+    run_owner_migration(conn)?;
 
-    // One-time ownership migration for rows written before the cleanup
-    // owner existed — gated on the column having JUST been added and run
-    // after the rebuild recovery above, so recovered rows participate and
-    // no per-open scan is paid afterwards.
-    //
-    // A NULL-owner row whose job is LIVE has an unambiguous current owner:
-    // the job row itself (renames update it). Stamp those. A NULL-owner
-    // row with NO live job is different — the immutable executing_agent
-    // cannot stand in for the current owner (a pre-owner-schema rename
-    // updated only live jobs, and a reused alias may denote a different
-    // agent), so those rows are QUARANTINED: no agent-scoped read, skipped
-    // by the owner cascade. They can still be removed by job id through
-    // remove_job, and a declarative id being reassigned purges them before
-    // the new job exists. Rows an interrupted migration leaves NULL keep
-    // resolving through the live-job arm of the owner-scoped read.
-    if owner_column_added {
-        conn.execute(
+    Ok(())
+}
+
+/// True when SQLite reports lock contention with another connection. The
+/// one-time migration and recovery paths treat it as "another process is
+/// doing this work": their bodies are idempotent and re-run on the next
+/// open, so deferring beats failing the caller's cron operation.
+fn is_lock_contention(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
+/// Begin an IMMEDIATE transaction (write lock taken up front, so no
+/// deferred read-to-write upgrade that SQLite refuses to retry), or `None`
+/// on lock contention.
+fn begin_immediate(conn: &Connection) -> Result<Option<Transaction<'_>>> {
+    match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+        Ok(tx) => Ok(Some(tx)),
+        Err(e) if is_lock_contention(&e) => Ok(None),
+        Err(e) => Err(e).context("Failed to begin cron migration transaction"),
+    }
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let count: i64 = conn
+        .prepare("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+        .query_row(params![name], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// `PRAGMA user_version` step claimed by the ownership data migration.
+/// The cron database's marker is a monotonic migration ladder: a future
+/// data migration claims the next integer and gates on `< its step`, never
+/// reusing or lowering an earlier one. The marker commits in the same
+/// transaction as the migration's writes, so "column exists but the data
+/// migration never ran" is not a reachable durable state: either both
+/// committed or the migration re-runs on the next open.
+const OWNER_MIGRATION_COMPLETE: i64 = 1;
+
+/// One-time ownership migration for rows written before the cleanup owner
+/// existed, gated on the persisted completion marker so no per-open scan
+/// is paid afterwards. The body is idempotent (it touches only NULL-owner
+/// rows), so an interrupted or concurrent attempt simply re-runs to
+/// completion on a later open.
+///
+/// A NULL-owner row whose job is LIVE has an unambiguous current owner:
+/// the job row itself (renames update it). Stamp those. A NULL-owner row
+/// with NO live job is different — the immutable executing_agent cannot
+/// stand in for the current owner (a pre-owner-schema rename updated only
+/// live jobs, and a reused alias may denote a different agent), so those
+/// rows are QUARANTINED: no agent-scoped read, skipped by the owner
+/// cascade. They can still be removed by job id through remove_job, and a
+/// declarative id being reassigned purges them before the new job exists.
+fn run_owner_migration(conn: &Connection) -> Result<()> {
+    let migrated: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("Failed to read cron DB migration marker")?;
+    if migrated >= OWNER_MIGRATION_COMPLETE {
+        return Ok(());
+    }
+
+    let Some(tx) = begin_immediate(conn)? else {
+        return Ok(());
+    };
+    // A fresh database — and one whose rows were all stamped at insert —
+    // has nothing to migrate: skip the scans and just record completion.
+    let needs_data_pass: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM cron_runs WHERE owner_agent IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to probe for unmigrated run-history rows")?;
+    if needs_data_pass {
+        tx.execute(
             "UPDATE cron_runs
              SET owner_agent = (SELECT j.agent_alias FROM cron_jobs j
                                 WHERE j.id = cron_runs.job_id)
@@ -2132,29 +2196,182 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             [],
         )
         .context("Failed to stamp run-history ownership from live jobs")?;
-
-        let quarantined: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM cron_runs r
-                 WHERE r.owner_agent IS NULL
-                   AND NOT EXISTS (SELECT 1 FROM cron_jobs j WHERE j.id = r.job_id)",
-                [],
-                |row| row.get(0),
-            )
-            .context("Failed to count quarantined run-history rows")?;
-        if quarantined > 0 {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Cron)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"count": quarantined})),
-                "cron run history rows with unreconstructible ownership were quarantined during upgrade (no agent-scoped access; removable by job id)"
-            );
-        }
+    }
+    tx.execute_batch(&format!("PRAGMA user_version = {OWNER_MIGRATION_COMPLETE}"))
+        .context("Failed to record the ownership migration marker")?;
+    match tx.commit() {
+        Ok(()) => {}
+        Err(e) if is_lock_contention(&e) => return Ok(()),
+        Err(e) => return Err(e).context("Failed to commit the ownership migration"),
     }
 
+    if needs_data_pass {
+        warn_if_quarantined(conn)?;
+    }
     Ok(())
+}
+
+/// Emit the operator-facing notice for run-history rows whose current
+/// ownership is unreconstructible. Worded as standing state, not an event,
+/// because the migration can legitimately re-run over a database an earlier
+/// build already migrated (it never wrote the marker) and re-observe the
+/// same rows.
+fn warn_if_quarantined(conn: &Connection) -> Result<()> {
+    let quarantined: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM cron_runs r
+             WHERE r.owner_agent IS NULL
+               AND NOT EXISTS (SELECT 1 FROM cron_jobs j WHERE j.id = r.job_id)",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to count quarantined run-history rows")?;
+    if quarantined > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Cron)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"count": quarantined})),
+            "cron run history rows have unreconstructible ownership and are quarantined (no agent-scoped access; removable by job id)"
+        );
+    }
+    Ok(())
+}
+
+/// Complete the between-DROP-and-RENAME state an interrupted non-atomic
+/// (predecessor) `cron_runs` rebuild can leave behind: the working table
+/// exists and `cron_runs` does not, so the working table IS the run
+/// history. Runs before schema creation or column migration ever
+/// references `cron_runs`, because recreating the table first would strand
+/// that history. Columns the stranded table predates are added by the
+/// additive migration that follows.
+///
+/// The other stranded shape — a working table beside a live `cron_runs` —
+/// is handled by `merge_stranded_cron_runs_rows` after the additive
+/// migrations instead, where the live table is guaranteed to carry every
+/// stranded column.
+fn recover_stranded_cron_runs_table(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "cron_runs_no_fk")? {
+        return Ok(());
+    }
+    let Some(tx) = begin_immediate(conn)? else {
+        return Ok(());
+    };
+    // Re-checked under the write lock: a concurrent open may have finished
+    // the recovery between the probe above and here.
+    if !table_exists(&tx, "cron_runs_no_fk")? || table_exists(&tx, "cron_runs")? {
+        return Ok(());
+    }
+    tx.execute_batch("ALTER TABLE cron_runs_no_fk RENAME TO cron_runs;")
+        .context("Failed to finish interrupted cron_runs rebuild")?;
+    match tx.commit() {
+        Ok(()) => Ok(()),
+        Err(e) if is_lock_contention(&e) => Ok(()),
+        Err(e) => Err(e).context("Failed to commit cron_runs rebuild recovery"),
+    }
+}
+
+/// Merge a working table stranded BESIDE `cron_runs` back into it and give
+/// the merged rows the same one-time ownership migration a direct upgrade
+/// gets, scoped to exactly the rows that arrived here — never re-running
+/// the global pass, which would re-stamp modern rows whose NULL owner is
+/// deliberate (no executing agent was known at insert).
+///
+/// Runs after the additive migrations, so every column the stranded table
+/// shares with the schema exists on `cron_runs`; the merge list is the
+/// case-insensitive intersection in canonical casing, which also keeps a
+/// stranded column this schema does not know from breaking the merge.
+/// Whatever prefix the interrupted attempt committed, every run row is in
+/// `cron_runs`, in the working table, or (by id) in both, so INSERT OR
+/// IGNORE plus dropping the working table restores a clean single-table
+/// state without loss or duplication.
+fn merge_stranded_cron_runs_rows(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "cron_runs_no_fk")? {
+        return Ok(());
+    }
+    // Stranded rows may reference jobs that no longer exist, and the
+    // surviving cron_runs in this state is exactly the legacy FK-bearing
+    // shape, so enforcement would reject the merge. The pragma is a no-op
+    // inside a transaction; toggle it around one.
+    conn.execute_batch("PRAGMA foreign_keys = OFF")
+        .context("Failed to suspend FK enforcement for cron_runs recovery")?;
+    let merged = merge_stranded_rows_locked(conn);
+    let restored = conn
+        .execute_batch("PRAGMA foreign_keys = ON")
+        .context("Failed to restore FK enforcement after cron_runs recovery");
+    let quarantined = merged?;
+    restored?;
+    if quarantined > 0 {
+        warn_if_quarantined(conn)?;
+    }
+    Ok(())
+}
+
+fn merge_stranded_rows_locked(conn: &Connection) -> Result<i64> {
+    fn column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(names)
+    }
+
+    let Some(tx) = begin_immediate(conn)? else {
+        return Ok(0);
+    };
+    // Re-checked under the write lock: a concurrent open may have already
+    // merged and dropped the working table.
+    if !table_exists(&tx, "cron_runs_no_fk")? {
+        return Ok(0);
+    }
+    let ours = column_names(&tx, "cron_runs")?;
+    let theirs = column_names(&tx, "cron_runs_no_fk")?;
+    let column_list = ours
+        .iter()
+        .filter(|ours_name| {
+            theirs
+                .iter()
+                .any(|theirs_name| theirs_name.eq_ignore_ascii_case(ours_name))
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    tx.execute_batch(&format!(
+        "INSERT OR IGNORE INTO cron_runs ({column_list})
+            SELECT {column_list} FROM cron_runs_no_fk;"
+    ))
+    .context("Failed to recover interrupted cron_runs rebuild state")?;
+    tx.execute(
+        "UPDATE cron_runs
+         SET owner_agent = (SELECT j.agent_alias FROM cron_jobs j
+                            WHERE j.id = cron_runs.job_id)
+         WHERE owner_agent IS NULL
+           AND id IN (SELECT id FROM cron_runs_no_fk)
+           AND EXISTS (SELECT 1 FROM cron_jobs j
+                       WHERE j.id = cron_runs.job_id
+                         AND j.agent_alias IS NOT NULL
+                         AND j.agent_alias != '')",
+        [],
+    )
+    .context("Failed to stamp ownership of recovered run-history rows")?;
+    let quarantined: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM cron_runs r
+             WHERE r.owner_agent IS NULL
+               AND r.id IN (SELECT id FROM cron_runs_no_fk)
+               AND NOT EXISTS (SELECT 1 FROM cron_jobs j WHERE j.id = r.job_id)",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to count quarantined recovered rows")?;
+    tx.execute_batch("DROP TABLE cron_runs_no_fk;")
+        .context("Failed to drop the recovered cron_runs working table")?;
+    match tx.commit() {
+        Ok(()) => Ok(quarantined),
+        Err(e) if is_lock_contention(&e) => Ok(0),
+        Err(e) => Err(e).context("Failed to commit cron_runs rebuild recovery"),
+    }
 }
 
 /// One-time rebuild for legacy databases whose `cron_runs` still declares
@@ -2164,56 +2381,12 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
 /// history must outlive completion-time job deletion; operator-initiated
 /// removals delete it explicitly instead.
 ///
-/// Atomic and retry-safe: the copy/drop/rename runs as one transaction, and
-/// any partial state left behind by an interrupted earlier attempt (a stale
-/// working table beside — or instead of — the real one) is first recovered
-/// by merging its rows back before the rebuild proceeds. A table already
-/// without the foreign key is left untouched.
+/// Atomic: the copy/drop/rename runs as one transaction. Partial state a
+/// predecessor's non-atomic attempt left behind is handled earlier in
+/// `initialize_schema` by `recover_stranded_cron_runs_table` and
+/// `merge_stranded_cron_runs_rows`. A table already without the foreign
+/// key is left untouched.
 fn drop_cron_runs_job_fk(conn: &Connection) -> Result<()> {
-    fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
-        let count: i64 = conn
-            .prepare("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")?
-            .query_row(params![name], |row| row.get(0))?;
-        Ok(count > 0)
-    }
-
-    // Recover from an interrupted earlier attempt before anything else.
-    // Whatever prefix it committed, the invariant holds: every run row is
-    // in `cron_runs`, in the working table, or (by id) in both — so merging
-    // the working table into `cron_runs` with INSERT OR IGNORE and dropping
-    // it restores a clean single-table state without loss or duplication.
-    if table_exists(conn, "cron_runs_no_fk")? {
-        let tx = conn.unchecked_transaction()?;
-        if !table_exists(&tx, "cron_runs")? {
-            // Interrupted between DROP and RENAME, before anything
-            // recreated `cron_runs`: the working table IS the data —
-            // finishing the rename recovers it wholesale. Any columns the
-            // stranded table predates are added by the additive migration
-            // that follows this recovery.
-            tx.execute_batch("ALTER TABLE cron_runs_no_fk RENAME TO cron_runs;")
-                .context("Failed to finish interrupted cron_runs rebuild")?;
-        } else {
-            // Merge by the columns the stranded table ACTUALLY has: a
-            // predecessor migration's working table predates later additive
-            // columns, and selecting a column it never had would fail and
-            // leave the history inaccessible.
-            let stranded_columns: Vec<String> = {
-                let mut stmt = tx.prepare("PRAGMA table_info(cron_runs_no_fk)")?;
-                stmt.query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            let column_list = stranded_columns.join(", ");
-            tx.execute_batch(&format!(
-                "INSERT OR IGNORE INTO cron_runs ({column_list})
-                    SELECT {column_list} FROM cron_runs_no_fk;
-                DROP TABLE cron_runs_no_fk;"
-            ))
-            .context("Failed to recover interrupted cron_runs rebuild state")?;
-        }
-        tx.commit()
-            .context("Failed to commit cron_runs rebuild recovery")?;
-    }
-
     let has_fk = {
         let mut stmt = conn.prepare("PRAGMA foreign_key_list(cron_runs)")?;
         let mut rows = stmt.query([])?;
@@ -2917,12 +3090,12 @@ mod tests {
         .unwrap();
     }
 
-    fn insert_legacy_run(conn: &Connection, table: &str, job_id: &str) {
+    fn insert_legacy_run_with_id(conn: &Connection, table: &str, job_id: &str, id: i64) {
         let now = Utc::now();
         conn.execute(
             &format!(
                 "INSERT INTO {table} (id, job_id, started_at, finished_at, status, output, duration_ms)
-                 VALUES (1, ?1, ?2, ?3, 'ok', 'done', 5)"
+                 VALUES ({id}, ?1, ?2, ?3, 'ok', 'done', 5)"
             ),
             params![
                 job_id,
@@ -2956,7 +3129,7 @@ mod tests {
         )
         .unwrap();
         legacy_fk_cron_runs_schema(&conn);
-        insert_legacy_run(&conn, "cron_runs", "interrupted-a");
+        insert_legacy_run_with_id(&conn, "cron_runs", "interrupted-a", 1);
         conn.execute_batch(
             "CREATE TABLE cron_runs_no_fk (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2975,11 +3148,20 @@ mod tests {
             );",
         )
         .unwrap();
-        insert_legacy_run(&conn, "cron_runs_no_fk", "interrupted-a");
+        insert_legacy_run_with_id(&conn, "cron_runs_no_fk", "interrupted-a", 1);
+        // A stranded row whose job is gone: the surviving cron_runs still
+        // declares the FK, so the merge must run with enforcement off or
+        // this row is lost.
+        insert_legacy_run_with_id(&conn, "cron_runs_no_fk", "gone-job", 2);
         drop(conn);
 
         let runs = list_runs(&config, "interrupted-a", 10).unwrap();
         assert_eq!(runs.len(), 1, "row must survive exactly once, {runs:?}");
+        assert_eq!(
+            list_runs(&config, "gone-job", 10).unwrap().len(),
+            1,
+            "an orphan stranded row must merge despite the legacy FK"
+        );
 
         let conn = Connection::open(cron_db(&config)).unwrap();
         let temp_gone: i64 = conn
@@ -3040,7 +3222,7 @@ mod tests {
             );",
         )
         .unwrap();
-        insert_legacy_run(&conn, "cron_runs_no_fk", "interrupted-b");
+        insert_legacy_run_with_id(&conn, "cron_runs_no_fk", "interrupted-b", 1);
         drop(conn);
 
         let runs = list_runs(&config, "interrupted-b", 10).unwrap();
@@ -3207,7 +3389,7 @@ mod tests {
             );",
         )
         .unwrap();
-        insert_legacy_run(&conn, "cron_runs_no_fk", "predecessor-strand");
+        insert_legacy_run_with_id(&conn, "cron_runs_no_fk", "predecessor-strand", 1);
         drop(conn);
 
         // Recovery through the public open path must preserve the row even
@@ -3361,6 +3543,9 @@ mod tests {
                 command          TEXT NOT NULL,
                 created_at       TEXT NOT NULL,
                 next_run         TEXT NOT NULL,
+                last_run         TEXT,
+                last_status      TEXT,
+                last_output      TEXT,
                 agent_alias      TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE cron_runs (
@@ -3401,6 +3586,150 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_pre_owner_job(conn: &Connection, id: &str, alias: &str) {
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, agent_alias)
+             VALUES (?1, '*/5 * * * *', 'echo live', ?2, ?3, ?4)",
+            params![
+                id,
+                now.to_rfc3339(),
+                (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                alias,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn open_recovers_a_sole_stranded_working_table() {
+        // A predecessor (non-atomic) rebuild interrupted between DROP TABLE
+        // cron_runs and the RENAME leaves the working table as the ONLY
+        // holder of run history. The next open must complete that rename
+        // before anything else references cron_runs, carry the rows through
+        // the additive column migrations exactly once, and give them the
+        // same ownership migration a direct upgrade gets.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_owner_schema(&conn);
+        insert_pre_owner_job(&conn, "live-legacy", "agent-a");
+        insert_pre_owner_run(&conn, "live-legacy", "agent-a", "live-output");
+        insert_pre_owner_run(&conn, "gone-one-shot", "agent-a", "orphan");
+        let now = Utc::now();
+        conn.execute_batch("ALTER TABLE cron_runs RENAME TO cron_runs_no_fk;")
+            .unwrap();
+        drop(conn);
+
+        // Recovery, migration, and the ownership backfill through the
+        // public open path.
+        let runs = list_runs_for_agent(&config, "live-legacy", "agent-a", 10).unwrap();
+        assert_eq!(runs.len(), 1, "recovered live row must reach its owner");
+        assert_eq!(runs[0].owner_agent.as_deref(), Some("agent-a"));
+        assert!(
+            list_runs_for_agent(&config, "gone-one-shot", "agent-a", 10)
+                .unwrap()
+                .is_empty(),
+            "recovered orphan must be quarantined, not attributed"
+        );
+        assert_eq!(list_runs(&config, "gone-one-shot", 10).unwrap().len(), 1);
+
+        with_initialized_connection(&config, |conn| {
+            let stranded: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'cron_runs_no_fk'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(stranded, 0, "the working table must be gone after recovery");
+            let live_rows: i64 = conn.query_row(
+                "SELECT count(*) FROM cron_runs WHERE job_id = 'live-legacy'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(live_rows, 1, "rows must survive exactly once");
+            Ok(())
+        })
+        .unwrap();
+
+        // All later columns must be usable: a fresh run persists with full
+        // provenance on the recovered table.
+        let job = get_job(&config, "live-legacy").unwrap();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(7),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("agent-a"),
+                job_source: Some("imperative"),
+            },
+            Some("fresh"),
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, "live-legacy", "agent-a", 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn interrupted_owner_migration_completes_on_a_later_open() {
+        // The state a crash leaves when the owner_agent column addition
+        // reached disk but the data migration did not: column present,
+        // owners NULL, completion marker unset. A later open must finish
+        // the migration rather than skip it forever — otherwise the live
+        // row becomes permanently unowned the moment its job goes away.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_owner_schema(&conn);
+        conn.execute("ALTER TABLE cron_runs ADD COLUMN owner_agent TEXT", [])
+            .unwrap();
+        insert_pre_owner_job(&conn, "live-legacy", "agent-a");
+        insert_pre_owner_run(&conn, "live-legacy", "agent-a", "live-output");
+        drop(conn);
+
+        let runs = list_runs_for_agent(&config, "live-legacy", "agent-a", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].owner_agent.as_deref(),
+            Some("agent-a"),
+            "a later open must complete the interrupted ownership migration"
+        );
+
+        rename_jobs_by_agent(&config, "agent-a", "agent-b").unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, "live-legacy", "agent-b", 10)
+                .unwrap()
+                .len(),
+            1,
+            "the completed migration must follow renames"
+        );
+        assert!(
+            list_runs_for_agent(&config, "live-legacy", "agent-a", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        remove_jobs_by_agent(&config, "agent-b").unwrap();
+        assert!(
+            list_runs(&config, "live-legacy", 10).unwrap().is_empty(),
+            "owner-scoped deletion must find the migrated row"
+        );
+    }
+
     #[test]
     fn upgrade_stamps_live_job_ownership_and_quarantines_orphans() {
         // Pre-owner lifecycle under test, in order: agent A executed two
@@ -3416,16 +3745,7 @@ mod tests {
         std::fs::create_dir_all(cron_dir(&config)).unwrap();
         let conn = Connection::open(cron_db(&config)).unwrap();
         pre_owner_schema(&conn);
-        let now = Utc::now();
-        conn.execute(
-            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, agent_alias)
-             VALUES ('live-legacy', '*/5 * * * *', 'echo live', ?1, ?2, 'agent-a')",
-            params![
-                now.to_rfc3339(),
-                (now + ChronoDuration::minutes(5)).to_rfc3339(),
-            ],
-        )
-        .unwrap();
+        insert_pre_owner_job(&conn, "live-legacy", "agent-a");
         insert_pre_owner_run(&conn, "live-legacy", "agent-a", "live-output");
         insert_pre_owner_run(&conn, "gone-one-shot", "agent-a", "orphan-secret");
         // The pre-owner schema's rename A -> B reaches only live job rows.
@@ -3482,6 +3802,94 @@ mod tests {
         // removal succeeds and purges the quarantined record.
         remove_job(&config, "gone-one-shot").unwrap();
         assert!(list_runs(&config, "gone-one-shot", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_recovery_stamps_only_merged_rows() {
+        // A stranded working table can be merged into a database whose
+        // ownership migration already completed. The merged pre-owner rows
+        // get the one-time stamping, scoped to them alone: a modern row
+        // whose NULL owner is deliberate (no executing agent known at
+        // insert) must stay unowned.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "agent-a", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
+                job_source: Some("imperative"),
+            },
+            Some("deliberately-unowned"),
+            5,
+        )
+        .unwrap();
+
+        with_initialized_connection(&config, |conn| {
+            conn.execute_batch(
+                "CREATE TABLE cron_runs_no_fk (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id      TEXT NOT NULL,
+                    started_at  TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    output      TEXT,
+                    duration_ms INTEGER,
+                    execution   TEXT,
+                    delivery    TEXT,
+                    persistence TEXT,
+                    principal   TEXT,
+                    executing_agent TEXT,
+                    job_source  TEXT
+                );",
+            )
+            .map_err(anyhow::Error::from)?;
+            conn.execute(
+                "INSERT INTO cron_runs_no_fk (id, job_id, started_at, finished_at, status,
+                                              output, duration_ms, executing_agent, job_source)
+                 VALUES (9001, ?1, ?2, ?3, 'ok', 'stranded-output', 5, 'agent-a', 'imperative')",
+                params![
+                    job.id,
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+                ],
+            )
+            .map_err(anyhow::Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Next open merges the stranded table into the migrated database.
+        let runs = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        let merged = runs
+            .iter()
+            .find(|r| r.output.as_deref() == Some("stranded-output"))
+            .unwrap();
+        assert_eq!(
+            merged.owner_agent.as_deref(),
+            Some("agent-a"),
+            "the merged pre-owner row must get the one-time stamping"
+        );
+        let modern = runs
+            .iter()
+            .find(|r| r.output.as_deref() == Some("deliberately-unowned"))
+            .unwrap();
+        assert!(
+            modern.owner_agent.is_none(),
+            "a modern deliberately-unowned row must not be re-stamped by recovery"
+        );
     }
 
     #[test]
