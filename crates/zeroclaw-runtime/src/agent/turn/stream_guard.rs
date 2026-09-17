@@ -9,9 +9,10 @@ use super::protocol_detect::{
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
     TERMINAL_MARKERS, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
-    contains_tool_protocol_tag_call, looks_like_malformed_tool_protocol_envelope_for_known_tools,
-    looks_like_tool_protocol_envelope, looks_like_tool_protocol_example,
-    strip_trailing_terminal_markers, tool_protocol_envelope_mentions_known_tool,
+    contains_tool_protocol_tag_call, embedded_tool_protocol_envelope_mentions_known_tool,
+    looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
+    looks_like_tool_protocol_example, strip_trailing_terminal_markers,
+    tool_protocol_envelope_mentions_known_tool,
 };
 
 #[derive(Debug, Default)]
@@ -206,6 +207,16 @@ impl StreamTextGuard {
             return true;
         }
 
+        // A protocol object for an active tool embedded in the held-back text
+        // (a python tool stub, or an envelope inside other JSON) is valid JSON
+        // that the checks above do not recognize; releasing it would stream a
+        // leak the final response check then rejects.
+        if self.has_active_tools
+            && embedded_tool_protocol_envelope_mentions_known_tool(text, &self.known_tool_names)
+        {
+            return true;
+        }
+
         self.looks_like_active_tool_json(text)
     }
 }
@@ -269,6 +280,43 @@ impl StreamThinkTagStripper {
             return String::new();
         }
         std::mem::take(&mut self.pending)
+    }
+}
+
+#[cfg(test)]
+mod embedded_protocol_stream_tests {
+    use super::StreamTextGuard;
+
+    fn shell_guard() -> StreamTextGuard {
+        let specs = vec![crate::tools::ToolSpec::new(
+            "shell",
+            "run a command",
+            serde_json::json!({"type": "object"}),
+        )];
+        StreamTextGuard::new(Some(&specs))
+    }
+
+    #[test]
+    fn python_tool_stub_leak_is_never_streamed() {
+        let mut guard = shell_guard();
+        let mut forwarded = String::new();
+        for chunk in [
+            "Creating the draft now.\n",
+            r#"{"content":"One moment.","tool_code":"print(shell(\"ls\"))","tool_name":"shell"}"#,
+            " Done shortly.",
+        ] {
+            if let Some(out) = guard.push(chunk) {
+                forwarded.push_str(&out);
+            }
+        }
+        if let Some(out) = guard.finish() {
+            forwarded.push_str(&out);
+        }
+        assert!(
+            !forwarded.contains("tool_code"),
+            "stub bytes reached the stream: {forwarded:?}"
+        );
+        assert!(guard.suppressed_protocol, "the leak must be suppressed");
     }
 }
 
