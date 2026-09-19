@@ -2366,7 +2366,7 @@ fn embedded_protocol_objects_are_all_framed_as_examples(text: &str) -> bool {
 /// - Detection reads the PARSED value, so a duplicate or whitespace-padded
 ///   protocol key (`"tool_calls"` twice, `"tool_calls "`) hides the leak
 ///   from the scan while the bytes still reach the reply.
-/// - Replies longer than [`MAX_EMBEDDED_SCAN_BYTES`] are not scanned.
+/// - Replies longer than the embedded scan bound (64 KiB) are not scanned.
 pub fn embedded_tool_protocol_envelope_mentions_known_tool(
     text: &str,
     known_tool_names: &HashSet<String>,
