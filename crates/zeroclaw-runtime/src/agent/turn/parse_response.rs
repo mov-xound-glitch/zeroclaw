@@ -956,6 +956,8 @@ mod cost_usd_regression_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id,
+            serving_provider_name: None,
+            serving_model: None,
         }
     }
 
