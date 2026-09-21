@@ -187,12 +187,12 @@ impl Tool for SendMessageToPeerTool {
                 .cloned()
                 .unwrap_or_else(|| target.clone());
 
-            let cfg = (*self.config).clone();
+            let cfg = Arc::clone(&self.config);
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
             let body = message.clone();
             // Build the recipient's cost-tracking context from `&cfg` before
-            // `cfg` moves into `process_message` below — a detached
+            // `cfg` moves into `process_message_shared` below — a detached
             // `zeroclaw_spawn::spawn!` task does not inherit the caller's
             // task-locals, so the recipient's turn would otherwise run with
             // no cost context and its spend would go unrecorded.
@@ -204,7 +204,7 @@ impl Tool for SendMessageToPeerTool {
                 // Heap-pinned: a full agent turn is one of the largest
                 // futures in the runtime, and holding it inline in this
                 // task overflows 2 MiB stacks (test threads, Windows).
-                let turn = Box::pin(crate::agent::loop_::process_message(
+                let turn = Box::pin(crate::agent::loop_::process_message_shared(
                     cfg,
                     &recipient_alias,
                     &body,
