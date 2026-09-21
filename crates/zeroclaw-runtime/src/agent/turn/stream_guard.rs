@@ -13,7 +13,7 @@ use zeroclaw_tool_call_parser::{
     embedded_tool_protocol_envelope_mentions_known_tool,
     looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
     looks_like_tool_protocol_example, names_known_tool, strip_trailing_terminal_markers,
-    tool_protocol_envelope_mentions_known_tool,
+    tool_protocol_envelope_mentions_known_tool, unframed_embedded_protocol_mentions_known_tool,
 };
 
 #[derive(Debug, Default)]
@@ -189,8 +189,13 @@ impl StreamTextGuard {
     fn buffer_embeds_leak(&self, text: &str) -> bool {
         self.has_active_tools
             && embedded_tool_protocol_envelope_mentions_known_tool(text, &self.known_tool_names)
-            && !looks_like_tool_protocol_example(text)
-            && !looks_like_tool_protocol_example(&format!("{}{}", self.recent_prose, text))
+            && (!(looks_like_tool_protocol_example(text)
+                || looks_like_tool_protocol_example(&format!("{}{}", self.recent_prose, text)))
+                || unframed_embedded_protocol_mentions_known_tool(
+                    &self.recent_prose,
+                    text,
+                    &self.known_tool_names,
+                ))
     }
 
     fn suppress_protocol(&mut self) {
@@ -256,8 +261,13 @@ impl StreamTextGuard {
         // before it. Asking `example_framing_precedes(prose_before)` alone
         // would let one framing phrase exempt the whole rest of the stream,
         // including a second, unframed leak after the illustrated one.
-        if looks_like_tool_protocol_example(text)
-            || looks_like_tool_protocol_example(&format!("{prose_before}{text}"))
+        if (looks_like_tool_protocol_example(text)
+            || looks_like_tool_protocol_example(&format!("{prose_before}{text}")))
+            && !unframed_embedded_protocol_mentions_known_tool(
+                prose_before,
+                text,
+                &self.known_tool_names,
+            )
         {
             return false;
         }
@@ -526,6 +536,45 @@ mod embedded_protocol_stream_tests {
             "streaming must continue after inline JSON"
         );
         assert!(!guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn a_tag_example_does_not_carry_a_bare_leak_onto_the_stream() {
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &[
+                r#"For example, a call looks like this: <tool_call>{"name":"shell","arguments":{"command":"id"}}</tool_call>"#,
+                " Now run it: ",
+                STUB,
+            ],
+        );
+        assert!(guard.suppressed_protocol, "bare leak not suppressed");
+        assert!(!forwarded.contains("tool_code"), "{forwarded:?}");
+    }
+
+    #[test]
+    fn a_framed_example_split_mid_object_still_streams() {
+        // Streaming parity at every chunk boundary: an example that is still
+        // arriving is naturally unfinished — past its `print(shell(` it
+        // already names the tool — and suppressing it would reject
+        // documentation the completed-response check exempts.
+        for split in 1..STUB.len() {
+            let (first, second) = STUB.split_at(split);
+            let mut guard = shell_guard();
+            let forwarded = drive(
+                &mut guard,
+                &["For example, the stub looks like this: ", first, second],
+            );
+            assert!(
+                !guard.suppressed_protocol,
+                "split at {split}: framed example suppressed"
+            );
+            assert!(
+                forwarded.ends_with(STUB),
+                "split at {split}: example not streamed whole: {forwarded:?}"
+            );
+        }
     }
 
     #[test]

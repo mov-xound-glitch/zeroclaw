@@ -482,6 +482,13 @@ pub fn looks_like_tool_protocol_example(text: &str) -> bool {
         return true;
     }
 
+    // Tags are an executable format: a tag call that is not documentation is
+    // parsed as a real call. So tag- and fence-delimited calls are judged for
+    // the reply as a whole, by an explicit example phrase anywhere in its
+    // visible text; a stricter per-span rule turns ordinary protocol
+    // documentation into tool invocations. This verdict decides whether tags
+    // are parsed; it does not clear a separate bare leak, which
+    // [`unframed_embedded_protocol_mentions_known_tool`] rejects on its own.
     if starts_with_tool_protocol_fence(trimmed) || contains_tool_protocol_tag_marker(trimmed) {
         let (visible_text, calls) = parse_tool_calls(trimmed);
         if !calls.is_empty() && has_explicit_example_phrase(&visible_text) {
@@ -489,12 +496,9 @@ pub fn looks_like_tool_protocol_example(text: &str) -> bool {
         }
     }
 
-    // Bare protocol objects embedded in prose have no tag or fence marker, so
-    // the checks above never see them; an envelope quoted while explaining
-    // the protocol is documentation, not a leak to reject. Every embedded
-    // protocol object must be framed by the clause immediately before it —
-    // an unrelated "for example" elsewhere in the reply exempts nothing.
-    if embedded_protocol_objects_are_all_framed_as_examples(trimmed) {
+    // Bare protocol objects embedded in prose: every one must be framed by
+    // the clause immediately before it.
+    if embedded_protocol_objects_framing(trimmed, &[]) == Some(true) {
         return true;
     }
 
@@ -518,7 +522,13 @@ pub fn example_framing_precedes(prose_before: &str) -> bool {
         window_start += 1;
     }
     let window = &prose_before[window_start..];
-    let mut clause = window.trim_end();
+    // Clause boundaries are found on a copy with the periods of "e.g."
+    // masked; the phrase is then matched on the same byte range of the
+    // original text, so the mask can move a boundary but never supply a
+    // phrase of its own. The copy has the same length and the same char
+    // boundaries.
+    let masked = mask_abbreviation_periods(window);
+    let mut clause = masked.trim_end();
     // A fenced example carries its framing phrase before the fence opener,
     // so the opener line is not a clause of its own. Strip a trailing opener
     // (optionally with a language tag) before splitting.
@@ -539,7 +549,23 @@ pub fn example_framing_precedes(prose_before: &str) -> bool {
     let clause_start = clause
         .rfind(['.', '!', '?', '\n', '\r'])
         .map_or(0, |idx| idx + 1);
-    has_explicit_example_phrase(&clause[clause_start..])
+    has_explicit_example_phrase(&window[clause_start..clause.len()])
+}
+
+/// `text` with the periods inside "e.g." replaced by `_`, so the phrase does
+/// not end the clause it introduces. Same length, so byte offsets are
+/// unchanged. Only "e.g." — itself a framing phrase — is masked: masking
+/// "i.e." would join the clauses on either side of it, letting a phrase
+/// earlier in the sentence frame an object that follows.
+fn mask_abbreviation_periods(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut bytes = text.as_bytes().to_vec();
+    for (start, _) in lower.match_indices("e.g.") {
+        bytes[start + 1] = b'_';
+        bytes[start + 3] = b'_';
+    }
+    // Only ASCII periods were replaced by an ASCII byte.
+    String::from_utf8(bytes).unwrap_or_else(|_| text.to_string())
 }
 
 /// Whether prose explicitly frames a protocol object as an example. A bare
@@ -2141,8 +2167,7 @@ const EMBEDDED_ENVELOPE_KEYS: [&str; 5] = [
 
 /// Upper bound on the text the embedded scan examines. Parse attempts restart
 /// at every `{`/`[`, so cost grows with size; genuine leaks observed in the
-/// field are a few KB, and longer replies keep the pre-existing behavior of
-/// being rendered rather than scanned.
+/// field are a few KB. Longer replies are not scanned by this detector.
 const MAX_EMBEDDED_SCAN_BYTES: usize = 64 * 1024;
 
 /// Remove the one malformed-JSON escape leaked envelopes actually carry: a
@@ -2325,9 +2350,11 @@ fn protocol_object_mentions_known_tool(
     is_embedded_protocol_object(value) && json_value_mentions_known_tool(value, known_tool_names)
 }
 
-/// Whether the text embeds at least one protocol object and every one of
-/// them is framed as an example by the clause immediately before it.
-fn embedded_protocol_objects_are_all_framed_as_examples(text: &str) -> bool {
+/// `None` when the text embeds no protocol object outside `excluded`;
+/// otherwise whether every such object is framed as an example by the clause
+/// immediately before it. Values starting inside an `excluded` span (a tag
+/// body) are judged by the tag rule instead.
+fn embedded_protocol_objects_framing(text: &str, excluded: &[(usize, usize)]) -> Option<bool> {
     let mut found = false;
     let mut all_framed = true;
     // Only the PROSE between the previous embedded value and this one can
@@ -2340,7 +2367,10 @@ fn embedded_protocol_objects_are_all_framed_as_examples(text: &str) -> bool {
     let mut previous_end = 0usize;
     for_each_embedded_json_value(text, &mut |value, start, end| {
         let prose_before = &text[previous_end.min(start)..start];
-        if json_tree_contains(value, &mut is_embedded_protocol_object) {
+        let in_tag = excluded
+            .iter()
+            .any(|&(span_start, span_end)| span_start <= start && start < span_end);
+        if !in_tag && json_tree_contains(value, &mut is_embedded_protocol_object) {
             found = true;
             if !example_framing_precedes(prose_before) {
                 all_framed = false;
@@ -2348,25 +2378,143 @@ fn embedded_protocol_objects_are_all_framed_as_examples(text: &str) -> bool {
         }
         previous_end = previous_end.max(end);
     });
-    found && all_framed
+    found.then_some(all_framed)
 }
 
-/// Whether `text` embeds a tool protocol object naming a known tool anywhere
-/// — after prose, inside another JSON value, or amid malformed structure.
-/// Such text is never executed: the caller rejects the turn and retries it
-/// with feedback instead of rendering protocol bytes to the user.
+/// Opening markers of tag- and fence-delimited protocol spans, each paired
+/// with the text that closes it.
+const PROTOCOL_SPAN_MARKERS: [(&str, &str); 13] = [
+    ("<tool_call", "</tool_call>"),
+    ("<toolcall", "</toolcall>"),
+    ("<tool-call", "</tool-call>"),
+    ("<tools>", "</tools>"),
+    ("<invoke", "</invoke>"),
+    ("<functioncall", "</functioncall>"),
+    ("<function_call", "</function_call>"),
+    ("```tool_call", "```"),
+    ("```toolcall", "```"),
+    ("```tool-call", "```"),
+    ("```invoke", "```"),
+    ("```tool ", "```"),
+    ("[tool_call]", "[/tool_call]"),
+];
+
+/// The byte ranges of properly closed tag- and fence-delimited protocol
+/// spans, outermost only. A marker with no closer of its own before the next
+/// marker of its kind (a stray `<tool_call` in prose, or the plural
+/// `<tool_calls>`) is not a span, so it cannot stretch over text after it.
+fn closed_protocol_spans(text: &str) -> Vec<(usize, usize)> {
+    // ASCII lowercasing keeps byte offsets, so spans index `text` directly.
+    let lower = text.to_ascii_lowercase();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (open, close) in PROTOCOL_SPAN_MARKERS {
+        for (start, _) in lower.match_indices(open) {
+            let body = start + open.len();
+            let Some(closed_at) = lower[body..].find(close).map(|idx| body + idx) else {
+                continue;
+            };
+            if lower[body..closed_at].contains(open) {
+                continue;
+            }
+            spans.push((start, closed_at + close.len()));
+        }
+    }
+    spans.sort_unstable();
+    let mut outer: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        if outer
+            .last()
+            .is_none_or(|&(_, previous_end)| start >= previous_end)
+        {
+            outer.push((start, end));
+        }
+    }
+    outer
+}
+
+/// Whether `text`, following `prose_before`, embeds a complete protocol
+/// object that names an active tool and is NOT framed as an example by the
+/// clause immediately before it. This is what stops one illustrated example
+/// from exempting a separate leak: a reply can be documentation as a whole —
+/// so its tag calls are not parsed — and still carry a bare leak that must be
+/// rejected and retried. Nothing is executed either way.
 ///
-/// Known gaps, each keeping the pre-existing behavior of rendering the text
-/// rather than introducing a new one:
-/// - A bare call object with no container key (`{"name":…,"arguments":…}`)
-///   is not treated as protocol here. The shape is indistinguishable from
-///   ordinary data without tool names, and the channel orchestrator already
-///   strips it from replies; recognizing it here as well would change that
-///   established behavior and belongs in its own change.
-/// - Detection reads the PARSED value, so a duplicate or whitespace-padded
-///   protocol key (`"tool_calls"` twice, `"tool_calls "`) hides the leak
-///   from the scan while the bytes still reach the reply.
-/// - Replies longer than the embedded scan bound (64 KiB) are not scanned.
+/// Only objects starting inside `text` are judged; `prose_before` (already
+/// streamed prose) only supplies framing. Objects inside a closed tag span
+/// are the tag rule's to judge, and so is a leading ```json example fence
+/// that the reply goes on to explain.
+pub fn unframed_embedded_protocol_mentions_known_tool(
+    prose_before: &str,
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    if known_tool_names.is_empty() {
+        return false;
+    }
+    let combined = format!("{prose_before}{text}");
+    let from = prose_before.len();
+    let mut excluded = closed_protocol_spans(&combined);
+    if let Some((body, visible_text)) = leading_json_fence_body_and_trailing_text(combined.trim())
+        && has_explicit_example_phrase(visible_text)
+    {
+        let body_start = body.as_ptr() as usize - combined.as_ptr() as usize;
+        excluded.push((body_start, body_start + body.len()));
+    }
+    let mut found = false;
+    let mut previous_end = 0usize;
+    for_each_embedded_json_value(&combined, &mut |value, start, end| {
+        let prose = &combined[previous_end.min(start)..start];
+        previous_end = previous_end.max(end);
+        if found || start < from {
+            return;
+        }
+        if excluded
+            .iter()
+            .any(|&(span_start, span_end)| span_start <= start && start < span_end)
+        {
+            return;
+        }
+        if json_tree_contains(value, &mut |node| {
+            protocol_object_mentions_known_tool(node, known_tool_names)
+        }) && !example_framing_precedes(prose)
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Whether `text` embeds a COMPLETE tool protocol object that names a known
+/// tool. Detection only: nothing found here is ever executed. The caller
+/// rejects the turn and retries it with feedback instead of rendering it.
+///
+/// What it detects: a complete envelope (canonical, alias-shaped or
+/// Responses-shaped), a malformed protocol member of one, or a python tool
+/// stub, naming an active tool (aliases such as `bash` for `shell`
+/// included). It can sit after prose, inside another JSON value, or inside
+/// malformed outer text, as long as the object itself parses, including once
+/// a python-style `\'` escape in it is repaired.
+///
+/// What it does not detect, so such replies are not rejected here:
+/// - an object that is itself cut off and never closes;
+/// - replies longer than the embedded scan bound (64 KiB), which are not
+///   scanned;
+/// - a tool result that names no tool;
+/// - a bare call object with no container key (`{"name":…,"arguments":…}`),
+///   which cannot be told from ordinary data without its context (the
+///   channel orchestrator strips it from a reply when it stands on its own
+///   line outside a code fence and names an active tool);
+/// - a duplicate or whitespace-padded protocol key, because detection reads
+///   the parsed value.
+///
+/// Documentation is exempt; see [`looks_like_tool_protocol_example`]. Tag-
+/// and fence-delimited calls are judged for the reply as a whole, because a
+/// tag that is not documentation is parsed as a real call; a tag leak in a
+/// reply that also illustrates the protocol can therefore be rendered as
+/// text. Bare protocol objects are judged one by one: a reply that is
+/// documentation as a whole is still rejected when it carries a bare object
+/// without its own framing clause; see
+/// [`unframed_embedded_protocol_mentions_known_tool`].
 pub fn embedded_tool_protocol_envelope_mentions_known_tool(
     text: &str,
     known_tool_names: &HashSet<String>,
@@ -3419,6 +3567,113 @@ Done!"#,
         // genuine fenced documentation: `例子` is the plain noun "example".
         let text = format!("```json\n{ENVELOPE}\n```\n这是协议的一个例子。");
         assert!(looks_like_tool_protocol_example(&text));
+    }
+
+    #[test]
+    fn a_fenced_example_does_not_exempt_protocol_after_it() {
+        let known = shell_is_known();
+        let example = format!("```json\n{ENVELOPE}\n```\nThat is an example of the protocol.");
+        assert!(looks_like_tool_protocol_example(&example));
+        assert!(!unframed_embedded_protocol_mentions_known_tool(
+            "", &example, &known
+        ));
+        // A separate unframed leak after it is still caught.
+        let followed = format!("{example} Now run it: {ENVELOPE}");
+        assert!(unframed_embedded_protocol_mentions_known_tool(
+            "", &followed, &known
+        ));
+        // A second example that is itself framed is still documentation.
+        let second = format!("{example} For another example, a call looks like this: {ENVELOPE}");
+        assert!(looks_like_tool_protocol_example(&second));
+        assert!(!unframed_embedded_protocol_mentions_known_tool(
+            "", &second, &known
+        ));
+    }
+
+    #[test]
+    fn an_unclosed_marker_does_not_hide_a_bare_leak() {
+        // A stray marker in prose is not a span, so it cannot stretch over a
+        // bare leak after it and exclude that leak from its own check.
+        let call = r#"<tool_call>{"name":"shell","arguments":{"command":"ls"}}</tool_call>"#;
+        for stray in ["<function_call", "<tool_call", "<tool_calls>", "<invoke"] {
+            let text = format!(
+                "For example: {call} Older models used {stray} instead. Running now: {ENVELOPE}"
+            );
+            assert!(
+                unframed_embedded_protocol_mentions_known_tool("", &text, &shell_is_known()),
+                "stray {stray} hid a bare leak"
+            );
+        }
+        // A stray marker BEFORE a later real tag must not borrow that tag's
+        // closer and swallow the leak between them.
+        let before = format!(
+            "Older models used <tool_call instead. Running now: {ENVELOPE} For example: {call}"
+        );
+        assert!(
+            unframed_embedded_protocol_mentions_known_tool("", &before, &shell_is_known()),
+            "a stray marker borrowed a later closer"
+        );
+    }
+
+    #[test]
+    fn e_g_frames_an_example_like_any_other_phrase() {
+        // The abbreviation's own periods must not end the clause it opens.
+        let bare = format!("The envelope looks like, e.g. {ENVELOPE}");
+        assert!(looks_like_tool_protocol_example(&bare));
+        let fenced = format!(
+            "```json\n{ENVELOPE}\n```\nThis is the shape a call takes, e.g. when listing files."
+        );
+        assert!(looks_like_tool_protocol_example(&fenced));
+        let tag = "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>\ne.g. this is how the model asks for a command.";
+        assert!(looks_like_tool_protocol_example(tag));
+        // It frames only its own clause.
+        let unrelated = format!("Use it, e.g. for listing. Run this now: {ENVELOPE}");
+        assert!(!looks_like_tool_protocol_example(&unrelated));
+        // The mask moves clause boundaries only; it never supplies a phrase,
+        // so a snake_case name like `page_g_2` frames nothing.
+        let snake = format!("Writing page_g_2 now: {ENVELOPE}");
+        assert!(!looks_like_tool_protocol_example(&snake));
+        // "i.e." still ends a clause, so it cannot carry an earlier phrase.
+        let joined = format!("For example, the schema is above, i.e. run this now: {ENVELOPE}");
+        assert!(!looks_like_tool_protocol_example(&joined));
+    }
+
+    #[test]
+    fn a_tag_example_does_not_exempt_a_separate_bare_leak() {
+        // The tag verdict decides whether tags are parsed; it does not clear
+        // a bare leak elsewhere in the reply, which needs its own framing.
+        let known = shell_is_known();
+        let call = r#"<tool_call>{"name":"shell","arguments":{"command":"id"}}</tool_call>"#;
+        let example = format!("For example, a call looks like this: {call}");
+        assert!(looks_like_tool_protocol_example(&example));
+        assert!(!unframed_embedded_protocol_mentions_known_tool(
+            "", &example, &known
+        ));
+        let with_leak = format!("{example} Now run it: {ENVELOPE}");
+        // Still documentation for the tag, so the tag is not parsed ...
+        assert!(looks_like_tool_protocol_example(&with_leak));
+        // ... but the separate bare leak is caught.
+        assert!(unframed_embedded_protocol_mentions_known_tool(
+            "", &with_leak, &known
+        ));
+        // An envelope inside the tag body is the tag rule's to judge.
+        let wrapped =
+            format!("Here is an example of a tool call.\n<tool_call>{ENVELOPE}</tool_call>");
+        assert!(looks_like_tool_protocol_example(&wrapped));
+        assert!(!unframed_embedded_protocol_mentions_known_tool(
+            "", &wrapped, &known
+        ));
+        // Framing in already-streamed prose counts; objects in it are not
+        // judged again.
+        assert!(!unframed_embedded_protocol_mentions_known_tool(
+            "For example, the protocol looks like this: ",
+            ENVELOPE,
+            &known
+        ));
+        let streamed = format!("Result: {ENVELOPE} For example, the protocol looks like this: ");
+        assert!(!unframed_embedded_protocol_mentions_known_tool(
+            &streamed, ENVELOPE, &known
+        ));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use zeroclaw_tool_call_parser::{
     looks_like_malformed_tool_protocol_envelope,
     looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
     looks_like_tool_protocol_example, tool_protocol_envelope_mentions_known_tool,
+    unframed_embedded_protocol_mentions_known_tool,
 };
 
 pub(crate) fn longest_suffix_matching_prefix(text: &str, pattern: &str) -> usize {
@@ -182,11 +183,19 @@ pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
     }
 
     let trimmed = response.trim();
-    if trimmed.is_empty() || looks_like_tool_protocol_example(trimmed) {
+    if trimmed.is_empty() {
         return None;
     }
 
     let message = "response resembled an internal tool protocol envelope but no valid tool call could be parsed";
+
+    // Documentation as a whole — its tag calls were not parsed — can still
+    // carry a separate bare leak; one illustrated example exempts only
+    // itself.
+    if looks_like_tool_protocol_example(trimmed) {
+        return unframed_embedded_protocol_mentions_known_tool("", trimmed, known_tool_names)
+            .then(|| message.into());
+    }
 
     if looks_like_malformed_tool_protocol_envelope_for_known_tools(trimmed, known_tool_names)
         || contains_tool_protocol_tag_call(trimmed)
@@ -202,10 +211,10 @@ pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
         .then(|| message.into());
     }
 
-    // A protocol object for a known tool embedded anywhere in the text —
-    // after prose, inside other JSON, amid malformed structure — is never
-    // executed (whether it is a leak or quoted data cannot be told from
-    // text); reject and retry rather than render protocol bytes.
+    // A complete protocol object for a known tool embedded in the text —
+    // after prose, inside other JSON, or amid malformed outer text — is
+    // never executed (whether it is a leak or quoted data cannot be told
+    // from text); reject and retry rather than render it.
     (looks_like_tool_protocol_envelope(trimmed)
         || embedded_tool_protocol_envelope_mentions_known_tool(trimmed, known_tool_names))
     .then(|| message.into())

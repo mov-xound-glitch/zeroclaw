@@ -970,6 +970,7 @@ mod cost_usd_regression_tests {
             turn_id,
             serving_provider_name: None,
             serving_model: None,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
         }
     }
 
@@ -982,6 +983,117 @@ mod cost_usd_regression_tests {
             )],
             known_tool_names: HashSet::from(["shell".to_string()]),
             use_native_tools: true,
+        }
+    }
+
+    async fn interpret_leak(text: &str, turn_id: &str) -> (bool, usize) {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let ctx = embedded_envelope_ctx(&pacing, &dedup_exempt_tools, turn_id);
+        let interpreted = interpret_chat_response(
+            &ctx,
+            "openai.codex",
+            "gpt-5.6",
+            ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            &[],
+            &shell_specs(),
+            false,
+            0,
+            false,
+        )
+        .await;
+        (
+            interpreted.parse_issue_detected,
+            interpreted.tool_calls.len(),
+        )
+    }
+
+    #[tokio::test]
+    async fn ordinary_explanations_and_code_examples_are_rendered() {
+        // The detector is bounded to complete protocol objects that name an
+        // active tool and are not framed as examples. Replies that discuss
+        // the protocol, quote API shapes, or show code must still render;
+        // each of these was rejected by a broader check considered for this
+        // change.
+        let envelope = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"id\"}","id":"c1","name":"shell"}]}"#;
+        let cases = [
+            (
+                "API explanation quoting a tool result",
+                r#"You append {"role":"tool","tool_call_id":"call_abc","content":"42"} to messages."#.to_string(),
+            ),
+            (
+                "Python code sample building a tool-call message",
+                r#"Here's how in Python: msg = {"role":"assistant","content": None, "tool_calls":[{"id":"c1","type":"function","function":{"name":"shell","arguments": json.dumps({"command":"ls"})}}]}"#.to_string(),
+            ),
+            (
+                "framed example with elided arguments",
+                r#"For example, the envelope looks like this: {"tool_calls":[{"name":"shell","arguments":{...}}]}"#.to_string(),
+            ),
+            (
+                "prose with a markdown link describing the protocol",
+                r#"See [the OpenAI docs](https://platform.openai.com/docs) for details. Each entry in the "tool_calls" array carries "name": "shell" and an arguments string."#.to_string(),
+            ),
+            (
+                "complete envelope framed as an example",
+                format!("For example, the protocol looks like this: {envelope}"),
+            ),
+        ];
+        for (label, text) in cases {
+            let (rejected, calls) = interpret_leak(&text, "ordinary-reply-regression").await;
+            assert_eq!(calls, 0, "{label}: must never execute");
+            assert!(
+                !rejected,
+                "{label}: an ordinary reply must render, not retry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tag_example_beside_a_bare_leak_is_rejected_not_executed() {
+        // The tag is documentation, so it must not be parsed as a call; the
+        // separate unframed bare leak must still be rejected and retried.
+        let call =
+            r#"<tool_call>{"name":"shell","arguments":{"command":"rm -rf build"}}</tool_call>"#;
+        let envelope = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"id\"}","id":"c1","name":"shell"}]}"#;
+        let with_leak =
+            format!("For example, a call looks like this: {call} Now run it: {envelope}");
+        let (rejected, calls) = interpret_leak(&with_leak, "tag-plus-leak").await;
+        assert_eq!(calls, 0, "the example tag must never execute");
+        assert!(rejected, "the separate bare leak must be rejected");
+
+        // Two illustrations, the second introduced without an explicit
+        // phrase: whatever the verdict, the example tag must not execute.
+        let docs = format!(
+            "Here is an example of a tool call:\n{call}\nOpenAI-compatible providers wrap the same call like this:\n```json\n{{\"tool_calls\":[{{\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"shell\",\"arguments\":\"{{\\\"command\\\":\\\"rm -rf build\\\"}}\"}}}}]}}\n```"
+        );
+        let (_rejected, calls) = interpret_leak(&docs, "two-illustrations").await;
+        assert_eq!(calls, 0, "a documented tag must never execute");
+    }
+
+    #[tokio::test]
+    async fn documentation_tag_examples_are_never_executed() {
+        // Tags are an executable format, so a tag example that lost its
+        // exemption would be parsed as a real call. Ordinary protocol
+        // documentation must render as text instead.
+        let call = r#"<tool_call>{"name":"shell","arguments":{"command":"ls"}}</tool_call>"#;
+        let cases = [
+            format!("Here is an example of a tool call.\n\n```xml\n{call}\n```"),
+            format!("For example, to edit config.toml the model emits: {call}"),
+            format!("For example:\n\nUser: list my files\nAssistant: {call}"),
+            format!(
+                "For example, a model can call several tools:\n1. List files:\n{call}\n2. Read a file:\n{call}"
+            ),
+            format!("{call}\n```\nThat is an example of a tool call."),
+        ];
+        for text in cases {
+            let (rejected, calls) = interpret_leak(&text, "tag-docs-regression").await;
+            assert_eq!(calls, 0, "documentation tag executed: {text:?}");
+            assert!(!rejected, "documentation tag must render: {text:?}");
         }
     }
 
