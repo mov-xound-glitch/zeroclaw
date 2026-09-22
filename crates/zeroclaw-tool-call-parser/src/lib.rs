@@ -484,14 +484,16 @@ pub fn looks_like_tool_protocol_example(text: &str) -> bool {
 
     // Tags are an executable format: a tag call that is not documentation is
     // parsed as a real call. So tag- and fence-delimited calls are judged for
-    // the reply as a whole, by an explicit example phrase anywhere in its
-    // visible text; a stricter per-span rule turns ordinary protocol
-    // documentation into tool invocations. This verdict decides whether tags
-    // are parsed; it does not clear a separate bare leak, which
-    // [`unframed_embedded_protocol_mentions_known_tool`] rejects on its own.
+    // the reply as a whole, and generously — any example or sample wording in
+    // its visible text ("Sample tool call:", "Example tool call:", "示例如下:")
+    // — because here a miss executes documentation while an over-exemption
+    // only renders a tag as text. This verdict decides whether tags are
+    // parsed; it does not clear a separate bare leak, which
+    // [`unframed_embedded_protocol_mentions_known_tool`] judges on its own
+    // with the strict phrase test.
     if starts_with_tool_protocol_fence(trimmed) || contains_tool_protocol_tag_marker(trimmed) {
         let (visible_text, calls) = parse_tool_calls(trimmed);
-        if !calls.is_empty() && has_explicit_example_phrase(&visible_text) {
+        if !calls.is_empty() && has_example_context(&visible_text) {
             return true;
         }
     }
@@ -566,6 +568,21 @@ fn mask_abbreviation_periods(text: &str) -> String {
     }
     // Only ASCII periods were replaced by an ASCII byte.
     String::from_utf8(bytes).unwrap_or_else(|_| text.to_string())
+}
+
+/// Loose example wording, for the reply-level tag verdict only: any mention
+/// of an example or sample, or any explicit framing phrase ("e.g.", "for
+/// instance"). It accepts everything the strict test accepts, so no wording
+/// that frames a bare object fails to exempt a tag. Bare objects use the
+/// strict [`has_explicit_example_phrase`] instead.
+fn has_example_context(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("example")
+        || lower.contains("sample")
+        || ["示例", "例如", "比如", "举例", "例子", "比方说", "譬如"]
+            .iter()
+            .any(|phrase| text.contains(phrase))
+        || has_explicit_example_phrase(text)
 }
 
 /// Whether prose explicitly frames a protocol object as an example. A bare

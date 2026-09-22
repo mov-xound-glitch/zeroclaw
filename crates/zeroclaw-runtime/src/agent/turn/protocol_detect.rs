@@ -69,41 +69,91 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
         }
     }
 
+    // The last opener whose tail shows a protocol key is held whether or
+    // not its value has closed: a complete object carrying the key (a tool
+    // result, a whole envelope in one delta) is judged once held, not
+    // forwarded on sight.
     for delimiter in ['{', '['] {
         if let Some(idx) = text.rfind(delimiter) {
             let tail = &lower[idx..];
-            // A JSON value that has started but not yet shown a protocol
-            // key — an opener followed by a quoted key — is held as well: a
-            // leaked envelope split across deltas otherwise forwards its
-            // first half before any key that would identify it arrives.
-            // Only while it is still unfinished, though: once the value has
-            // closed, nothing further can identify it, and holding an
-            // ordinary inline object like `config: {"retries": 3} and …`
-            // would stall the rest of the reply to end of stream.
-            let json_like_start = tail[delimiter.len_utf8()..].trim_start().starts_with('"')
-                && !starts_with_complete_json_value(&text[idx..]);
-            if tail.contains("\"tool")
-                || tail.contains("\"function")
-                || tail.contains("\"call")
-                || tail.len() <= 16
-                || json_like_start
-            {
+            if tail.contains("\"tool") || tail.contains("\"function") || tail.contains("\"call") {
                 earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
             }
+        }
+    }
+
+    // A JSON value still open at the end of the chunk is held from its own
+    // opener, not from the last brace: a brace inside a string value
+    // (`"Status {placeholder} is ready"`) would otherwise stand in for the
+    // unfinished object around it and let that object's first half stream
+    // before any identifying key arrives. Only an opener that starts like
+    // JSON — followed by a quoted key or another opener — or a very short
+    // tail qualifies, so a stray bracket in prose (`[0, 1)`) does not hold
+    // the rest of the reply. Brackets inside strings do not count toward
+    // whether a value closed, and a value that has closed is left to the
+    // rule above.
+    let mut openers = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+        openers += 1;
+        if openers > MAX_CANDIDATE_OPENERS {
+            break;
+        }
+        if json_like_value_closes(&text[idx..]) {
+            continue;
+        }
+        let tail = &lower[idx..];
+        let rest = tail[ch.len_utf8()..].trim_start();
+        let json_like_start =
+            rest.starts_with('"') || rest.starts_with('{') || rest.starts_with('[');
+        if json_like_start || tail.len() <= 16 {
+            earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
+            break;
         }
     }
 
     earliest
 }
 
-/// Whether `text` begins with a complete JSON value, ignoring anything after
-/// it. Trailing prose is expected: this answers "has the value closed", not
-/// "is the whole text JSON".
-fn starts_with_complete_json_value(text: &str) -> bool {
-    serde_json::Deserializer::from_str(text)
-        .into_iter::<serde_json::Value>()
-        .next()
-        .is_some_and(|value| value.is_ok())
+/// How many openers in one chunk are examined for an unfinished value, so an
+/// adversarial chunk cannot make the scan quadratic; past it only the
+/// protocol-key rule applies.
+const MAX_CANDIDATE_OPENERS: usize = 64;
+
+/// Whether the bracketed value starting at `text[0]` closes within `text`.
+/// Brackets inside double-quoted strings (with backslash escapes) do not
+/// count, so this answers "has the value closed" for partial, even invalid,
+/// JSON; trailing prose after the close is expected.
+fn json_like_value_closes(text: &str) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in text.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 pub(crate) fn starts_suspicious_protocol_prefix(text: &str) -> bool {

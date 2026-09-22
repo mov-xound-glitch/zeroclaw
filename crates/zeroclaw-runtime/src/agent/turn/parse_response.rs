@@ -1089,6 +1089,10 @@ mod cost_usd_regression_tests {
                 "For example, a model can call several tools:\n1. List files:\n{call}\n2. Read a file:\n{call}"
             ),
             format!("{call}\n```\nThat is an example of a tool call."),
+            // Clear introductions that name the reply a sample or example.
+            format!("Sample tool call: {call}"),
+            format!("Example tool call: {call}"),
+            format!("示例如下: {call}"),
         ];
         for text in cases {
             let (rejected, calls) = interpret_leak(&text, "tag-docs-regression").await;

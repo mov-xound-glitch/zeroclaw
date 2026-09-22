@@ -554,6 +554,80 @@ mod embedded_protocol_stream_tests {
     }
 
     #[test]
+    fn a_brace_inside_a_string_does_not_release_the_outer_stub() {
+        // `{placeholder}` inside the content string must not be mistaken for
+        // the start of the candidate: the unfinished outer stub is what has
+        // to be held, at every split.
+        let prose = "Creating now. ";
+        let stubs = [
+            "{\"content\":\"Status {placeholder} is ready\",\n\"tool_code\":\"print(shell())\",\"tool_name\":\"shell\"}",
+            // A lone closer inside the string must not count as the object
+            // closing.
+            "{\"content\":\"Done } now\",\n\"tool_code\":\"print(shell())\",\"tool_name\":\"shell\"}",
+        ];
+        for stub in stubs {
+            let text = format!("{prose}{stub}");
+            for split in prose.len() + 1..text.len() {
+                let (first, second) = text.split_at(split);
+                let mut guard = shell_guard();
+                let forwarded = drive(&mut guard, &[first, second]);
+                assert!(
+                    !forwarded.contains("tool_code") && !forwarded.contains("content"),
+                    "split at {split}: stub bytes streamed: {forwarded:?}"
+                );
+                assert!(
+                    guard.suppressed_protocol,
+                    "split at {split}: not suppressed"
+                );
+            }
+        }
+        // Completed inline JSON with a brace inside a string still streams.
+        let mut guard = shell_guard();
+        let first = guard.push("Set {\"greeting\":\"hi {name}\"} in the config and restart.");
+        assert!(first.is_some_and(|text| text.contains("greeting")));
+    }
+
+    #[test]
+    fn a_complete_protocol_object_in_one_delta_is_held_and_judged() {
+        // A value that closes inside the chunk is still held when it shows a
+        // protocol key, so a tool result arriving whole is not forwarded.
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &["Done.\n{\"tool_call_id\":\"call_1\",\"content\":\"ok\"}"],
+        );
+        assert!(!forwarded.contains("tool_call_id"), "{forwarded:?}");
+        assert!(guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn many_openers_before_a_split_stub_do_not_release_it() {
+        // Past the opener cap the protocol-key rule still holds the stub.
+        let first = format!(
+            "{} Creating now. {{\"content\":\"x\",\"tool_co",
+            "[]".repeat(64)
+        );
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &[&first, "de\":\"print(shell())\",\"tool_name\":\"shell\"}"],
+        );
+        assert!(!forwarded.contains("tool_co"), "{forwarded:?}");
+        assert!(guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn a_stray_bracket_in_prose_does_not_hold_the_reply() {
+        let mut guard = shell_guard();
+        let first =
+            guard.push("Intervals like [0, 1) are half-open; a \"function\" maps [a, b] to reals.");
+        assert!(
+            first.is_some_and(|text| text.contains("reals")),
+            "prose with an unclosed bracket must keep streaming"
+        );
+    }
+
+    #[test]
     fn a_framed_example_split_mid_object_still_streams() {
         // Streaming parity at every chunk boundary: an example that is still
         // arriving is naturally unfinished — past its `print(shell(` it
