@@ -154,6 +154,7 @@ pub mod method {
     pub const SOPS_SAVE: &str = "sops/save";
     pub const SOPS_CREATE: &str = "sops/create";
     pub const SOPS_DELETE: &str = "sops/delete";
+    pub const SOPS_RENAME: &str = "sops/rename";
     pub const SOPS_DECIDE: &str = "sops/decide";
     pub const SOPS_WIRE_DRAFT: &str = "sops/wire-draft";
     pub const SOPS_GRAPH_DRAFT: &str = "sops/graph-draft";
@@ -1815,11 +1816,18 @@ impl RpcClient {
     /// daemon CA to trust) and `client_cert_path` / `client_key_path` (the client
     /// certificate to present). `skip_verify` disables server verification
     /// (self-signed dev only).
+    ///
+    /// `auth_token` (with an optional `auth_provider` selection, default
+    /// `native`) is presented in the initialize handshake; remote daemons
+    /// require it since the RFC 7141 enforcement boundary. The mTLS cert is
+    /// transport/device admission; the token is principal authentication.
     pub async fn connect_wss_direct(
         url: &str,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
         tls: &ClientTls,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
     ) -> Result<Self> {
         // The built-in (webpki-roots) connector only for the plain default (no
         // client cert, no custom CA, no skip-verify); any custom TLS material
@@ -1840,7 +1848,15 @@ impl RpcClient {
         .await
         .with_context(|| format!("WSS connect to {url}"))?;
         // No relay pump on the direct path: the socket IS the transport.
-        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, None).await
+        Self::spawn_ws_session(
+            ws_stream,
+            prev_tui_id,
+            prev_tui_sig,
+            auth_token,
+            auth_provider,
+            None,
+        )
+        .await
     }
 
     /// Connect to the daemon through a nominated relay.
@@ -1855,6 +1871,8 @@ impl RpcClient {
         prev_tui_sig: Option<&str>,
         tls: &ClientTls,
         relay: &RelayDial,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
     ) -> Result<Self> {
         // ONE deadline for the whole client-side setup. It is created here, before
         // the first packet, and every step below shares what is left of it: the
@@ -1886,7 +1904,15 @@ impl RpcClient {
         // `?` here would drop the guard and retire the pump, which is exactly
         // what a failed handshake wants.
         let (ws_stream, _response) = handshake?;
-        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, pump.release()).await
+        Self::spawn_ws_session(
+            ws_stream,
+            prev_tui_id,
+            prev_tui_sig,
+            auth_token,
+            auth_provider,
+            pump.release(),
+        )
+        .await
     }
 
     /// Drive a connected WSS stream: spawn the writer/reader tasks and complete
@@ -1900,6 +1926,8 @@ impl RpcClient {
         ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<S>>,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
         relay_pump: Option<tokio::task::JoinHandle<()>>,
     ) -> Result<Self>
     where
@@ -2009,6 +2037,12 @@ impl RpcClient {
         }
         if let Some(sig) = prev_tui_sig {
             init_params["tui_sig"] = serde_json::Value::String(sig.to_string());
+        }
+        if let Some(token) = auth_token {
+            init_params["auth_token"] = serde_json::Value::String(token.to_string());
+        }
+        if let Some(provider) = auth_provider {
+            init_params["auth_provider"] = serde_json::Value::String(provider.to_string());
         }
         // NOTE: We intentionally do NOT forward the TUI's environment here.
         // In a WSS connection the daemon is on a remote machine, so env values
@@ -2626,6 +2660,18 @@ impl RpcClient {
     pub async fn sops_create(&self, sop: Value) -> Result<Value> {
         self.call(method::SOPS_CREATE, serde_json::json!({ "sop": sop }))
             .await
+    }
+
+    /// Move a SOP to a new name. Separate from `sops_save`, which persists
+    /// under the submitted SOP's own name and so can only overwrite the SOP it
+    /// was loaded from; the daemon collision-checks the target and moves the
+    /// definition rather than copying it.
+    pub async fn sops_rename(&self, from: &str, to: &str) -> Result<Value> {
+        self.call(
+            method::SOPS_RENAME,
+            serde_json::json!({ "from": from, "to": to }),
+        )
+        .await
     }
 
     pub async fn sops_delete(&self, name: &str) -> Result<Value> {
@@ -4216,6 +4262,13 @@ pub struct LogsQueryParams {
     /// older than the previous one. Independent of id ordering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub until_line_offset: Option<u64>,
+    /// Segment-aware cursor passed back from the previous page's
+    /// `next_segment_cursor`. Identifies both the segment file and the
+    /// byte offset within it, so pagination continues across rotated
+    /// archives. Takes precedence over `until_line_offset` when both
+    /// are supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until_segment_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity_min: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4250,9 +4303,26 @@ pub struct LogsQueryResult {
     /// Byte offset past the OLDEST event on the current page. Pass back
     /// as [`LogsQueryParams::until_line_offset`] on the next request to
     /// walk older pages deterministically regardless of id ordering.
-    /// `None` when the page is empty.
+    /// `None` when the page is empty, and also `None` when the oldest
+    /// event on the page lives in a rotated archive rather than the
+    /// active file — use [`Self::next_segment_cursor`] in that case.
     pub next_cursor_line_offset: Option<u64>,
+    /// Segment-aware cursor for the oldest event on this page. Pass
+    /// back as [`LogsQueryParams::until_segment_cursor`] to walk older
+    /// pages across segment boundaries. Supersedes
+    /// `next_cursor_line_offset` for `rotating`-mode deployments with
+    /// multiple retained segments. Absent (deserialized as `None`) on
+    /// daemons predating multi-segment reads.
+    #[serde(default)]
+    pub next_segment_cursor: Option<String>,
     pub at_end: bool,
+    /// True when a retained segment could not be read and was left out of
+    /// this page. `at_end` is then only "no older events among the segments
+    /// that could be read", so the pane must not present the buffer as the
+    /// complete history. Absent (deserialized as `false`) on daemons that
+    /// predate the field.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 /// Mirror of `zeroclaw_runtime::rpc::types::LogsGetResult`. Full log
@@ -5505,7 +5575,7 @@ mod notification_tests {
             WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client_io), Role::Client, None)
                 .await;
         let client = Arc::new(
-            RpcClient::spawn_ws_session(client_ws, None, None, None)
+            RpcClient::spawn_ws_session(client_ws, None, None, None, None, None)
                 .await
                 .unwrap(),
         );
@@ -5806,7 +5876,7 @@ mod notification_tests {
             WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client_io), Role::Client, None)
                 .await;
         let client = Arc::new(
-            RpcClient::spawn_ws_session(client_ws, None, None, Some(pump))
+            RpcClient::spawn_ws_session(client_ws, None, None, None, None, Some(pump))
                 .await
                 .unwrap(),
         );
@@ -6635,6 +6705,8 @@ mod relay_transport_tests {
                     ..Default::default()
                 },
                 &relay,
+                None,
+                None,
             )
             .await
             .expect_err("a silent relay must not hold the connect")

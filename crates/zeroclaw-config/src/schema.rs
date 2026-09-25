@@ -509,7 +509,7 @@ pub struct Config {
 
     /// Named permission profiles (`[permission_profiles.<alias>]`): the
     /// single runtime authorization vocabulary. OIDC claim mappings and
-    /// user roster entries resolve here; deny-by-default — anything a
+    /// user roster entries resolve here; deny-by-default: anything a
     /// profile does not grant is refused.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -831,6 +831,31 @@ pub enum AuthMode {
     OAuth,
 }
 
+/// Prompt-cache entry lifetime to request for this provider's Anthropic
+/// cache markers. `"5m"` is the API default; `"1h"` extends the cache
+/// entry lifetime to one hour so a pause longer than five minutes does
+/// not force a full-price rewrite of the cached prefix. Meaningful only
+/// where Anthropic-shaped `cache_control` markers reach the API: the
+/// native Anthropic provider always places them, compatible providers
+/// only behind `cache_passthrough` (with passthrough off the setting is
+/// inert). One TTL applies to every marker this implementation places;
+/// operator-supplied `cache_control` (via `provider_extra` or raw tool
+/// JSON) sits outside that guarantee and must order 1h before 5m when
+/// mixing lifetimes in one request.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub enum CacheTtl {
+    /// Standard 5-minute cache lifetime (the API default).
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    /// 1-hour cache lifetime; cache writes bill at a premium write rate.
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
 /// Named model_provider profile definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -960,6 +985,36 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub cache_passthrough: bool,
+    /// Cache entry lifetime requested for this provider's Anthropic
+    /// prompt-cache markers. `"5m"` (default) keeps the standard
+    /// 5-minute lifetime; `"1h"` requests a 1-hour lifetime so a pause
+    /// longer than five minutes does not force a full-price rewrite of
+    /// the cached prefix. The 1h lifetime bills cache writes at a
+    /// premium write rate (nominal planning figure: twice the input
+    /// price), so it pays off only when turns regularly resume more
+    /// than five minutes after the last request.
+    ///
+    /// The native Anthropic provider applies this to every cache marker
+    /// it places in a request. Compatible providers apply it only when
+    /// `cache_passthrough` is enabled; without passthrough no markers
+    /// are placed at all and this field is inert (no parse-time warning:
+    /// an operator may stage the key before switching passthrough on).
+    /// Providers that emit their own cache markers by other means
+    /// (openrouter) ignore this setting.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<CacheTtl>,
+    /// Forward the runtime-configured `reasoning_effort` to every model on
+    /// this OpenAI-compatible provider, not only OpenAI reasoning-family
+    /// names (o1*/o3*/o4*/gpt-5*/gpt-*codex*). The name filter exists because
+    /// some strict backends reject unknown request params with HTTP 400;
+    /// enable this only on a backend verified to accept `reasoning_effort`
+    /// (GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
+    /// gateways commonly do). Default `false`: the name filter keeps
+    /// deciding, and non-OpenAI model names never receive the param.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reasoning_effort_passthrough: bool,
     /// Pull live token prices for this provider's models from its own
     /// OpenAI-compatible `/models` listing (the gateway is the source of truth
     /// for its prices), filling cost-tracking rates for models the operator
@@ -2917,7 +2972,9 @@ pub struct GrokCliModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
-    /// Path to the `grok` CLI binary. Falls back to `grok` (PATH lookup).
+    /// Absolute path or bare executable name for the `grok` CLI (default: `grok`).
+    /// Bare names resolve only from absolute PATH directories; empty and relative
+    /// PATH entries are ignored before the subprocess working directory is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
     /// Required absolute working directory for the `grok` subprocess and ACP
@@ -3682,6 +3739,11 @@ impl Default for DelegateToolConfig {
 
 // ── Aliased Agents ───────────────────────────────────────────────
 
+/// Default fraction of `max_history_messages` that a whole-turn history trim
+/// drops the history to. Strictly below 1.0 so a trim leaves headroom and
+/// the next turns do not immediately trigger another trim.
+pub const DEFAULT_HISTORY_TRIM_LOW_WATER: f32 = 0.7;
+
 /// Runtime tunables resolved from the agent's runtime profile. Populated
 /// by `Config::resolved_agent_config`; never deserialized from the agent
 /// table. The runtime profile is the sole config surface for these.
@@ -3690,6 +3752,9 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_history_messages: usize,
+    /// Fraction of `max_history_messages` a whole-turn trim drops to
+    /// (hysteresis low-water mark; 1.0 disables hysteresis).
+    pub history_trim_low_water: f32,
     /// Optional operator context budget from `runtime_profiles.<name>.max_context_tokens`.
     /// Without an opt-in ratio, `None` preserves the legacy 32,000-token budget.
     /// With a ratio, `Some(n)` clamps the model-relative threshold down to `n`.
@@ -3862,6 +3927,7 @@ impl Default for ResolvedRuntime {
             compact_context: true,
             max_tool_iterations: 10,
             max_history_messages: 50,
+            history_trim_low_water: DEFAULT_HISTORY_TRIM_LOW_WATER,
             max_context_tokens: None,
             model_context_window: 32_000,
             model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
@@ -4480,6 +4546,17 @@ impl Config {
             .unwrap_or(50)
     }
 
+    /// Resolve the fraction of the history cap that a whole-turn trim drops
+    /// to (hysteresis low-water mark). Same resolution chain as
+    /// `effective_max_history_messages`: the agent's runtime profile value
+    /// when set, otherwise [`DEFAULT_HISTORY_TRIM_LOW_WATER`].
+    #[must_use]
+    pub fn effective_history_trim_low_water(&self, agent_alias: &str) -> f32 {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.history_trim_low_water)
+            .unwrap_or(DEFAULT_HISTORY_TRIM_LOW_WATER)
+    }
+
     /// Resolve the whole-turn history cap used by structured `Agent` sessions.
     ///
     /// An explicit runtime-profile cap remains authoritative. When omitted, the
@@ -4764,6 +4841,7 @@ impl Config {
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
+            history_trim_low_water: self.effective_history_trim_low_water(agent_alias),
             // Absolute operator budget. In opt-in ratio mode it also caps the
             // model-derived threshold (see `effective_context_budget`).
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
@@ -13191,6 +13269,19 @@ pub struct ObservabilityConfig {
     #[serde(default = "default_log_persistence_retention_max_age_days")]
     pub log_persistence_retention_max_age_days: u64,
 
+    /// Maximum number of log entries (non-empty JSONL lines) per segment file
+    /// when `log_persistence = "rotating"`. When the active file's line count
+    /// reaches this cap, it is rotated to an archive (an O(1) rename — no
+    /// content is rewritten), the same mechanism as
+    /// `log_persistence_max_bytes`, so each archive produced by this trigger
+    /// holds exactly this many entries in steady state; an existing active
+    /// file that already exceeds the cap when this feature is first enabled
+    /// is archived whole on the next append. `0` disables entry-count rotation.
+    /// Ignored unless `log_persistence = "rotating"`; the `rolling` policy
+    /// keeps its own in-place trim governed by `log_persistence_max_entries`.
+    #[serde(default = "default_log_persistence_max_entries_per_segment")]
+    pub log_persistence_max_entries_per_segment: usize,
+
     /// Tool I/O capture policy: "off" | "redacted" | "full".
     /// - `off`: only tool name + outcome + duration land in the log.
     /// - `redacted` (default): tool input + output are leak-scanned and
@@ -13278,6 +13369,8 @@ impl Default for ObservabilityConfig {
             log_persistence_retention_max_files: default_log_persistence_retention_max_files(),
             log_persistence_retention_max_age_days: default_log_persistence_retention_max_age_days(
             ),
+            log_persistence_max_entries_per_segment:
+                default_log_persistence_max_entries_per_segment(),
             log_tool_io: default_log_tool_io(),
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
@@ -13316,6 +13409,11 @@ fn default_log_persistence_rotate_daily() -> bool {
 /// Keep a week of rotated archives by default.
 fn default_log_persistence_retention_max_files() -> usize {
     7
+}
+
+/// Entry-count rotation off by default; operators opt in with an explicit cap.
+fn default_log_persistence_max_entries_per_segment() -> usize {
+    0
 }
 
 /// Age-based cleanup off by default; count-based retention governs unless set.
@@ -13630,8 +13728,8 @@ pub struct OidcConfig {
     /// requirement; non-empty = the token's `acr` claim must be one of
     /// these values or authentication fails closed.
     pub required_acr: Vec<String>,
-    /// Allowed `azp` (authorized party) values — the client the token was
-    /// issued TO. Empty = no restriction; non-empty = the token must carry
+    /// Allowed `azp` (authorized party) values, meaning the client the token
+    /// was issued TO. Empty = no restriction; non-empty = the token must carry
     /// an `azp` claim listed here or authentication fails closed.
     pub allowed_authorized_parties: Vec<String>,
     /// Client identities whose tokens are ALWAYS service principals
@@ -13791,6 +13889,121 @@ pub enum OidcActorKind {
     Human,
 }
 
+impl Config {
+    /// Validate the inbound-authentication sections (`[oidc.<alias>]`,
+    /// `[users]`, `[permission_profiles]`) on their own.
+    ///
+    /// This is the ONE auth-specific validation boundary (RFC 7141). Full
+    /// [`Config::validate`] calls it, but so does authorization-policy
+    /// compilation: `load_or_init` deliberately tolerates a semantically
+    /// invalid config so an operator can boot to repair it, which means the
+    /// resolver cannot assume its input was validated. Running exactly these
+    /// checks again at compile/replace time guarantees that duplicate uids or
+    /// effective principal ids, invalid issuers, and dangling profile
+    /// references can never be installed as a serving policy — without making
+    /// auth activation contingent on every unrelated config field being valid.
+    /// Keys are sorted so the first error reported is deterministic.
+    pub fn validate_auth(&self) -> Result<()> {
+        let mut oidc_aliases: Vec<&String> = self.oidc.keys().collect();
+        oidc_aliases.sort();
+        for alias in oidc_aliases {
+            let oidc = &self.oidc[alias];
+            oidc.validate(alias)?;
+            let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
+            claim_values.sort();
+            for claim_value in claim_values {
+                let profile = &oidc.profile_map[claim_value];
+                if !self.permission_profiles.contains_key(profile) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("oidc.{alias}.profile_map"),
+                        "oidc.{alias}.profile_map[{claim_value:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                    );
+                }
+            }
+            // Service mappings reference profiles too: a dangling target
+            // must fail here at load time, not surface later as a
+            // Misconfigured denial when the service first resolves.
+            let mut client_ids: Vec<&String> = oidc.service_profile_map.keys().collect();
+            client_ids.sort();
+            for client_id in client_ids {
+                let profile = &oidc.service_profile_map[client_id];
+                if !self.permission_profiles.contains_key(profile) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("oidc.{alias}.service_profile_map"),
+                        "oidc.{alias}.service_profile_map[{client_id:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                    );
+                }
+            }
+        }
+
+        let mut user_names: Vec<&String> = self.users.keys().collect();
+        user_names.sort();
+        let mut uid_owners: HashMap<u32, &str> = HashMap::new();
+        let mut principal_owners: HashMap<&str, &str> = HashMap::new();
+        for name in user_names {
+            let user = &self.users[name];
+            user.validate(name)?;
+            for profile in &user.permission_profiles {
+                let trimmed = profile.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !self.permission_profiles.contains_key(trimmed) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("users.{name}.permission_profiles"),
+                        "users.{name}.permission_profiles names {trimmed:?} but [permission_profiles.{trimmed}] is not configured",
+                    );
+                }
+            }
+            // A uid maps a kernel-reported peer to exactly one
+            // principal; two entries claiming one uid would make
+            // authentication ambiguous.
+            if let Some(uid) = user.uid
+                && let Some(other) = uid_owners.insert(uid, name.as_str())
+            {
+                validation_bail!(
+                    ValidationFailed,
+                    format!("users.{name}.uid"),
+                    "users.{name}.uid = {uid} is already mapped by users.{other}; a uid must resolve to exactly one principal",
+                );
+            }
+            // Two entries resolving to one durable principal id would
+            // silently link accounts and merge their owned data.
+            let principal_id = user.effective_principal_id(name);
+            if let Some(other) = principal_owners.insert(principal_id, name.as_str()) {
+                validation_bail!(
+                    ValidationFailed,
+                    format!("users.{name}.principal_id"),
+                    "users.{name} resolves to principal id {principal_id:?} which users.{other} already uses; principal ids must be unique",
+                );
+            }
+        }
+
+        let mut profile_aliases: Vec<&String> = self.permission_profiles.keys().collect();
+        profile_aliases.sort();
+        for alias in profile_aliases {
+            let profile = &self.permission_profiles[alias];
+            for agent in &profile.allowed_agents {
+                let trimmed = agent.trim();
+                if trimmed.is_empty() || trimmed == "*" {
+                    continue;
+                }
+                if !self.agents.contains_key(trimmed) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("permission_profiles.{alias}.allowed_agents"),
+                        "permission_profiles.{alias}.allowed_agents names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl OidcConfig {
     pub fn validate(&self, alias: &str) -> Result<()> {
         if !is_valid_auth_section_name(alias) {
@@ -13931,11 +14144,12 @@ impl OidcConfig {
 #[serde(default)]
 pub struct UserConfig {
     /// Durable principal identifier for this entry; defaults to the entry
-    /// name. Ownership of sessions, memory, approvals, and audit trails
-    /// keys on this id, NOT on the entry name — so to rename the entry
-    /// without orphaning its data, set `principal_id` to the original id
-    /// in the same edit. Changing an entry's effective principal id
-    /// creates a new principal that owns nothing.
+    /// name. Audit records key on this id, NOT on the entry name, and
+    /// ownership of sessions, memory, and approvals will key on it once
+    /// principal-owned storage lands. To rename the entry without
+    /// orphaning its data, set `principal_id` to the original id in the
+    /// same edit. Changing an entry's effective principal id creates a
+    /// new principal.
     pub principal_id: Option<String>,
     /// Unix uid accepted for this user over the local socket (peer
     /// credential). Required today: it is the only roster credential the
@@ -14010,7 +14224,7 @@ pub struct PermissionProfileConfig {
     /// exact prop; `"*"` grants every path. Empty grants NO paths.
     pub config_write_paths: Vec<String>,
     /// Tool names holders may cause an agent to run. Empty grants NO
-    /// tools — broad access requires the explicit `"*"` entry. (Note this
+    /// tools; broad access requires the explicit `"*"` entry. (Note this
     /// differs from risk-profile `allowed_tools`, where empty means
     /// unconstrained: permission profiles are deny-by-default. The
     /// agent's own risk-profile policy still applies on top.)
@@ -14241,6 +14455,11 @@ pub struct RuntimeProfileConfig {
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
     /// Maximum conversation history messages retained per session. `None` inherits.
     pub max_history_messages: Option<usize>,
+    /// Fraction of `max_history_messages` that a whole-turn history trim
+    /// drops the history to (the hysteresis low-water mark). Valid range is
+    /// `(0.0, 1.0]`; `1.0` disables hysteresis and trims straight back to
+    /// the cap. `None` inherits the default (0.7).
+    pub history_trim_low_water: Option<f32>,
     /// Maximum estimated tokens before proactive history trimming. `None`
     /// preserves the legacy 32,000-token default when `context_compact_ratio`
     /// is unset. In ratio mode this remains an optional downward cap. Every
@@ -14308,6 +14527,7 @@ impl Default for RuntimeProfileConfig {
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
             max_history_messages: None,
+            history_trim_low_water: None,
             max_context_tokens: None,
             context_compact_ratio: None,
             compact_context: None,
@@ -14438,7 +14658,10 @@ pub struct RuntimeConfig {
     /// Shell binary the native runtime uses for command execution.
     ///
     /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
-    /// When unset or `null`, the system default `sh` is used.
+    /// When unset or `null`, the platform default is detected. Windows tries
+    /// `pwsh`, then `powershell`, then `cmd.exe`; macOS prefers the current
+    /// user's passwd login shell, then `zsh`, `bash`, and `/bin/sh`; Linux
+    /// prefers the passwd login shell, then `bash`, `zsh`, and `/bin/sh`.
     ///
     /// **Unix:** POSIX-compatible shells are invoked as
     /// `<shell> -c "<command>"`. Accepted forms:
@@ -14463,7 +14686,7 @@ pub struct RuntimeConfig {
     ///   as a bare name resolved via `PATH` or an absolute path (e.g.
     ///   `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`), run the command as
     ///   `<interpreter> -NoProfile -NonInteractive -Command <command>`;
-    /// - any other value (including the default `sh` and an explicit `"cmd"`)
+    /// - any other value (including an explicit `"cmd"`)
     ///   runs `cmd.exe /C "<command>"`, preserving the historical behaviour.
     ///
     /// Only an empty/whitespace value is rejected on Windows; the interpreter is
@@ -18896,7 +19119,7 @@ impl ChannelConfig for LineConfig {
 /// Sandbox backend and resource limits live on per-agent risk profiles
 /// (see `RiskProfileConfig::sandbox_*` and `RiskProfileConfig::max_*`); the
 /// runtime resolves them via `Config::active_risk_profile(agent_alias)`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security"]
 pub struct SecurityConfig {
@@ -18947,6 +19170,15 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub nat64_prefixes: Vec<String>,
 
+    /// Whether the daemon's OWN uid keeps the trusted shared-operator path
+    /// on the local socket even when a `[users]` roster is configured.
+    /// Default `true`: the operator who runs the daemon (and owns its
+    /// config file) retains local authority, which is also what makes
+    /// local-only lockout recovery possible. Set `false` to require every
+    /// local peer — including the daemon's own uid — to map through
+    /// `[users.<name>].uid` or present a credential.
+    #[serde(default = "default_true")]
+    pub trust_daemon_uid: bool,
     /// Audit logging configuration
     #[serde(default)]
     #[nested]
@@ -18977,6 +19209,21 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[nested]
     pub webauthn: WebAuthnConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            trust_daemon_uid: default_true(),
+            audit: AuditConfig::default(),
+            leak_detection: LeakDetectionConfig::default(),
+            otp: OtpConfig::default(),
+            estop: EstopConfig::default(),
+            nevis: NevisConfig::default(),
+            webauthn: WebAuthnConfig::default(),
+            nat64_prefixes: Vec::new(),
+        }
+    }
 }
 
 /// Outbound credential leak detection configuration.
@@ -19430,23 +19677,44 @@ pub enum SandboxBackend {
 }
 
 /// Audit logging configuration
+///
+/// **Scope:** the audit trail currently records certificate issuance and
+/// renewal. Command execution is NOT audited: no runtime path calls
+/// `AuditLogger::log_command_event` outside tests, so no tool command, its
+/// arguments, its approval or its rejection is ever written here. Treat this
+/// section as the certificate trail, not as a record of what the agent ran.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.audit"]
 pub struct AuditConfig {
-    /// Enable audit logging
+    /// Enable audit logging.
+    ///
+    /// Defaults to `true`, which is what keeps the certificate issuance and
+    /// renewal trail being written. Setting it to `false` turns that trail
+    /// off: certificate issuance and renewal then have no audit-log record.
+    /// Enabling it does not start recording command execution, which has no
+    /// production writer.
     #[serde(default = "default_audit_enabled")]
     pub enabled: bool,
 
-    /// Path to audit log file (relative to zeroclaw dir)
+    /// Path to audit log file (relative to zeroclaw dir).
+    ///
+    /// Receives the certificate issuance and renewal events. No command
+    /// execution record is ever written to it.
     #[serde(default = "default_audit_log_path")]
     pub log_path: String,
 
-    /// Maximum log size in MB before rotation
+    /// Maximum log size in MB before rotation.
+    ///
+    /// Applies to the certificate trail written at `log_path`.
     #[serde(default = "default_audit_max_size_mb")]
     pub max_size_mb: u32,
 
-    /// Sign events with HMAC for tamper evidence
+    /// Sign events with HMAC for tamper evidence.
+    ///
+    /// Applies to the certificate trail written at `log_path`. It cannot make
+    /// command execution tamper-evident, because command execution is not
+    /// recorded.
     #[serde(default)]
     pub sign_events: bool,
 }
@@ -22493,6 +22761,28 @@ impl Config {
                 ));
             }
         }
+        // `security.audit` is the certificate issuance and renewal trail, and
+        // nothing else: `AuditLogger::log_command_event` has no production
+        // caller, so tool commands are never recorded. Turning the section off
+        // therefore removes the only record it does produce while adding no
+        // command record in exchange, and `AuditLogger::log` returns `Ok(())`
+        // without writing, so nothing else reports the loss. Warn on the
+        // disabling value, and say in the same breath which record the
+        // operator does and does not get, so nobody reads "audit" as a record
+        // of what the agent ran.
+        if !self.security.audit.enabled {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+                "security.audit.enabled=false: certificates are issued and renewed with no \
+                 audit record. Command execution is not audited either way, because no \
+                 production path records tool commands. Leave the section enabled to keep \
+                 the certificate trail, and use an external supervisor or logging wrapper \
+                 that observes the ZeroClaw process, or OS-level process accounting, if you \
+                 need a record of what ran."
+                    .to_string(),
+                "security.audit.enabled",
+            ));
+        }
         warnings
     }
 
@@ -23700,107 +23990,28 @@ impl Config {
             }
         }
 
-        // Inbound authentication & principals (RFC 7141): each auth section
-        // must be internally valid, reference only configured entries, and
-        // map credentials and principal ids unambiguously. Keys are sorted
-        // so the first error reported is deterministic.
+        // Inbound authentication & principals (RFC 7141): one auth-specific
+        // validation boundary, shared with policy compilation so an invalid
+        // auth section can never be compiled into a serving policy even when
+        // the boot path tolerates other config errors.
+        self.validate_auth()?;
+
+        // A remote WSS listener with no possible credential path must fail
+        // validation rather than start: before enforcement that meant
+        // silently accepting unauthenticated clients, after it an
+        // enforced-but-unusable listener. gateway.require_pairing keeps a
+        // recoverable path (pair, then authenticate) even with no tokens
+        // yet.
+        if self.wss.enabled
+            && self.oidc.is_empty()
+            && self.gateway.paired_tokens.is_empty()
+            && !self.gateway.require_pairing
         {
-            let mut oidc_aliases: Vec<&String> = self.oidc.keys().collect();
-            oidc_aliases.sort();
-            for alias in oidc_aliases {
-                let oidc = &self.oidc[alias];
-                oidc.validate(alias)?;
-                let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
-                claim_values.sort();
-                for claim_value in claim_values {
-                    let profile = &oidc.profile_map[claim_value];
-                    if !self.permission_profiles.contains_key(profile) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("oidc.{alias}.profile_map"),
-                            "oidc.{alias}.profile_map[{claim_value:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
-                        );
-                    }
-                }
-                // Service mappings reference profiles too: a dangling target
-                // must fail here at load time, not surface later as a
-                // Misconfigured denial when the service first resolves.
-                let mut client_ids: Vec<&String> = oidc.service_profile_map.keys().collect();
-                client_ids.sort();
-                for client_id in client_ids {
-                    let profile = &oidc.service_profile_map[client_id];
-                    if !self.permission_profiles.contains_key(profile) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("oidc.{alias}.service_profile_map"),
-                            "oidc.{alias}.service_profile_map[{client_id:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
-                        );
-                    }
-                }
-            }
-
-            let mut user_names: Vec<&String> = self.users.keys().collect();
-            user_names.sort();
-            let mut uid_owners: HashMap<u32, &str> = HashMap::new();
-            let mut principal_owners: HashMap<&str, &str> = HashMap::new();
-            for name in user_names {
-                let user = &self.users[name];
-                user.validate(name)?;
-                for profile in &user.permission_profiles {
-                    let trimmed = profile.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if !self.permission_profiles.contains_key(trimmed) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("users.{name}.permission_profiles"),
-                            "users.{name}.permission_profiles names {trimmed:?} but [permission_profiles.{trimmed}] is not configured",
-                        );
-                    }
-                }
-                // A uid maps a kernel-reported peer to exactly one
-                // principal; two entries claiming one uid would make
-                // authentication ambiguous.
-                if let Some(uid) = user.uid
-                    && let Some(other) = uid_owners.insert(uid, name.as_str())
-                {
-                    validation_bail!(
-                        ValidationFailed,
-                        format!("users.{name}.uid"),
-                        "users.{name}.uid = {uid} is already mapped by users.{other}; a uid must resolve to exactly one principal",
-                    );
-                }
-                // Two entries resolving to one durable principal id would
-                // silently link accounts and merge their owned data.
-                let principal_id = user.effective_principal_id(name);
-                if let Some(other) = principal_owners.insert(principal_id, name.as_str()) {
-                    validation_bail!(
-                        ValidationFailed,
-                        format!("users.{name}.principal_id"),
-                        "users.{name} resolves to principal id {principal_id:?} which users.{other} already uses; principal ids must be unique",
-                    );
-                }
-            }
-
-            let mut profile_aliases: Vec<&String> = self.permission_profiles.keys().collect();
-            profile_aliases.sort();
-            for alias in profile_aliases {
-                let profile = &self.permission_profiles[alias];
-                for agent in &profile.allowed_agents {
-                    let trimmed = agent.trim();
-                    if trimmed.is_empty() || trimmed == "*" {
-                        continue;
-                    }
-                    if !self.agents.contains_key(trimmed) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("permission_profiles.{alias}.allowed_agents"),
-                            "permission_profiles.{alias}.allowed_agents names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
-                        );
-                    }
-                }
-            }
+            validation_bail!(
+                ValidationFailed,
+                "wss.enabled",
+                "wss.enabled requires a remote credential path: configure [oidc.<alias>], enable gateway.require_pairing (then pair a device), or keep an existing paired token",
+            );
         }
 
         // Security OTP / estop
@@ -24564,6 +24775,25 @@ impl Config {
                 "delegate.agentic_timeout_secs",
                 "delegate.agentic_timeout_secs must be greater than 0"
             );
+        }
+
+        // Per-profile validation: the whole-turn history-trim hysteresis
+        // fraction must be in (0.0, 1.0]. Zero or negative would request an
+        // empty refill target; anything above 1.0 would trim deeper than the
+        // cap itself. Sorted iteration keeps error ordering stable.
+        let mut profile_aliases: Vec<&String> = self.runtime_profiles.keys().collect();
+        profile_aliases.sort();
+        for palias in profile_aliases {
+            let Some(low_water) = self.runtime_profiles[palias].history_trim_low_water else {
+                continue;
+            };
+            if !low_water.is_finite() || low_water <= 0.0 || low_water > 1.0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("runtime_profiles.{palias}.history_trim_low_water"),
+                    "runtime_profiles.{palias}.history_trim_low_water must be a finite number in (0.0, 1.0] (got {low_water})",
+                );
+            }
         }
 
         // Per-profile validation: the context-compression summarizer provider
@@ -27553,6 +27783,35 @@ mod tests {
         );
     }
 
+    #[::core::prelude::v1::test]
+    fn cache_ttl_deserializes_and_defaults_to_omitted() {
+        let one_hour: ModelProviderConfig = toml::from_str("cache_ttl = \"1h\"").unwrap();
+        assert_eq!(one_hour.cache_ttl, Some(CacheTtl::OneHour));
+        assert_eq!(
+            toml::to_string(&one_hour).unwrap(),
+            "cache_ttl = \"1h\"\n",
+            "an explicitly configured cache_ttl must round-trip its wire string"
+        );
+
+        let five_minutes: ModelProviderConfig = toml::from_str("cache_ttl = \"5m\"").unwrap();
+        assert_eq!(five_minutes.cache_ttl, Some(CacheTtl::FiveMinutes));
+
+        let serialized = toml::to_string(&ModelProviderConfig::default()).unwrap();
+        assert!(
+            !serialized.contains("cache_ttl"),
+            "absent cache_ttl must be omitted from serialized config"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn cache_ttl_rejects_unknown_lifetime() {
+        let parsed = toml::from_str::<ModelProviderConfig>("cache_ttl = \"2h\"");
+        assert!(
+            parsed.is_err(),
+            "cache_ttl is a closed enum; unknown lifetimes must not parse into a silent default"
+        );
+    }
+
     // ── Nextcloud Talk: one normalized bot secret for both directions ──
     //
     // Nextcloud installs ONE secret per bot and uses it to verify inbound webhook
@@ -28577,6 +28836,35 @@ zeroclaw-operators = "operator"
             "operator"
         );
         assert_eq!(config.users["alice"].uid, Some(1000));
+    }
+
+    #[::core::prelude::v1::test]
+    fn wss_without_any_credential_path_fails_validation() {
+        let mut config = Config::default();
+        config.wss.enabled = true;
+        config.gateway.require_pairing = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("remote credential path"), "got: {err}");
+
+        config.gateway.require_pairing = true;
+        config
+            .validate()
+            .expect("pairing-capable wss config is startable");
+
+        config.gateway.require_pairing = false;
+        config.gateway.paired_tokens = vec!["zc_tok".into()];
+        config
+            .validate()
+            .expect("an existing paired token is a path");
+    }
+
+    #[::core::prelude::v1::test]
+    fn security_trust_daemon_uid_defaults_true_via_both_paths() {
+        assert!(SecurityConfig::default().trust_daemon_uid);
+        let parsed: Config = toml::from_str("[security]\n").unwrap();
+        assert!(parsed.security.trust_daemon_uid);
+        let parsed: Config = toml::from_str("[security]\ntrust_daemon_uid = false\n").unwrap();
+        assert!(!parsed.security.trust_daemon_uid);
     }
 
     #[::core::prelude::v1::test]
@@ -32293,6 +32581,7 @@ reasoning_effort = "turbo"
         assert!(cfg.resolved.compact_context);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
         assert_eq!(cfg.resolved.max_history_messages, 50);
+        assert_eq!(cfg.resolved.history_trim_low_water, 0.7);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
         assert!(!cfg.resolved.strict_tool_parsing);
@@ -32521,6 +32810,105 @@ runtime_profile = "long_turn"
         assert_eq!(
             parsed.effective_structured_max_history_messages("default"),
             50
+        );
+    }
+
+    #[test]
+    async fn default_history_trim_low_water_is_seven_tenths() {
+        let raw = r#"
+[runtime_profiles.plain]
+
+[agents.default]
+runtime_profile = "plain"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.7);
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.history_trim_low_water, 0.7);
+    }
+
+    #[test]
+    async fn runtime_profile_history_trim_low_water_is_honored() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 0.9
+
+[agents.default]
+runtime_profile = "mem_saver"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.9);
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.history_trim_low_water, 0.9);
+    }
+
+    #[test]
+    async fn validate_accepts_history_trim_low_water_of_one() {
+        let raw = r#"
+[runtime_profiles.no_hysteresis]
+history_trim_low_water = 1.0
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed
+                .runtime_profiles
+                .get("no_hysteresis")
+                .and_then(|p| p.history_trim_low_water),
+            Some(1.0)
+        );
+        parsed
+            .validate()
+            .expect("history_trim_low_water = 1.0 must be accepted");
+    }
+
+    #[test]
+    async fn validate_rejects_zero_history_trim_low_water() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 0.0
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("history_trim_low_water = 0.0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_history_trim_low_water_above_one() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 1.5
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("history_trim_low_water above 1.0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_non_finite_history_trim_low_water() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = nan
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("non-finite history_trim_low_water must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
         );
     }
 
@@ -38730,6 +39118,73 @@ group_policy = "disabled"
         assert!(
             !warnings.iter().any(|w| w.path.contains("custom.vllm")),
             "custom honors wire_api and must not warn",
+        );
+    }
+
+    // The certificate issuance and renewal trail is written through this
+    // section, so the default has to stay `true`: an operator who never
+    // touches `[security.audit]` still gets the certificate record. Both the
+    // typed default and the omitted-TOML path are asserted, because the two
+    // are separate code paths (`Default` versus `serde(default = ...)`).
+    #[test]
+    async fn audit_config_default_is_enabled() {
+        assert!(
+            AuditConfig::default().enabled,
+            "security.audit.enabled must default to true so certificate \
+             issuance and renewal stay audited"
+        );
+
+        let config: Config = toml::from_str("").expect("empty TOML loads with defaults");
+        assert!(config.security.audit.enabled);
+    }
+
+    // Disabling the section silently stops the certificate trail:
+    // `AuditLogger::log` returns `Ok(())` without writing, so the caller sees
+    // a success it did not get. The warning is the only place that says so.
+    #[test]
+    async fn collect_warnings_flags_disabled_audit_dropping_certificate_record() {
+        let mut config: Config = toml::from_str(
+            r#"
+[security.audit]
+enabled = false
+"#,
+        )
+        .expect("explicit audit setting loads from TOML");
+        suppress_semantic_memory_warning(&mut config);
+
+        let warnings = warnings_with_code(
+            &config,
+            crate::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+        );
+        assert_eq!(warnings.len(), 1);
+        let w = &warnings[0];
+        assert_eq!(w.path, "security.audit.enabled");
+        assert!(
+            w.message
+                .contains("issued and renewed with no audit record"),
+            "warning should name the certificate record that is lost: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("Command execution is not audited"),
+            "warning should scope the claim to command execution rather than \
+             to the whole section: {}",
+            w.message
+        );
+    }
+
+    // The default config keeps the certificate trail, so there is nothing to
+    // report and no operator sees this warning on a stock install.
+    #[test]
+    async fn collect_warnings_silent_when_audit_left_default() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        assert!(
+            warnings_with_code(
+                &config,
+                crate::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+            )
+            .is_empty()
         );
     }
 
