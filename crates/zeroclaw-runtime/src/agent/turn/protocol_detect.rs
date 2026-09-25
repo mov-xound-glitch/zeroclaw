@@ -92,17 +92,22 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
     // the rest of the reply. Brackets inside strings do not count toward
     // whether a value closed, and a value that has closed is left to the
     // rule above.
-    let mut openers = 0usize;
+    let mut scanned = 0usize;
     for (idx, ch) in text.char_indices() {
         if ch != '{' && ch != '[' {
             continue;
         }
-        openers += 1;
-        if openers > MAX_CANDIDATE_OPENERS {
-            break;
-        }
-        if json_like_value_closes(&text[idx..]) {
+        let tail_raw = &text[idx..];
+        let span = json_like_value_span(tail_raw);
+        scanned += span.unwrap_or(tail_raw.len());
+        if let Some(_closed) = span {
+            if scanned > MAX_CANDIDATE_SCAN_BYTES {
+                break;
+            }
             continue;
+        }
+        if scanned > MAX_CANDIDATE_SCAN_BYTES {
+            break;
         }
         let tail = &lower[idx..];
         let rest = tail[ch.len_utf8()..].trim_start();
@@ -117,20 +122,22 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
     earliest
 }
 
-/// How many openers in one chunk are examined for an unfinished value, so an
+/// How many bytes one chunk may spend looking for an unfinished value, so an
 /// adversarial chunk cannot make the scan quadratic; past it only the
-/// protocol-key rule applies.
-const MAX_CANDIDATE_OPENERS: usize = 64;
+/// protocol-key rule applies. The budget counts bytes actually examined, not
+/// openers, so a run of short closed values (`[][][]…`) costs almost nothing
+/// and cannot crowd out a later unfinished candidate.
+const MAX_CANDIDATE_SCAN_BYTES: usize = 256 * 1024;
 
-/// Whether the bracketed value starting at `text[0]` closes within `text`.
-/// Brackets inside double-quoted strings (with backslash escapes) do not
-/// count, so this answers "has the value closed" for partial, even invalid,
-/// JSON; trailing prose after the close is expected.
-fn json_like_value_closes(text: &str) -> bool {
+/// The byte length of the bracketed value starting at `text[0]`, or `None`
+/// when it never closes within `text`. Brackets inside double-quoted strings
+/// (with backslash escapes) do not count, so this works on partial, even
+/// invalid, JSON; trailing prose after the close is expected.
+fn json_like_value_span(text: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    for byte in text.bytes() {
+    for (idx, byte) in text.bytes().enumerate() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -147,13 +154,13 @@ fn json_like_value_closes(text: &str) -> bool {
             b'}' | b']' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return true;
+                    return Some(idx + 1);
                 }
             }
             _ => {}
         }
     }
-    false
+    None
 }
 
 pub(crate) fn starts_suspicious_protocol_prefix(text: &str) -> bool {
