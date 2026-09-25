@@ -65,6 +65,17 @@ rpc_type! {
             skip_serializing_if = "Option::is_none"
         )]
         pub client_capabilities: Option<serde_json::Value>,
+        /// Explicit credential for authentication (a native pairing token
+        /// or an OIDC access token). Wins over the transport-intrinsic
+        /// peer credential when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_token: Option<String>,
+        /// Which configured provider verifies `auth_token` (e.g. `native`,
+        /// `oidc.corp`). Defaults to `native`. Selection is explicit and
+        /// final: the selected provider's denial never falls through to
+        /// another provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_provider: Option<String>,
     }
 }
 
@@ -97,6 +108,13 @@ rpc_type! {
         /// Supported RPC method names (e.g. "session/prompt", "memory/list").
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub capabilities: Vec<String>,
+        /// Configured auth provider selection keys (e.g. `native`,
+        /// `peercred`, `oidc.corp`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub auth_methods: Vec<String>,
+        /// Canonical principal id this connection is bound to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub principal_id: Option<String>,
         /// Shared command catalogue entries available on the TUI surface.
         ///
         /// Always serialized so a new daemon's authoritative empty catalogue
@@ -192,6 +210,10 @@ rpc_type! {
         pub cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub session_id: Option<String>,
+        /// Accepted for wire compatibility and ignored. The session's shell
+        /// environment is resolved from the calling connection's own TUI
+        /// registration, so naming another connection's id here has no
+        /// effect.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tui_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1323,6 +1345,11 @@ rpc_type! {
         /// pagination regardless of id ordering.
         #[serde(default)]
         pub until_line_offset: Option<u64>,
+        /// Segment-aware cursor. Set from `LogsQueryResult::next_segment_cursor`
+        /// to paginate across rotated archive files. Takes precedence over
+        /// `until_line_offset` when both are supplied.
+        #[serde(default)]
+        pub until_segment_cursor: Option<String>,
         #[serde(default)]
         pub severity_min: Option<u8>,
         #[serde(default)]
@@ -1360,8 +1387,22 @@ rpc_type! {
         /// Byte offset past the last event on this page. Callers should
         /// pass this back as `until_line_offset` on the next request to
         /// resume without re-scanning already-read bytes.
+        ///
+        /// For multi-segment deployments, this is `None` when the oldest event
+        /// on the page is in an archive file — use `next_segment_cursor` instead.
         pub next_cursor_line_offset: Option<u64>,
+        /// Segment-aware cursor for the oldest event on this page. Pass back
+        /// as `until_segment_cursor` to walk older pages across segment
+        /// boundaries. Supersedes `next_cursor_line_offset` for `rotating`-mode
+        /// deployments with multiple retained segments.
+        pub next_segment_cursor: Option<String>,
         pub at_end: bool,
+        /// True when a retained segment could not be read and was left out of
+        /// this page. `at_end` then means "no older events among the segments
+        /// that could be read", which is weaker than "no older events exist",
+        /// so a client that stops paging on `at_end` should say the history is
+        /// partial rather than present it as complete.
+        pub incomplete: bool,
     }
 }
 
@@ -1419,11 +1460,12 @@ pub enum SessionUpdateEvent {
         timeout_secs: u64,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
-    /// for this turn; `max_context_tokens` is the runtime-profile context
-    /// budget (`[runtime_profiles.<name>] max_context_tokens`).
-    /// `model_context_window` is the model's actual context window
-    /// (`[providers.models.<type>.<alias>] context_window`).
-    /// All may be absent when the provider doesn't report usage.
+    /// for this turn. `max_context_tokens` is the preemptive-trim budget (the
+    /// resolved `effective_context_budget`), preserving its original meaning as
+    /// the value the meter fills toward. `model_context_window` is the model's
+    /// full context window (provider `context_window`), exposed distinctly so a
+    /// client can render capacity and budget separately. Any may be absent when
+    /// the provider doesn't report usage or the value can't be resolved.
     ContextUsage {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1467,6 +1509,29 @@ pub enum SessionUpdateEvent {
         dropped_messages: usize,
         kept_turns: usize,
         reason: String,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// Provenance of `tokens_after` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget (protected newest turn plus schemas). History MAY
+        /// have been trimmed on the way to that floor, so this flag — not
+        /// `dropped_messages == 0` — is the authoritative "unsatisfiable"
+        /// signal. Absent for ordinary trims.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unsatisfiable_floor: Option<bool>,
     },
 }
 
@@ -2012,7 +2077,9 @@ mod tests {
             log_path: Some("/var/lib/zeroclaw/runtime-trace.jsonl".into()),
             next_cursor: None,
             next_cursor_line_offset: None,
+            next_segment_cursor: None,
             at_end: true,
+            incomplete: false,
         };
 
         let value = serde_json::to_value(result).expect("logs/query result");

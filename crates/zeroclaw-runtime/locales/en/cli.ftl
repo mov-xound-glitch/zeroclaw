@@ -28,6 +28,12 @@ cli-integrations-status-available = Available
 cli-integrations-setup-heading = Setup
 cli-integrations-setup-macos-heading = Setup (macOS only)
 cli-integrations-builtin-heading = Built-in
+cli-integrations-chat-telegram-prepare = Message {$botfather} on {$channel} to create a bot and obtain its token.
+cli-integrations-chat-discord-prepare = Create a bot at {$url}, obtain its token, and enable the {$intent} intent.
+cli-integrations-chat-slack-prepare = Create an app at {$url}, configure its bot scopes, enable Socket Mode and create an app-level token, then install the app to obtain its bot token.
+cli-integrations-chat-configure = Run {$command}, open Config, and configure a {$channel} instance and its credentials.
+cli-integrations-chat-bind = Bind the channel alias to an agent and review peer-group access.
+cli-integrations-chat-enable = Enable the channel instance only after reviewing its settings and access.
 cli-skills-about = Manage skills (user-defined capabilities)
 cli-sop-about = Manage standard operating procedures (SOPs)
 cli-migrate-about = Migrate data from other agent runtimes
@@ -77,6 +83,8 @@ cli-wechat-login-confirmed-missing-field = Login confirmed but {$field} missing.
 cli-wechat-connected = ✅ WeChat connected!
 cli-wechat-bound-success = ✅ WeChat account bound successfully. You can talk to ZeroClaw now.
 cli-wechat-invalid-bind-code = ❌ Invalid bind code. Please try again.
+cli-wechat-bind-denied = ❌ This account is blocked by an `ignore` entry in the runtime config. Ask the operator to remove it, then retry with the same code.
+cli-wechat-bind-not-saved = ❌ Could not save the binding, so nothing changed. Your code is still valid; ask the operator to check the config file, then retry.
 
 cli-skills-list-about = List all installed skills
 cli-skills-audit-about = Audit a skill source directory or installed skill name
@@ -439,6 +447,8 @@ channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$c
 channel-line-bind-success = ✅ Paired! You can now chat.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
 channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
+channel-line-bind-denied = ❌ This account is blocked by an `ignore` entry. Ask the operator to remove it, then retry.
+channel-line-bind-not-saved = ❌ Could not save the binding, so nothing changed. Your code is still valid; ask the operator to check the config file, then retry.
 channel-telegram-cmd-new-desc = Start a new conversation session
 channel-telegram-cmd-clear-desc = Clear this conversation session
 channel-telegram-cmd-stop-desc = Cancel the current in-flight task
@@ -532,6 +542,7 @@ cli-sop-loaded-header = Loaded SOPs ({$count}):
 cli-sop-none-to-validate = No SOPs found to validate.
 cli-sop-valid = ✅ {$name} — valid
 cli-sop-deleted = Deleted SOP: {$name}
+cli-sop-renamed = Renamed SOP {$from} to {$to}
 cli-sop-warnings = ⚠️  {$name} — {$count} warning(s):
 cli-sop-all-passed = All SOPs passed validation.
 cli-sop-priority = {"  "}Priority:       {$value}
@@ -692,6 +703,7 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-auth-validation = authorization config rejected before persistence: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
 cli-quickstart-error-provider-required = provider type, alias, and model are required
@@ -862,6 +874,8 @@ cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-key = Config entry key ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-install-verify-failed = install failed: '{$name}' does not load against this host: {$error} — rebuild the plugin against this host's WIT (see wit/v0), or override with --no-verify to install anyway.
+cli-plugin-install-verify-bypassed = note: skipping the install-time load check for '{$name}' (--no-verify); if it does not load against this host it will be skipped at startup
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-config-section-degraded-executable = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
@@ -979,12 +993,14 @@ turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) 
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
+turn-context-window-exceeded-error = This request exceeds the selected model's context window. Reduce the request or enabled tools, or choose a model with a larger context window.
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = history message limit exceeded
+history-trim-reason-recovery = context window overflow recovery
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).
@@ -1078,6 +1094,7 @@ channel-runtime-safeguard-footer-client-server =
 
 delegate-provider-fallback-warning = Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.
 turn-tool-protocol-strict-mixed-error = Strict tool parsing cannot run a fallback chain that mixes native-tool and text-only candidates. Configure every reachable candidate to use the same tool protocol, or set strict_tool_parsing to false.
+turn-context-hook-mutation-unsafe-error = A before-LLM-call hook changed existing messages in a way that cannot be safely reconciled with a required context-budget trim. Configure the hook to only append messages, or shorten the current turn.
 delegate-provider-fallback-header = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model }, agentic)]
 
@@ -1221,6 +1238,7 @@ cli-doctor-probe-timeout-message = Model probing timed out. Some provider catalo
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled is set, but the vi_verify tool is withheld from the model-visible registry until a credential chain verifier exists. Enabling the section does not enable credential verification on commerce tool calls. The issuance and verification library paths are unaffected.
+cli-doctor-security-audit-disabled-drops-certificate-record = security.audit.enabled=false: certificates are issued and renewed with no audit record. Command execution is not audited either way, because no production path records tool commands. Leave the section enabled to keep the certificate trail, and use an external supervisor or logging wrapper that observes the ZeroClaw process, or OS-level process accounting, if you need a record of what ran.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
@@ -1287,3 +1305,8 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
+
+rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
+
+cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
