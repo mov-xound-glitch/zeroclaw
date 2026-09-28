@@ -103,19 +103,25 @@ fn dns_failure() -> ErrorCode {
     )
 }
 
-/// Emit the structured denial event that attributes the attempt to the exact
-/// instance. The destination host and the boundary's reason are recorded
-/// host-side — the operator needs both to seed a grant — while only the guest's
-/// error is masked.
+/// Wrap `value` as one POSIX single-quoted shell word. An apostrophe inside
+/// closes the quoted run, contributes a backslash-escaped apostrophe outside
+/// it, and reopens the run, so the word stays one argument with the original
+/// bytes. This is the quoting `shell_escape` in `zeroclaw-runtime`'s
+/// `coding_cli_executor` applies to generated commands.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// `existing` with `host` appended when it is not already there, rendered as
-/// the single-quoted JSON list `config set` takes. `config set` replaces the
-/// whole list, so a remedy has to carry every entry the operator already has.
+/// one single-quoted shell argument carrying the JSON list `config set` takes.
+/// `config set` replaces the whole list, so a remedy has to carry every entry
+/// the operator already has.
 fn list_with(existing: &[String], host: &str) -> String {
     let mut list: Vec<&str> = existing.iter().map(String::as_str).collect();
     if !list.contains(&host) {
         list.push(host);
     }
-    format!("'{}'", serde_json::Value::from(list))
+    shell_quote(&serde_json::Value::from(list).to_string())
 }
 
 /// The operator-facing next step for a missing grant: the exact command that
@@ -194,6 +200,10 @@ fn egress_remedy(
     }
 }
 
+/// Emit the structured denial event that attributes the attempt to the exact
+/// instance. The destination host and the boundary's reason are recorded
+/// host-side — the operator needs both to seed a grant — while only the guest's
+/// error is masked.
 fn record_denial(id: &PluginInstanceId, host: &str, reason: &str, remedy: Option<String>) {
     ::zeroclaw_log::record!(
         WARN,
@@ -399,12 +409,22 @@ fn trust_environment() -> TrustEnvironment {
 /// short one must not be able to cancel the store read that the *next* request
 /// needs. What a timeout cancels here is the waiter, never the work.
 struct TrustSlot {
-    ready: tokio::sync::watch::Receiver<Option<Arc<rustls::ClientConfig>>>,
+    ready: tokio::sync::watch::Receiver<Option<TrustMaterial>>,
     /// Held for its `Drop` alone. [`wasmtime_wasi::runtime::spawn_blocking`]
     /// hands back a handle that aborts its task when dropped, so letting this
     /// fall at the end of the miss branch would abort the very assembly the
     /// waiters are about to await.
     _assembly: wasmtime_wasi::runtime::AbortOnDropJoinHandle<()>,
+}
+
+/// One assembled trust decision: the client configuration plugin HTTPS dials
+/// with, and the root store it was built from. The roots travel with the
+/// configuration so TLS-profile transports extend exactly the trust plugin
+/// HTTPS already has, never a second, separately assembled set.
+#[derive(Clone)]
+struct TrustMaterial {
+    config: Arc<rustls::ClientConfig>,
+    roots: Arc<rustls::RootCertStore>,
 }
 
 /// Test-only delay injected ahead of the store read.
@@ -462,6 +482,30 @@ static ASSEMBLY_DELAY: std::sync::Mutex<Option<std::time::Duration>> = std::sync
 /// the assembly lands, and [`ErrorCode::TlsProtocolError`] when the assembly
 /// task itself died without producing a configuration.
 async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
+    plugin_trust_material(deadline)
+        .await
+        .map(|material| material.config)
+}
+
+/// The root store plugin HTTPS verifies against: the bundled program plus this
+/// machine's store, from the same cached assembly as [`plugin_tls_config`].
+///
+/// TLS-profile transports start from this store when a profile keeps system
+/// roots, so a socket, a WebSocket, and an HTTPS request from one plugin trust
+/// the same authorities.
+///
+/// # Errors
+///
+/// As [`plugin_tls_config`].
+pub(crate) async fn plugin_trust_roots(
+    deadline: Instant,
+) -> Result<Arc<rustls::RootCertStore>, ErrorCode> {
+    plugin_trust_material(deadline)
+        .await
+        .map(|material| material.roots)
+}
+
+async fn plugin_trust_material(deadline: Instant) -> Result<TrustMaterial, ErrorCode> {
     static CACHE: OnceLock<std::sync::Mutex<HashMap<TrustEnvironment, TrustSlot>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -480,8 +524,8 @@ async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig
             // must not inherit an unrelated panic.
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(slot) = guard.get(&key) {
-            if let Some(config) = slot.ready.borrow().clone() {
-                return Ok(config);
+            if let Some(material) = slot.ready.borrow().clone() {
+                return Ok(material);
             }
             slot.ready.clone()
         } else {
@@ -498,14 +542,15 @@ async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig
                 }
                 let anchors = build_trust_anchors();
                 record_trust_anchors(&anchors);
+                let roots = Arc::new(anchors.store);
                 let config = Arc::new(
                     rustls::ClientConfig::builder()
-                        .with_root_certificates(anchors.store)
+                        .with_root_certificates(Arc::clone(&roots))
                         .with_no_client_auth(),
                 );
                 // The slot keeps a receiver alive for the life of the process,
                 // so this send lands whether or not anyone is still waiting.
-                let _ = sender.send(Some(config));
+                let _ = sender.send(Some(TrustMaterial { config, roots }));
             });
             guard.insert(
                 key.clone(),
@@ -1007,6 +1052,102 @@ mod tests {
         );
     }
 
+    /// A grant with no quoting-sensitive characters keeps the exact command the
+    /// remedy has always printed. Only entries that need escaping change.
+    #[test]
+    fn a_remedy_for_plain_grants_keeps_the_command_unchanged() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let key = id
+            .config_entry_key()
+            .expect("an admitted instance has a config-entry key");
+        let existing = vec!["docs.example.com".to_string()];
+        let remedy = egress_grant_remedy(id, "new.example.com", Some(&existing))
+            .expect("a missing grant has a fix");
+        let expected = format!(
+            "grant reach with: zeroclaw config set plugins.entries.{key}.egress_hosts '[\"docs.example.com\",\"new.example.com\"]'"
+        );
+        assert_eq!(remedy, expected, "{remedy}");
+    }
+
+    /// The serialized list was wrapped in single quotes without escaping the
+    /// apostrophes inside it, so a grant like `o'brien.example` closed the
+    /// quoted run early and left the operator with an unterminated quote. The
+    /// grant grammar now rejects such an entry before it reaches a policy, so
+    /// none should arrive here; the command must still be one shell word for
+    /// whatever list it is handed, rather than relying on a grammar elsewhere
+    /// to keep it well-formed.
+    #[test]
+    fn a_remedy_for_a_grant_with_an_apostrophe_is_one_shell_argument() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let key = id
+            .config_entry_key()
+            .expect("an admitted instance has a config-entry key");
+        let existing = vec!["o'brien.example".to_string()];
+        let remedy = egress_grant_remedy(id, "new.example.com", Some(&existing))
+            .expect("a missing grant has a fix");
+        let expected = format!(
+            "grant reach with: zeroclaw config set plugins.entries.{key}.egress_hosts '[\"o'\\''brien.example\",\"new.example.com\"]'"
+        );
+        assert_eq!(remedy, expected, "{remedy}");
+    }
+
+    /// The same command read back the way a POSIX shell reads it has to carry
+    /// the list `config set` replaces, apostrophe and all. Whether that list
+    /// then builds a policy is the grant grammar's call, not the quoting's:
+    /// the shell must hand `config set` the operator's list byte for byte so
+    /// the grammar is what judges it, not a truncated copy.
+    #[test]
+    fn a_remedy_for_a_grant_with_an_apostrophe_round_trips() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let existing = vec![
+            "docs.example.com".to_string(),
+            "o'brien.example".to_string(),
+        ];
+        let remedy = egress_grant_remedy(id, "new.example.com", Some(&existing))
+            .expect("a missing grant has a fix");
+        let written = remedy_list(&remedy);
+        assert_eq!(
+            written,
+            vec![
+                "docs.example.com".to_string(),
+                "o'brien.example".to_string(),
+                "new.example.com".to_string()
+            ],
+            "{remedy}"
+        );
+    }
+
+    /// The escape sequence is data, not syntax: a grant that already contains
+    /// `'\''`, adjacent apostrophes or a trailing one must survive unchanged
+    /// rather than being escaped a second time.
+    #[test]
+    fn a_grant_containing_the_escape_sequence_round_trips() {
+        for value in [
+            "a'\\''b.example",
+            "o''brien.example",
+            "trailing'",
+            "'leading",
+        ] {
+            let quoted = shell_quote(value);
+            assert_eq!(shell_argument(&quoted), value, "{quoted}");
+        }
+    }
+
     /// The remedy names the field each refusal actually needs, and is absent
     /// where no config change would help: a granted host that resolved into
     /// private address space must be pointed at `egress_allow_private`, not
@@ -1123,11 +1264,41 @@ mod tests {
         assert!(remedy.contains("egress_allow_private"), "{remedy}");
     }
 
-    /// The list a remedy command would write, parsed back out of it.
+    /// The list a remedy command would hand to `config set`, read off the
+    /// command the way a POSIX shell would read it.
     fn remedy_list(remedy: &str) -> Vec<String> {
-        let start = remedy.rfind(" '").expect("remedy ends in a quoted list") + 2;
-        let end = remedy.rfind('\'').expect("the list is single-quoted");
-        serde_json::from_str(&remedy[start..end]).expect("the list is JSON")
+        let argument = remedy
+            .split_once("config set ")
+            .and_then(|(_, tail)| tail.split_once(' '))
+            .map(|(_, argument)| argument)
+            .unwrap_or_else(|| panic!("no config-set argument in the remedy: {remedy}"));
+        serde_json::from_str(&shell_argument(argument)).expect("the list is JSON")
+    }
+
+    /// Resolve one single-quoted shell argument. [`shell_quote`] emits a quoted
+    /// run, and for an apostrophe it splices out to a backslash-escaped quote
+    /// and back in; anything else after a closing quote is an unterminated
+    /// quote, which is exactly the defect here, so this fails loudly there
+    /// instead of quietly decoding a truncated list.
+    fn shell_argument(raw: &str) -> String {
+        let mut out = String::new();
+        let mut rest = raw
+            .strip_prefix('\'')
+            .unwrap_or_else(|| panic!("the argument must open with a quote: {raw}"));
+        loop {
+            let end = rest
+                .find('\'')
+                .unwrap_or_else(|| panic!("unterminated quote in the argument: {raw}"));
+            out.push_str(&rest[..end]);
+            rest = &rest[end + 1..];
+            if rest.is_empty() {
+                return out;
+            }
+            rest = rest
+                .strip_prefix("\\''")
+                .unwrap_or_else(|| panic!("text after the closing quote in the argument: {raw}"));
+            out.push('\'');
+        }
     }
 
     /// `config set` replaces a whole list, so a remedy that printed only the
@@ -1758,6 +1929,15 @@ mod tests {
     /// The request port matches A's port so the pinned answer passes the
     /// resolved-address port check, and the host is a public name so nothing but
     /// the pin selects which loopback endpoint is reached.
+    ///
+    /// The name is under the reserved `.invalid` TLD (RFC 6761), which no
+    /// resolver can answer. That covers the other way to regress: dialing by
+    /// name (`TcpStream::connect((host, port))`), which re-resolves through the
+    /// system resolver and never reaches the test resolver at all. With a real
+    /// name that mutation would fail only if live DNS happened not to return
+    /// listener A. Under `.invalid` it fails on every machine, online or not.
+    /// The resolver's call count then pins the other half: `authorize` resolves
+    /// exactly once.
     #[tokio::test]
     async fn the_hook_dials_only_the_pinned_answer_not_a_later_resolution() {
         let (pinned, pinned_hits) = counting_http_listener();
@@ -1767,8 +1947,9 @@ mod tests {
         // the one `authorize` pins — is A; any later resolution is B. The switch
         // is a deterministic counter, so nothing depends on DNS or address order.
         let calls = Arc::new(AtomicUsize::new(0));
+        let resolutions = Arc::clone(&calls);
         let resolver = move |_host: &str, _port: u16| {
-            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            if resolutions.fetch_add(1, Ordering::SeqCst) == 0 {
                 vec![pinned]
             } else {
                 vec![rebind]
@@ -1780,8 +1961,8 @@ mod tests {
                 // lets its (loopback) resolved address pass the class check —
                 // the same carveout every loopback destination here needs.
                 EgressPolicy::new(
-                    &["rebind.example.com".to_string()],
-                    &["rebind.example.com".to_string()],
+                    &["rebind.invalid".to_string()],
+                    &["rebind.invalid".to_string()],
                     &[],
                     4,
                 )
@@ -1792,7 +1973,7 @@ mod tests {
 
         let response = hooks
             .send_request(
-                request(&format!("http://rebind.example.com:{}/", pinned.port())),
+                request(&format!("http://rebind.invalid:{}/", pinned.port())),
                 config(),
             )
             .expect("an authorized destination is dialed asynchronously");
@@ -1815,6 +1996,11 @@ mod tests {
             0,
             "a re-resolved answer must never be dialed: the pin is the only \
              address set the hook may use"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the name must be resolved exactly once, by authorization"
         );
     }
 

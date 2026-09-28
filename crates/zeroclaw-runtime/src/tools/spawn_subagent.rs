@@ -93,6 +93,10 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
 
 #[async_trait]
 impl Tool for SpawnSubagentTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         Self::NAME
     }
@@ -228,6 +232,7 @@ impl Tool for SpawnSubagentTool {
                     depth: u32::from(self.is_subagent_caller),
                     parent_id: None,
                     originator_route: None,
+                    originator_chain: Vec::new(),
                     delivered: false,
                     idem_key: None,
                     principal_id: None,

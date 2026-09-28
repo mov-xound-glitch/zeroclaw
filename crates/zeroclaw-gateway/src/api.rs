@@ -2634,6 +2634,7 @@ pub(crate) mod tests {
 
     fn memory_entry_with_content(content: String) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: "entry-1".into(),
             key: "huge-memory".into(),
             content,

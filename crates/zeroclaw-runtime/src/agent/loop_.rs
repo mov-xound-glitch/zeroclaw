@@ -1,3 +1,4 @@
+use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::approval::ApprovalManager;
 
 /// Format token count with thousands separators.
@@ -965,6 +966,15 @@ async fn agent_turn_with_sop_reassembly(
     sop_reassembly: Option<SopStepReassembly<'_>>,
 ) -> Result<String> {
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
+    let shared_budget = ExecutionTreeBudget::current()
+        .map(|budget| budget.child())
+        .or_else(|| {
+            config.zip(agent_alias).and_then(|(config, alias)| {
+                ExecutionTreeBudget::from_limit(
+                    config.effective_max_execution_tree_iterations(alias),
+                )
+            })
+        });
     #[cfg(test)]
     if let Some(hook) = AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
         .lock()
@@ -972,7 +982,13 @@ async fn agent_turn_with_sop_reassembly(
         .as_ref()
         .cloned()
     {
-        hook(sop_reassembly.is_some());
+        hook(
+            sop_reassembly.is_some(),
+            sop_reassembly
+                .as_ref()
+                .and_then(|reassembly| reassembly.live_config.as_ref())
+                .is_some(),
+        );
     }
     // Bracket the turn with AgentStart/AgentEnd so entry points that dispatch
     // through `agent_turn` (gateway webhook chat via `process_message`, peer
@@ -1047,7 +1063,7 @@ async fn agent_turn_with_sop_reassembly(
         channel_reply_target,
         cancellation_token: None,
         on_delta: None,
-        shared_budget: None, // no shared budget for agent_turn callers
+        shared_budget,
         channel,
         collected_receipts: None,
         event_tx: None,
@@ -1254,7 +1270,7 @@ static RESOLVED_AGENT_FOR_TURN_TEST_HOOK: LazyLock<Mutex<Option<ResolvedAgentFor
     LazyLock::new(|| Mutex::new(None));
 
 #[cfg(test)]
-type AgentTurnSopReassemblyTestHook = Arc<dyn Fn(bool) + Send + Sync>;
+type AgentTurnSopReassemblyTestHook = Arc<dyn Fn(bool, bool) + Send + Sync>;
 
 #[cfg(test)]
 static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
@@ -1358,7 +1374,7 @@ pub async fn run(
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
-        let eff_max_history_messages = agent.resolved.max_history_messages;
+        let eff_max_history_turns = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
@@ -1452,6 +1468,7 @@ pub async fn run(
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
+                &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
                 sop_mem,
@@ -1729,7 +1746,7 @@ pub async fn run(
         tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
         tool_descs.push((
         "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
+        "Capture a screenshot of the current screen. Returns the saved file path. Use when: visual verification, UI inspection, debugging displays.",
     ));
         tool_descs.push((
         "image_info",
@@ -1797,7 +1814,7 @@ pub async fn run(
         }
         retain_registered_tool_descriptions(&mut tool_descs, &tools_registry);
         let bootstrap_max_chars = if eff_compact_context {
-            Some(6000)
+            Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
         } else {
             None
         };
@@ -2028,6 +2045,11 @@ pub async fn run(
                 ChatMessage::system(&system_prompt),
                 ChatMessage::user(&enriched),
             ];
+            let execution_tree_budget = ExecutionTreeBudget::current()
+                .map(|budget| budget.child())
+                .or_else(|| {
+                    ExecutionTreeBudget::from_limit(agent.resolved.max_execution_tree_iterations)
+                });
             // One-shot transcript: no prior trim ran, so no crumb exists.
             let mut history_has_trim_breadcrumb = false;
 
@@ -2083,7 +2105,7 @@ pub async fn run(
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
-                                exec: ResolvedAgentExecution::resolve(
+                                                                exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
                                         provider_name: &provider_name,
@@ -2123,7 +2145,7 @@ pub async fn run(
                                 channel_reply_target: None,
                                 cancellation_token: None,
                                 on_delta: None,
-                                shared_budget: None,
+                                shared_budget: execution_tree_budget.clone(),
                                 channel: None,
                                 collected_receipts: None,
                                 event_tx: None,
@@ -2153,6 +2175,7 @@ pub async fn run(
                                 served_route_sink: None,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    live_config: None,
                                 }),
                             }),
                         ),
@@ -2586,6 +2609,13 @@ pub async fn run(
                 };
 
                 history.push(ChatMessage::user(&enriched));
+                let execution_tree_budget = ExecutionTreeBudget::current()
+                    .map(|budget| budget.child())
+                    .or_else(|| {
+                        ExecutionTreeBudget::from_limit(
+                            agent.resolved.max_execution_tree_iterations,
+                        )
+                    });
 
                 // Set up streaming channel so tool progress and response
                 // content are printed progressively instead of buffered.
@@ -2722,7 +2752,7 @@ pub async fn run(
                                     channel_reply_target: None,
                                     cancellation_token: Some(cancel_token.clone()),
                                     on_delta: Some(delta_tx.clone()),
-                                    shared_budget: None,
+                                    shared_budget: execution_tree_budget.clone(),
                                     channel: None,
                                     collected_receipts: None,
                                     event_tx: None,
@@ -2752,6 +2782,7 @@ pub async fn run(
                                     served_route_sink: None,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        live_config: None,
                                     }),
                                 }),
                             ),
@@ -2997,8 +3028,12 @@ pub async fn run(
                     }
                 }
 
-                // Hard cap as a safety net.
-                trim_history(&mut history, eff_max_history_messages);
+                // Whole-turn retention limit as a safety net.
+                trim_history(
+                    &mut history,
+                    eff_max_history_turns,
+                    &mut history_has_trim_breadcrumb,
+                );
 
                 // Restore base system prompt after the per-turn tool framing
                 // and optional thinking prefix have been applied.
@@ -3066,6 +3101,71 @@ pub async fn process_message(
 /// futures.
 pub(crate) async fn process_message_shared(
     config: Arc<Config>,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
+) -> Result<String> {
+    process_message_inner(
+        config,
+        None,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        internal_principal,
+    )
+    .await
+}
+
+/// Shared-snapshot variant that also preserves the daemon's live tool-policy source.
+pub(crate) async fn process_message_shared_with_live_config(
+    config: Arc<Config>,
+    live_config: Arc<parking_lot::RwLock<Config>>,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
+) -> Result<String> {
+    process_message_inner(
+        config,
+        Some(live_config),
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        internal_principal,
+    )
+    .await
+}
+
+/// Process a single message while preserving the daemon/gateway's live config
+/// source for tools that resolve security policy at execution time.
+pub async fn process_message_with_live_config(
+    config: Config,
+    live_config: Arc<parking_lot::RwLock<Config>>,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+) -> Result<String> {
+    process_message_inner(
+        Arc::new(config),
+        Some(live_config),
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        None,
+    )
+    .await
+}
+
+async fn process_message_inner(
+    config: Arc<Config>,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3174,6 +3274,7 @@ pub(crate) async fn process_message_shared(
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
+                &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
                 sop_mem,
@@ -3207,7 +3308,7 @@ pub(crate) async fn process_message_shared(
             None,
             sop_engine,
             sop_audit,
-            None,
+            live_config.clone(),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3415,7 +3516,7 @@ pub(crate) async fn process_message_shared(
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if eff_compact_context {
-            Some(6000)
+            Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
         } else {
             None
         };
@@ -3637,7 +3738,10 @@ pub(crate) async fn process_message_shared(
                     }),
                     Some(agent_alias),
                     Some(&turn_id),
-                    Some(SopStepReassembly { config: &config }),
+                    Some(SopStepReassembly {
+                        config: &config,
+                        live_config,
+                    }),
                 ),
             )
             .await
@@ -5846,6 +5950,7 @@ mod tests {
         delay_ms: u64,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
+        execution_order: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     }
 
     impl DelayTool {
@@ -5860,7 +5965,16 @@ mod tests {
                 delay_ms,
                 active,
                 max_active,
+                execution_order: None,
             }
+        }
+
+        fn with_execution_order(
+            mut self,
+            execution_order: Arc<std::sync::Mutex<Vec<String>>>,
+        ) -> Self {
+            self.execution_order = Some(execution_order);
+            self
         }
     }
 
@@ -5888,6 +6002,13 @@ mod tests {
             &self,
             args: serde_json::Value,
         ) -> anyhow::Result<crate::tools::ToolResult> {
+            if let Some(execution_order) = &self.execution_order {
+                execution_order
+                    .lock()
+                    .expect("execution order lock should be valid")
+                    .push(self.name.clone());
+            }
+
             let now_active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now_active, Ordering::SeqCst);
 
@@ -5964,7 +6085,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -6133,8 +6254,15 @@ mod tests {
         let uploads = temp.path().join("uploads");
         std::fs::create_dir(&uploads).unwrap();
         let image_path = uploads.join("cached.png");
-        let original_bytes = [
-            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 1, 2, 3, 4,
+        // A real decodable 1x1 PNG, not a bare signature: preparation fully
+        // decodes image content now, so bytes that only carry the magic
+        // number are refused and no data URI would ever reach the provider.
+        let original_bytes: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
         let replacement_bytes = vec![
             0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 5, 6, 7, 8,
@@ -6153,9 +6281,10 @@ mod tests {
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
                 CountingTool::new("probe", Arc::clone(&invocations)),
             )]);
+        let marker_path = image_path.to_string_lossy().replace('\\', "/");
         let mut history = vec![ChatMessage::user(format!(
             "inspect [IMAGE:{}]",
-            image_path.display()
+            marker_path
         ))];
         let observer = NoopObserver;
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -6230,7 +6359,7 @@ mod tests {
         // message is plain text.
         let mut history = vec![
             ChatMessage::user(
-                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
             ),
             ChatMessage::user("what is WAL?".to_string()),
         ];
@@ -6329,7 +6458,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -6409,7 +6538,7 @@ mod tests {
         let mut history = vec![
             ChatMessage::user("inspect the screenshot".to_string()),
             ChatMessage::tool(
-                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
             ),
         ];
         let tools_registry =
@@ -6488,7 +6617,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -6763,6 +6892,7 @@ mod tests {
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
             Ok(vec![zeroclaw_memory::MemoryEntry {
+                principal_id: None,
                 id: "1".into(),
                 key: "remembered".into(),
                 content: "the server is prod-3".into(),
@@ -6968,7 +7098,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "look [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "look [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -7404,6 +7534,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_file_mutation_rewrites_force_sequential_execution() {
+        struct RewriteAsFileMutations;
+
+        #[async_trait]
+        impl crate::hooks::HookHandler for RewriteAsFileMutations {
+            fn name(&self) -> &str {
+                "rewrite-as-file-mutations"
+            }
+
+            async fn before_tool_call_with_context(
+                &self,
+                _context: &zeroclaw_api::hook::ToolCallHookContext,
+                name: String,
+                args: serde_json::Value,
+            ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+                let prepared_name = match name.as_str() {
+                    "delay_a" => "file_edit",
+                    "delay_b" => "file_write",
+                    _ => &name,
+                };
+                crate::hooks::HookResult::Continue((prepared_name.to_string(), args))
+            }
+        }
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delay_a","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"delay_b","arguments":{"value":"B"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let execution_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+            Box::new(DelayTool::new(
+                "delay_a",
+                100,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_b",
+                100,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(
+                DelayTool::new(
+                    "file_edit",
+                    100,
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                )
+                .with_execution_order(Arc::clone(&execution_order)),
+            ),
+            Box::new(
+                DelayTool::new(
+                    "file_write",
+                    100,
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                )
+                .with_execution_order(Arc::clone(&execution_order)),
+            ),
+        ]);
+        let approval_mgr =
+            ApprovalManager::from_risk_profile(&zeroclaw_config::schema::RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            });
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(RewriteAsFileMutations));
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: true,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("prepared file mutations should complete");
+
+        assert!(result.ends_with("done"));
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "parallel policy must evaluate the hook-rewritten prepared calls"
+        );
+        assert_eq!(
+            *execution_order
+                .lock()
+                .expect("execution order lock should be valid"),
+            ["file_edit", "file_write"],
+            "both rewritten calls must execute in model order"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_executes_queued_sop_steps_after_sop_execute() {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
@@ -7451,6 +7734,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
         engine.replace_sops_for_test(vec![sop]);
@@ -7605,6 +7889,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
             step_scope_enforce: true,
@@ -10005,6 +10290,9 @@ mod tests {
             ChatMessage::user("run tool calls"),
         ];
         let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
@@ -10046,11 +10334,11 @@ mod tests {
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
-            on_delta: None,
+            on_delta: Some(delta_tx),
             shared_budget: None,
             channel: None,
             collected_receipts: None,
-            event_tx: None,
+            event_tx: Some(event_tx),
             steering: None,
             new_messages_out: None,
             image_cache: None,
@@ -10079,6 +10367,24 @@ mod tests {
             .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]"))
             .count();
         assert_eq!(feedback_count, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES);
+
+        let fallback =
+            crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
+        let mut event_chunks = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
+                event_chunks.push(delta);
+            }
+        }
+        assert_eq!(event_chunks, vec![fallback.to_string()]);
+
+        let mut draft_text = Vec::new();
+        while let Some(delta) = delta_rx.recv().await {
+            if let DraftEvent::Text(text) = delta {
+                draft_text.push(text);
+            }
+        }
+        assert_eq!(draft_text, vec![fallback]);
     }
 
     #[tokio::test]
@@ -13923,7 +14229,7 @@ This is an example, not an invocation."#;
         let original_len = history.len();
         assert!(original_len > DEFAULT_MAX_HISTORY_MESSAGES + 1);
 
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
 
         // System prompt preserved
         assert_eq!(history[0].role, "system");
@@ -13945,7 +14251,7 @@ This is an example, not an invocation."#;
             ChatMessage::user("hello"),
             ChatMessage::assistant("hi"),
         ];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history.len(), 3);
     }
 
@@ -14262,7 +14568,7 @@ This is an example, not an invocation."#;
         for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
         }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
     }
 
@@ -14274,7 +14580,7 @@ This is an example, not an invocation."#;
             history.push(ChatMessage::user(format!("user {i}")));
             history.push(ChatMessage::assistant(format!("assistant {i}")));
         }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[history.len() - 1].role, "assistant");
     }
@@ -14283,7 +14589,7 @@ This is an example, not an invocation."#;
     fn trim_history_with_only_system_prompt() {
         // Recovery: Only system prompt should not be trimmed
         let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history.len(), 1);
     }
 
@@ -14491,14 +14797,14 @@ Let me check the result."#;
     #[test]
     fn trim_history_empty_history() {
         let mut history: Vec<ChatMessage> = vec![];
-        trim_history(&mut history, 10);
+        trim_history(&mut history, 10, &mut false);
         assert!(history.is_empty());
     }
 
     #[test]
     fn trim_history_system_only() {
         let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, 10);
+        trim_history(&mut history, 10, &mut false);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].role, "system");
     }
@@ -14510,49 +14816,65 @@ Let me check the result."#;
             ChatMessage::user("msg 1"),
             ChatMessage::assistant("reply 1"),
         ];
-        trim_history(&mut history, 2); // 2 non-system messages = exactly at limit
+        trim_history(&mut history, 1, &mut false);
         assert_eq!(history.len(), 3, "should not trim when exactly at limit");
     }
 
     #[test]
-    fn trim_history_keeps_first_user_anchor_and_recent_tail() {
-        // The framing anchor (first user message) must survive trim so the
-        // model doesn't start a turn thinking "Continue" is the first thing
-        // it ever saw. Middle messages are the ones that get dropped.
+    fn trim_history_keeps_latest_complete_turns() {
         let mut history = vec![
             ChatMessage::system("system"),
-            ChatMessage::user("anchor: what's the task"),
-            ChatMessage::assistant("middle reply 1"),
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old reply"),
             ChatMessage::user("middle user 1"),
             ChatMessage::assistant("middle reply 2"),
             ChatMessage::user("recent user"),
             ChatMessage::assistant("recent reply"),
         ];
-        // max_history = 3 → keep anchor + 2 most recent (=3 non-system).
-        trim_history(&mut history, 3);
+        trim_history(&mut history, 2, &mut false);
         assert_eq!(history[0].role, "system");
-        assert_eq!(
-            history[1].content, "anchor: what's the task",
-            "first user message (framing anchor) must survive"
-        );
+        assert_eq!(history[1].content, "middle user 1");
         let last = history.last().expect("history not empty");
         assert_eq!(last.content, "recent reply", "tail must be preserved");
     }
 
     #[test]
-    fn trim_history_falls_back_to_tail_when_max_history_is_one() {
-        // With max_history=1 there's no room for both anchor and tail; fall
-        // back to plain head-drop so we don't produce a degenerate window.
+    fn trim_history_keeps_newest_incomplete_turn_when_limit_is_one() {
         let mut history = vec![
             ChatMessage::system("system"),
             ChatMessage::user("anchor"),
             ChatMessage::assistant("middle"),
             ChatMessage::user("recent"),
         ];
-        trim_history(&mut history, 1);
+        trim_history(&mut history, 1, &mut false);
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[1].content, "recent");
+    }
+
+    #[test]
+    fn trim_history_does_not_count_tool_rows_as_turns() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run tools"),
+        ];
+        for index in 0..60 {
+            history.push(ChatMessage::assistant(format!("tool call {index}")));
+            history.push(ChatMessage::user(format!("[Tool results]\nresult {index}")));
+        }
+        history.push(ChatMessage::assistant("done"));
+        let original: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+
+        trim_history(&mut history, 1, &mut false);
+
+        let retained: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+        assert_eq!(retained, original, "tool rows must remain part of one turn");
     }
 
     #[test]
@@ -18217,27 +18539,37 @@ Let me check the result."#;
             .risk_profiles
             .insert("default".to_string(), RiskProfileConfig::default());
 
-        let seen = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(bool, bool)>::new()));
         let seen_for_hook = Arc::clone(&seen);
         {
             let mut hook = super::AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
                 .lock()
                 .expect("agent-turn reassembly test hook lock should not be poisoned");
-            *hook = Some(Arc::new(move |has_reassembly| {
+            *hook = Some(Arc::new(move |has_reassembly, has_live_config| {
                 seen_for_hook
                     .lock()
                     .expect("seen lock should not be poisoned")
-                    .push(has_reassembly);
+                    .push((has_reassembly, has_live_config));
             }));
         }
 
-        let result = super::process_message(
-            config,
+        let snapshot_result = super::process_message(
+            config.clone(),
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
             TurnOrigin::SubTurn,
             None,
+        )
+        .await;
+        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let live_result = super::process_message_with_live_config(
+            config,
+            live_config,
+            "process-message-reassembly-agent",
+            "hello",
+            Some("session"),
+            TurnOrigin::SubTurn,
         )
         .await;
 
@@ -18250,10 +18582,193 @@ Let me check the result."#;
 
         let seen = seen.lock().expect("seen lock should not be poisoned");
         assert!(
-            seen.iter().any(|has_reassembly| *has_reassembly),
+            seen.iter()
+                .any(|(has_reassembly, has_live_config)| *has_reassembly && !*has_live_config),
             "process_message must pass a config-backed SopStepReassembly handle into agent_turn; \
-             observed {seen:?}; process_message result: {result:?}"
+             observed {seen:?}; process_message result: {snapshot_result:?}"
         );
+        assert!(
+            seen.iter()
+                .any(|(has_reassembly, has_live_config)| *has_reassembly && *has_live_config),
+            "process_message_with_live_config must pass a live-config-backed SopStepReassembly \
+             handle into agent_turn; observed {seen:?}; process_message result: {live_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_message_with_live_config_file_download_observes_revoked_private_host() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path, query_param},
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, FileDownloadConfig, RiskProfileConfig};
+
+        #[derive(Clone)]
+        struct ProviderState {
+            calls: Arc<AtomicUsize>,
+            requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+
+        async fn respond_with_file_download_then_done(
+            State(state): State<ProviderState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state
+                .requests
+                .lock()
+                .expect("provider request capture lock should be valid")
+                .push(body);
+            let call = state.calls.fetch_add(1, Ordering::SeqCst);
+            Json(if call == 0 {
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-file-download",
+                                "type": "function",
+                                "function": {
+                                    "name": "file_download",
+                                    "arguments": "{\"document_id\":\"doc-1\",\"dest_path\":\"out.bin\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "choices": [{"message": {"content": "done"}}]
+                })
+            })
+        }
+
+        let tmp = TempDir::new().expect("temp dir");
+        let download_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .and(query_param("document_id", "doc-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"should-not-download"))
+            .expect(0)
+            .mount(&download_server)
+            .await;
+
+        let provider_state = ProviderState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider listener should bind");
+        let provider_addr = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(respond_with_file_download_then_done),
+            )
+            .with_state(provider_state.clone());
+        let provider_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            file_download: FileDownloadConfig {
+                url: Some(format!("{}/download", download_server.uri())),
+                allowed_private_hosts: vec!["127.0.0.1".into()],
+                ..FileDownloadConfig::default()
+            },
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("test-model".to_string());
+        provider.uri = Some(format!("http://{provider_addr}"));
+        provider.native_tools = Some(true);
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "full".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                allowed_tools: vec!["file_download".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "live-file-download-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "full".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        std::fs::create_dir_all(config.agent_workspace_dir("live-file-download-agent"))
+            .expect("agent workspace directory");
+
+        let live_config = Arc::new(RwLock::new(config.clone()));
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let result = super::process_message_with_live_config(
+            config.clone(),
+            live_config,
+            "live-file-download-agent",
+            "download the private document",
+            Some("session"),
+            TurnOrigin::Channel,
+        )
+        .await
+        .expect("process_message_with_live_config should complete");
+
+        provider_server.abort();
+        assert_eq!(result, "done");
+        assert_eq!(
+            provider_state.calls.load(Ordering::SeqCst),
+            2,
+            "the second model call should receive the denied tool result"
+        );
+        {
+            let requests = provider_state
+                .requests
+                .lock()
+                .expect("provider requests lock should be valid");
+            assert!(
+                requests.iter().any(|body| body
+                    .to_string()
+                    .contains("file_download.allowed_private_hosts")),
+                "model provider should receive the live-policy denial result, got {requests:?}"
+            );
+        }
+        assert!(
+            !config
+                .agent_workspace_dir("live-file-download-agent")
+                .join("out.bin")
+                .exists(),
+            "revoked private-host policy must fail before writing the download"
+        );
+        assert!(
+            download_server
+                .received_requests()
+                .await
+                .unwrap()
+                .is_empty(),
+            "revoked private-host policy must fail before contacting the private endpoint"
+        );
+        download_server.verify().await;
     }
 
     #[tokio::test]
@@ -19089,9 +19604,10 @@ Let me check the result."#;
 
             async fn before_llm_call(
                 &self,
-                _messages: &mut Vec<ChatMessage>,
+                messages: &mut Vec<ChatMessage>,
                 model: &mut String,
             ) -> HookResult<()> {
+                messages.push(ChatMessage::assistant("hook suffix"));
                 if self.calls.fetch_add(1, Ordering::SeqCst) >= 1 {
                     *model = self.next_model.to_string();
                 }
@@ -19394,7 +19910,7 @@ Let me check the result."#;
         }
         assert_eq!(
             hook_calls.load(Ordering::SeqCst),
-            if summary { 1 } else { 2 },
+            2,
             "one hook per preparation"
         );
         let captured = requests.lock().unwrap();
@@ -19410,6 +19926,27 @@ Let me check the result."#;
         if !floor {
             let next = &captured[1];
             assert_eq!(next.model, next_model);
+            assert!(
+                next.messages
+                    .iter()
+                    .any(|m| m.content == "run the tool once"),
+                "normalized results must not displace the newest real user"
+            );
+            assert!(
+                next.messages
+                    .iter()
+                    .any(|m| m.content.contains(&"r".repeat(1600))),
+                "the newest tool result must remain paired with its request"
+            );
+            if !summary {
+                assert_eq!(
+                    next.messages
+                        .iter()
+                        .filter(|m| m.content == "hook suffix")
+                        .count(),
+                    1
+                );
+            }
             assert_eq!(next.schema_tokens > 0, next_model == "native-model");
             assert_eq!(
                 next.messages
@@ -19437,12 +19974,13 @@ Let me check the result."#;
             }
             if summary {
                 assert_eq!(next.schema_tokens, 0, "the summary is tools-free");
+                let mut tail = next.messages.iter().rev();
+                assert_eq!(tail.next().unwrap().content, "hook suffix");
                 assert!(
-                    next.messages
-                        .last()
+                    tail.next()
                         .unwrap()
                         .content
-                        .starts_with("You have reached")
+                        .starts_with("Agent exceeded maximum tool iterations")
                 );
                 assert!(
                     next.messages
@@ -19467,9 +20005,9 @@ Let me check the result."#;
                     .any(|m| m.content.contains(&"r".repeat(4000)))
             );
             assert!(
-                !history
-                    .iter()
-                    .any(|m| m.content.starts_with("You have reached")),
+                !history.iter().any(|m| m
+                    .content
+                    .starts_with("Agent exceeded maximum tool iterations")),
                 "failed summary must not append a synthetic user turn"
             );
         }
@@ -19502,13 +20040,14 @@ Let me check the result."#;
                 zeroclaw_api::agent::TokenCountSource::Estimated
             };
             assert_eq!(*source, Some(expected_source));
-            if summary && !floor {
-                let actual =
-                    estimate_history_tokens(&captured[1].messages) as u64 * usage_multiplier;
+            if !floor {
+                let actual = (estimate_history_tokens(&captured[1].messages)
+                    + captured[1].schema_tokens) as u64
+                    * if calibrated { usage_multiplier } else { 1 };
                 assert_eq!(
                     *tokens_after,
                     Some(actual),
-                    "trim event must count the summary prompt too"
+                    "trim event must count the exact dispatched messages and schemas"
                 );
             }
         }
@@ -19945,8 +20484,11 @@ Let me check the result."#;
     async fn prepared_image_capacity_is_enforced_with_soft_trimming_disabled() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
-        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        // Use a fully decodable image: the multimodal boundary intentionally
+        // rejects files that merely carry a valid signature, and the
+        // capacity estimate charges a fixed per-image cost regardless of size.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let image_bytes = STANDARD.decode(PNG_B64).expect("valid PNG fixture");
         std::fs::write(&image_path, image_bytes).unwrap();
         let history = vec![
             ChatMessage::system("text prompt"),
@@ -20038,12 +20580,10 @@ Let me check the result."#;
 
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
-        // PNG signature plus filler bytes so the base64-expanded payload is
-        // large enough to dwarf the raw `[IMAGE:...]` marker text — the
-        // exact mismatch the gate's heuristic must not misattribute after
-        // the carrying turn is dropped.
-        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        // Use a fully decodable image: the multimodal boundary intentionally
+        // rejects files that merely carry a valid signature.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let image_bytes = STANDARD.decode(PNG_B64).expect("valid PNG fixture");
         std::fs::write(&image_path, &image_bytes).unwrap();
         let marker = format!("[IMAGE:{}]", image_path.display());
 
