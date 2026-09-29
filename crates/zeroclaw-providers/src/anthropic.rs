@@ -19,16 +19,16 @@ use zeroclaw_config::schema::CacheTtl;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+/// Per-image ceiling for base64-encoded payloads, shared with the multimodal
+/// structural check so this adapter and the pre-dispatch resolvability count
+/// cannot drift apart on what an image may weigh (see
+/// `MAX_ENCODED_IMAGE_PAYLOAD_BYTES` in `crate::multimodal`). Anthropic
+/// documents 10 MB encoded per image for the direct API; its separate
+/// per-request budget (32 MB across all images) is not enforced here.
+use crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES;
 use crate::safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
 };
-/// Anthropic's documented per-image ceiling for the direct API: 10 MB
-/// **base64-encoded**. Measured on the encoded payload length, unlike the
-/// multimodal config's `max_image_size_mb`, which bounds decoded bytes. MB is
-/// read as 1024 * 1024 here, the same way `max_image_size_mb` reads it, so the
-/// two ceilings stay consistent with each other. Anthropic's separate
-/// per-request budget (32 MB across all images) is not enforced here.
-const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Replaces a raw `data:<media type>;base64,<payload>` run that survived marker
 /// parsing and would otherwise sit in a text position. See
 /// [`AnthropicModelProvider::sweep_residual_image_data`].
@@ -267,17 +267,26 @@ fn anthropic_beta_features(
     }
 }
 
-/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
-/// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
-/// require `adaptive`; budget-based models require `enabled`.
+/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7, the
+/// whole Fable 5 family) reject the fixed-budget `enabled` shape with HTTP
+/// 400 and require `adaptive`; budget-based models require `enabled`.
+///
+/// Shared crate-wide: the OpenAI-compatible passthrough builder resolves the
+/// same style so gateway requests match the native provider's shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnthropicThinkingStyle {
+pub(crate) enum AnthropicThinkingStyle {
     Budget,
     Adaptive,
 }
 
-fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
+/// Substring matching on purpose: gateway model IDs may carry routing
+/// prefixes (`claude-group/claude-opus-4-7`) that must resolve to the same
+/// style as the bare model name. The whole Fable 5 family is adaptive-only,
+/// so the bare `claude-fable-5` substring intentionally covers `fable-5` and
+/// `fable-5-1` alike; a hypothetical future budget-shaped member of the
+/// family would need this matcher revisited.
+pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5") {
         AnthropicThinkingStyle::Adaptive
     } else {
         AnthropicThinkingStyle::Budget
@@ -4459,6 +4468,16 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert_eq!(
             anthropic_thinking_style("claude-fable-5-1-20260815"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        // The whole Fable 5 family is adaptive-only: bare fable-5 and
+        // gateway-prefixed IDs resolve like fable-5-1.
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-group/claude-fable-5"),
             AnthropicThinkingStyle::Adaptive
         );
         // Budget-based families keep the `enabled` shape.
