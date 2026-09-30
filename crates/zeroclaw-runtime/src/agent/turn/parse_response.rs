@@ -118,6 +118,9 @@ pub(crate) struct InterpretedResponse {
     pub(crate) assistant_history_content: String,
     pub(crate) native_tool_calls: Vec<ToolCall>,
     pub(crate) parse_issue_detected: bool,
+    /// Known tools the rejected text invoked as prose, for the model-facing
+    /// feedback; empty when no tool name could be read from the payload.
+    pub(crate) parse_issue_tools: Vec<String>,
     pub(crate) input_tokens: Option<u64>,
     /// Full cumulative provider usage.  The caller records this as rejected
     /// when protocol classification rejects the response.
@@ -321,6 +324,15 @@ pub(crate) async fn interpret_chat_response(
         )
     };
 
+    let parse_issue_tools = if parse_issue.is_some() {
+        zeroclaw_tool_call_parser::embedded_tool_protocol_known_tool_names(
+            &response_text,
+            &specs.known_tool_names,
+        )
+    } else {
+        Vec::new()
+    };
+
     let native_calls = resp.tool_calls;
     InterpretedResponse {
         response_text,
@@ -329,6 +341,7 @@ pub(crate) async fn interpret_chat_response(
         assistant_history_content,
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
+        parse_issue_tools,
         input_tokens: resp_input_tokens,
         usage: resp.usage,
     }

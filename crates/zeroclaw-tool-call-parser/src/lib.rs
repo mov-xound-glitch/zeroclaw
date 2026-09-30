@@ -2550,6 +2550,83 @@ pub fn embedded_tool_protocol_envelope_mentions_known_tool(
     found
 }
 
+/// Names of the known tools that protocol objects embedded in `text` invoke,
+/// in order of first appearance and without duplicates, spelled as the model
+/// wrote them. Empty when no known tool is named. Used to tell the model which
+/// call was withheld, so a refusal cannot be mistaken for a completed action.
+pub fn embedded_tool_protocol_known_tool_names(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if known_tool_names.is_empty() {
+        return names;
+    }
+    for_each_embedded_json_value(text, &mut |value, _start, _end| {
+        collect_known_tool_names(value, known_tool_names, &mut names);
+    });
+    names
+}
+
+fn collect_known_tool_names(
+    value: &serde_json::Value,
+    known_tool_names: &HashSet<String>,
+    names: &mut Vec<String>,
+) {
+    // Same walk as `json_tree_contains` + `protocol_object_mentions_known_tool`:
+    // every node that is a protocol object contributes the names it invokes.
+    if is_embedded_protocol_object(value) {
+        push_protocol_object_tool_names(value, known_tool_names, names);
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_known_tool_names(item, known_tool_names, names);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for child in object.values() {
+                collect_known_tool_names(child, known_tool_names, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The name-bearing positions `json_value_mentions_known_tool` consults, in the
+/// same order, collected instead of short-circuited.
+fn push_protocol_object_tool_names(
+    value: &serde_json::Value,
+    known_tool_names: &HashSet<String>,
+    names: &mut Vec<String>,
+) {
+    let Some(object) = value.as_object() else {
+        if let Some(items) = value.as_array() {
+            for item in items {
+                push_protocol_object_tool_names(item, known_tool_names, names);
+            }
+        }
+        return;
+    };
+    if let Some(name) = object.get("name").and_then(serde_json::Value::as_str)
+        && names_known_tool(name, known_tool_names)
+        && !names.iter().any(|seen| seen == name)
+    {
+        names.push(name.to_string());
+    }
+    if let Some(function) = object.get("function") {
+        push_protocol_object_tool_names(function, known_tool_names, names);
+    }
+    if let Some(function_call) = object.get("function_call") {
+        push_protocol_object_tool_names(function_call, known_tool_names, names);
+    }
+    for key in ["tool_calls", "toolcalls"] {
+        if let Some(calls) = object.get(key) {
+            push_protocol_object_tool_names(calls, known_tool_names, names);
+        }
+    }
+}
+
 pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Strip `<think>...</think>` blocks before parsing.  Qwen and other
     // reasoning models embed chain-of-thought inline in the response text;
@@ -6434,5 +6511,38 @@ Let me check the result."#;
         assert_eq!(strip_trailing_terminal_markers("<eom>\n"), "");
         assert_eq!(strip_trailing_terminal_markers("<|eom|>  "), "");
         assert_eq!(strip_trailing_terminal_markers("<eom>\n<|eom|>"), "");
+    }
+}
+
+#[cfg(test)]
+mod known_tool_name_tests {
+    use super::embedded_tool_protocol_known_tool_names;
+    use std::collections::HashSet;
+
+    fn known(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn names_known_tools_in_order_without_duplicates() {
+        let text = "I'll save it now.\n\
+            {\"tool_calls\":[{\"name\":\"file_write\",\"arguments\":{\"path\":\"a.md\"}}]}\n\
+            Then list it: {\"toolcalls\":[{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}},\
+            {\"name\":\"file_write\",\"arguments\":{}}]}\n\
+            {\"type\":\"function_call\",\"name\":\"unknown_tool\",\"arguments\":{}}\nDone.";
+        assert_eq!(
+            embedded_tool_protocol_known_tool_names(text, &known(&["file_write", "shell"])),
+            vec!["file_write".to_string(), "shell".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_tools_and_plain_json_yield_nothing() {
+        let text = "{\"tool_calls\":[{\"name\":\"support_case\",\"arguments\":{\"id\":\"A1\"}}]}";
+        assert!(embedded_tool_protocol_known_tool_names(text, &known(&["file_write"])).is_empty());
+        // A plain data object naming a tool is not a protocol object.
+        let data = "{\"customer\":{\"name\":\"file_write\"},\"tool_calls\":\"none\"}";
+        assert!(embedded_tool_protocol_known_tool_names(data, &known(&["file_write"])).is_empty());
+        assert!(embedded_tool_protocol_known_tool_names(text, &known(&[])).is_empty());
     }
 }
