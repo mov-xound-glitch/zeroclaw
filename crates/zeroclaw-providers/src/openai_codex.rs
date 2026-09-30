@@ -34,6 +34,11 @@ pub struct OpenAiCodexModelProvider {
     auth_profile_override: Option<String>,
     responses_url: String,
     custom_endpoint: bool,
+    /// Test seam: forces the non-streaming fallback policy regardless of the
+    /// endpoint classification, so the default-endpoint branch can be driven
+    /// through a local mock server (which is otherwise always "custom").
+    #[cfg(test)]
+    non_streaming_fallback_override: Option<bool>,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
     /// Operator `[multimodal]` policy for this provider's own image-marker
@@ -140,6 +145,8 @@ impl OpenAiCodexModelProvider {
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
             custom_endpoint: !is_default_responses_url(&responses_url),
+            #[cfg(test)]
+            non_streaming_fallback_override: None,
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
@@ -1194,6 +1201,17 @@ struct ResolvedCodexCredentials {
 }
 
 impl OpenAiCodexModelProvider {
+    /// Whether a failed streaming decode may be retried with `stream: false`.
+    /// Only custom endpoints accept both modes; the ChatGPT Codex backend
+    /// rejects a non-streaming body with `400 Stream must be set to true`.
+    fn non_streaming_fallback_allowed(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.non_streaming_fallback_override {
+            return forced;
+        }
+        self.custom_endpoint
+    }
+
     async fn resolve_credentials(&self) -> anyhow::Result<ResolvedCodexCredentials> {
         let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
 
@@ -1431,7 +1449,7 @@ impl OpenAiCodexModelProvider {
                 // instead of the transient decode error that actually happened,
                 // so a recoverable blip is reported as a hard provider failure.
                 // Custom endpoints keep the fallback; many accept both modes.
-                if !self.custom_endpoint {
+                if !self.non_streaming_fallback_allowed() {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2251,6 +2269,61 @@ mod tests {
             "a configured provider_api_url must keep the fallback: many \
              OpenAI-compatible endpoints accept both modes"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_default_endpoint_surfaces_decode_error_and_never_retries_without_streaming() {
+        // Same malformed stream as the custom-endpoint test below, but with the
+        // provider classified as the default (ChatGPT) endpoint. The mock also
+        // holds a non-streaming reply that must never be requested.
+        let (mut provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![
+                MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
+                MockCodexReply::Json(serde_json::json!({
+                    "output_text": "must never be requested",
+                    "output": []
+                })),
+            ])
+            .await;
+        provider.non_streaming_fallback_override = Some(false);
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("the default endpoint must surface the streaming decode error");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("OpenAI Codex"),
+            "the original decode error must surface, got: {text}"
+        );
+        assert!(
+            !text.contains("Stream must be set to true") && !text.contains("400"),
+            "no non-streaming retry may reach the endpoint, got: {text}"
+        );
+        assert!(
+            err.downcast_ref::<ResponsesStreamApiError>().is_none(),
+            "a decode failure is not a server-declared stream error"
+        );
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request: no stream=false retry"
+        );
+        assert_eq!(requests[0]["stream"], true);
+
+        server_handle.abort();
     }
 
     #[tokio::test]
