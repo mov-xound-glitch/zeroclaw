@@ -25,8 +25,8 @@ const DEFAULT_CODEX_INSTRUCTIONS: &str =
 const WIRE_API: &str = "responses";
 const RESPONSES_HISTORY_PROVIDER: &str = "openai_codex";
 const RESPONSES_HISTORY_KIND: &str = "responses_output_items";
-/// Domain-separation tag for the conversation digest sent as the prompt cache
-/// key.
+/// Domain-separation tag for the keyed conversation digest sent as the prompt
+/// cache key.
 const PROMPT_CACHE_KEY_DOMAIN: &str = "zeroclaw.openai_codex.prompt_cache_key.v1";
 
 #[derive(Clone)]
@@ -40,6 +40,8 @@ pub struct OpenAiCodexModelProvider {
     /// Whether requests carry a per-conversation prompt cache key. On for the
     /// ChatGPT Codex backend, off for an operator-configured endpoint.
     cache_affinity: bool,
+    /// Install secret the prompt cache key is derived with.
+    install_secrets: zeroclaw_config::secrets::SecretStore,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
     /// The configured `[multimodal]` policy.
@@ -145,6 +147,8 @@ impl OpenAiCodexModelProvider {
             .clone()
             .unwrap_or_else(default_zeroclaw_dir);
         let auth = AuthService::new(&state_dir, options.secrets_encrypt);
+        let install_secrets =
+            zeroclaw_config::secrets::SecretStore::new(&state_dir, options.secrets_encrypt);
         let responses_url = resolve_responses_url(options)?;
 
         Ok(Self {
@@ -153,6 +157,7 @@ impl OpenAiCodexModelProvider {
             auth_profile_override: options.auth_profile_override.clone(),
             custom_endpoint: !is_default_responses_url(&responses_url),
             cache_affinity: is_default_responses_url(&responses_url),
+            install_secrets,
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
@@ -160,8 +165,8 @@ impl OpenAiCodexModelProvider {
         })
     }
 
-    /// Cache-affinity key for the calling conversation, or `None` outside one
-    /// and on a custom endpoint.
+    /// Cache-affinity key for the calling conversation. `None` outside a
+    /// conversation, on a custom endpoint, and on an install with no secret key.
     ///
     /// The Codex backend picks a prompt cache per request unless the request
     /// says which conversation it belongs to. A tool loop re-sends the same
@@ -171,11 +176,12 @@ impl OpenAiCodexModelProvider {
     /// its session identity: as `prompt_cache_key` in the body and as the
     /// `session-id` header.
     ///
-    /// The value is a digest of the conversation scope, never the scope; see
-    /// [`crate::conversation_affinity`] for why and for what that does and does
-    /// not protect. It is sent only to the ChatGPT Codex backend: an
-    /// operator-configured endpoint has not been shown to accept the extra
-    /// field, and has no claim on a per-conversation identifier.
+    /// The value is derived from the conversation scope with the install
+    /// secret, so it is neither the scope nor something the backend can test a
+    /// guessed scope against; see [`crate::conversation_affinity`]. It is sent
+    /// only to the ChatGPT Codex backend: an operator-configured endpoint has
+    /// not been shown to accept the extra field, and has no claim on a
+    /// per-conversation identifier.
     ///
     /// The scope is a task-local that does not cross a spawn, so the streaming
     /// path must call this before entering `zeroclaw_spawn::spawn!`.
@@ -183,8 +189,12 @@ impl OpenAiCodexModelProvider {
         if !self.cache_affinity {
             return None;
         }
-        crate::conversation_affinity::scope()
-            .map(|scope| crate::conversation_affinity::digest(PROMPT_CACHE_KEY_DOMAIN, &scope))
+        let scope = crate::conversation_affinity::scope()?;
+        crate::conversation_affinity::keyed_token(
+            &self.install_secrets,
+            PROMPT_CACHE_KEY_DOMAIN,
+            &scope,
+        )
     }
 
     fn http_client(&self) -> Client {
@@ -2395,11 +2405,20 @@ mod tests {
         let (mut provider, captured, server_handle, temp_dir, proxy_guard) =
             mock_codex_provider(replies).await;
         provider.cache_affinity = true;
+        provider
+            .install_secrets
+            .keyed_digest_or_create(b"zeroclaw.test.provision", b"")
+            .expect("provision the install key");
         (provider, captured, server_handle, temp_dir, proxy_guard)
     }
 
-    fn expected_prompt_cache_key(session_key: &str) -> String {
-        crate::conversation_affinity::digest(PROMPT_CACHE_KEY_DOMAIN, session_key)
+    fn expected_prompt_cache_key(provider: &OpenAiCodexModelProvider, session_key: &str) -> String {
+        crate::conversation_affinity::keyed_token(
+            &provider.install_secrets,
+            PROMPT_CACHE_KEY_DOMAIN,
+            session_key,
+        )
+        .expect("the test install has a secret key")
     }
 
     fn ok_reply() -> MockCodexReply {
@@ -2452,6 +2471,44 @@ mod tests {
             requests[0].get("prompt_cache_key").is_none(),
             "an operator-configured endpoint must not receive a conversation key; got: {}",
             requests[0]
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn install_without_a_secret_key_sends_no_prompt_cache_key() {
+        let (mut provider, captured, server_handle, temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![ok_reply()]).await;
+        provider.cache_affinity = true;
+        let messages = vec![ChatMessage::user("hello")];
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("gw_one".to_string()),
+                provider.chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "gpt-5-codex",
+                    None,
+                ),
+            )
+            .await
+            .expect("chat should succeed");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].get("prompt_cache_key").is_none(),
+            "without an install key no conversation identifier may be sent; got: {}",
+            requests[0]
+        );
+        assert!(
+            !temp_dir.path().join(".secret_key").exists(),
+            "a request must not provision the install key"
         );
 
         server_handle.abort();
@@ -2545,7 +2602,7 @@ mod tests {
         assert_eq!(requests.len(), 4);
         assert_eq!(
             requests[0]["prompt_cache_key"],
-            expected_prompt_cache_key(one)
+            expected_prompt_cache_key(&provider, one)
         );
         assert_eq!(
             requests[1]["prompt_cache_key"], requests[0]["prompt_cache_key"],
@@ -2553,7 +2610,7 @@ mod tests {
         );
         assert_eq!(
             requests[2]["prompt_cache_key"],
-            expected_prompt_cache_key(two)
+            expected_prompt_cache_key(&provider, two)
         );
         assert_ne!(
             requests[2]["prompt_cache_key"], requests[0]["prompt_cache_key"],
@@ -2607,7 +2664,7 @@ mod tests {
         assert_eq!(requests.len(), 2, "expected one retry request");
         assert_eq!(
             requests[0]["prompt_cache_key"],
-            expected_prompt_cache_key("gw_one")
+            expected_prompt_cache_key(&provider, "gw_one")
         );
         assert_eq!(
             requests[0]["prompt_cache_key"],
@@ -2649,7 +2706,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0]["prompt_cache_key"],
-            expected_prompt_cache_key("gw_one")
+            expected_prompt_cache_key(&provider, "gw_one")
         );
 
         server_handle.abort();

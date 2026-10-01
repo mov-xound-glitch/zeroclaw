@@ -194,12 +194,12 @@ On the ChatGPT Codex backend ZeroClaw therefore sends a per-conversation key
 with every request made inside a conversation, as the `prompt_cache_key` body
 field and the `session-id` header. A custom `uri` endpoint receives neither.
 
-The key is a truncated SHA-256 digest of the session key, so the channel and
-user identifiers a session key contains are not sent in plain form. It is
-unsalted, which keeps it the same after a daemon restart; that also makes it a
-stable pseudonym for the conversation, and someone who knows the session-key
-format could confirm a guessed key against it. Requests made outside a
-conversation, such as a cron job, carry no key.
+The key is derived from the session key with the install's secret key
+(`.secret_key`), so the channel and user identifiers a session key contains are
+not sent, and the backend cannot confirm a guessed session key against it. It is
+the same after a daemon restart and different on every install. An install with
+no secret key sends no key, and so do requests made outside a conversation, such
+as a cron job.
 
 To check it, look at `cached_input_tokens` beside `input_tokens` in the cost
 log (see [Cost tracking](../ops/cost-tracking.md)); the field is omitted when a
