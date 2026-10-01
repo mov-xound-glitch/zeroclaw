@@ -45,7 +45,6 @@
 //! key space. Defeating that would require a per-install salt, which would cost
 //! the cross-restart affinity this is for; it is deliberately out of scope here.
 
-use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 /// The affinity header OpenCode reads to pin a conversation to one backend.
@@ -57,10 +56,6 @@ const OPENCODE_HOST: &str = "opencode.ai";
 /// Domain-separation tag mixed into every digest, so a value emitted here can
 /// never collide with a digest this codebase derives for another purpose.
 const AFFINITY_DOMAIN: &str = "zeroclaw.opencode.session.v1";
-
-/// Bytes of SHA-256 output kept. 128 bits is far beyond what backend selection
-/// needs and keeps the header short.
-const TOKEN_BYTES: usize = 16;
 
 /// Domain name the HTTP client will connect to for `base_url`, or `None` when
 /// there is none: an unparseable or scheme-less URL, or an IP literal.
@@ -152,14 +147,7 @@ pub fn restrict_redirects(
 
 /// Domain-separated, truncated SHA-256 of one affinity scope.
 fn digest_scope(scope: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(AFFINITY_DOMAIN.as_bytes());
-    // A length-free separator would let a crafted scope reproduce another
-    // domain's preimage; a NUL cannot appear in the tag, so it terminates it
-    // unambiguously.
-    hasher.update([0u8]);
-    hasher.update(scope.as_bytes());
-    hex::encode(&hasher.finalize()[..TOKEN_BYTES])
+    crate::conversation_affinity::digest(AFFINITY_DOMAIN, scope)
 }
 
 /// Affinity token for inference requests made outside any conversation scope.
@@ -189,12 +177,7 @@ pub fn session_token(base_url: &str) -> Option<String> {
     if !is_opencode_target(base_url) {
         return None;
     }
-    let scope = zeroclaw_api::TOOL_LOOP_SESSION_KEY
-        .try_with(Clone::clone)
-        .ok()
-        .flatten()
-        .filter(|key| !key.trim().is_empty());
-    Some(match scope {
+    Some(match crate::conversation_affinity::scope() {
         Some(key) => digest_scope(&key),
         None => process_token().to_string(),
     })
@@ -203,6 +186,7 @@ pub fn session_token(base_url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation_affinity::TOKEN_BYTES;
 
     #[test]
     fn matches_builtin_zen_and_go_endpoints() {

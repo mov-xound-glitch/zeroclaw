@@ -25,6 +25,9 @@ const DEFAULT_CODEX_INSTRUCTIONS: &str =
 const WIRE_API: &str = "responses";
 const RESPONSES_HISTORY_PROVIDER: &str = "openai_codex";
 const RESPONSES_HISTORY_KIND: &str = "responses_output_items";
+/// Domain-separation tag for the conversation digest sent as the prompt cache
+/// key.
+const PROMPT_CACHE_KEY_DOMAIN: &str = "zeroclaw.openai_codex.prompt_cache_key.v1";
 
 #[derive(Clone)]
 pub struct OpenAiCodexModelProvider {
@@ -34,6 +37,9 @@ pub struct OpenAiCodexModelProvider {
     auth_profile_override: Option<String>,
     responses_url: String,
     custom_endpoint: bool,
+    /// Whether requests carry a per-conversation prompt cache key. On for the
+    /// ChatGPT Codex backend, off for an operator-configured endpoint.
+    cache_affinity: bool,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
     /// The configured `[multimodal]` policy.
@@ -62,6 +68,8 @@ struct ResponsesRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,11 +152,39 @@ impl OpenAiCodexModelProvider {
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
             custom_endpoint: !is_default_responses_url(&responses_url),
+            cache_affinity: is_default_responses_url(&responses_url),
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
             multimodal: options.multimodal.clone(),
         })
+    }
+
+    /// Cache-affinity key for the calling conversation, or `None` outside one
+    /// and on a custom endpoint.
+    ///
+    /// The Codex backend picks a prompt cache per request unless the request
+    /// says which conversation it belongs to. A tool loop re-sends the same
+    /// prefix every few seconds, so without that identity a large share of
+    /// those calls land on a cache that has never seen the prefix and are
+    /// billed as uncached input. The key is sent the way the Codex CLI sends
+    /// its session identity: as `prompt_cache_key` in the body and as the
+    /// `session-id` header.
+    ///
+    /// The value is a digest of the conversation scope, never the scope; see
+    /// [`crate::conversation_affinity`] for why and for what that does and does
+    /// not protect. It is sent only to the ChatGPT Codex backend: an
+    /// operator-configured endpoint has not been shown to accept the extra
+    /// field, and has no claim on a per-conversation identifier.
+    ///
+    /// The scope is a task-local that does not cross a spawn, so the streaming
+    /// path must call this before entering `zeroclaw_spawn::spawn!`.
+    fn prompt_cache_key(&self) -> Option<String> {
+        if !self.cache_affinity {
+            return None;
+        }
+        crate::conversation_affinity::scope()
+            .map(|scope| crate::conversation_affinity::digest(PROMPT_CACHE_KEY_DOMAIN, &scope))
     }
 
     fn http_client(&self) -> Client {
@@ -1341,6 +1377,11 @@ impl OpenAiCodexModelProvider {
             request_builder = request_builder.header("chatgpt-account-id", account_id);
         }
 
+        // The body field alone does not pin the backend's cache; the header does.
+        if let Some(key) = request.prompt_cache_key.as_deref() {
+            request_builder = request_builder.header("session-id", key);
+        }
+
         if use_gateway_api_key_auth {
             if let Some(access_token) = access_token {
                 request_builder = request_builder.header("x-openai-access-token", access_token);
@@ -1385,6 +1426,7 @@ impl OpenAiCodexModelProvider {
             tools,
             tool_choice: has_tools.then(|| "auto".to_string()),
             parallel_tool_calls: has_tools.then_some(true),
+            prompt_cache_key: self.prompt_cache_key(),
         };
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -1399,6 +1441,7 @@ impl OpenAiCodexModelProvider {
                         "tools_count": tools_count,
                         "tool_choice": request.tool_choice.as_deref(),
                         "parallel_tool_calls": request.parallel_tool_calls,
+                        "cache_affinity": request.prompt_cache_key.is_some(),
                     })),
                 "openai codex responses provider request prepared"
             );
@@ -1583,6 +1626,8 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let tools = request.tools.map(|items| items.to_vec());
         let model = model.to_string();
         let count_tokens = options.count_tokens;
+        // Resolved here because the conversation scope does not cross the spawn.
+        let prompt_cache_key = provider.prompt_cache_key();
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1636,6 +1681,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 tools,
                 tool_choice: has_tools.then(|| "auto".to_string()),
                 parallel_tool_calls: has_tools.then_some(true),
+                prompt_cache_key,
             };
             if ::zeroclaw_log::debug_enabled() {
                 ::zeroclaw_log::record!(
@@ -1650,6 +1696,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
                             "tools_count": tools_count,
                             "tool_choice": request.tool_choice.as_deref(),
                             "parallel_tool_calls": request.parallel_tool_calls,
+                            "cache_affinity": request.prompt_cache_key.is_some(),
                         })),
                     "openai codex responses streaming provider request prepared"
                 );
@@ -1880,6 +1927,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            prompt_cache_key: None,
         };
         let request_builder =
             provider.responses_request_builder("test-key", None, None, true, &request);
@@ -2329,6 +2377,280 @@ mod tests {
             .expect_err("HTTP errors should not be retried");
 
         assert_eq!(captured.lock().unwrap().len(), 1);
+
+        server_handle.abort();
+    }
+
+    /// The mock endpoint is a custom endpoint, where cache affinity is off;
+    /// these tests exercise the ChatGPT-backend behavior against it.
+    async fn mock_codex_provider_with_cache_affinity(
+        replies: Vec<MockCodexReply>,
+    ) -> (
+        OpenAiCodexModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+        crate::RuntimeProxyTestGuard,
+    ) {
+        let (mut provider, captured, server_handle, temp_dir, proxy_guard) =
+            mock_codex_provider(replies).await;
+        provider.cache_affinity = true;
+        (provider, captured, server_handle, temp_dir, proxy_guard)
+    }
+
+    fn expected_prompt_cache_key(session_key: &str) -> String {
+        crate::conversation_affinity::digest(PROMPT_CACHE_KEY_DOMAIN, session_key)
+    }
+
+    fn ok_reply() -> MockCodexReply {
+        MockCodexReply::Json(serde_json::json!({
+            "output_text": "ok",
+            "output": []
+        }))
+    }
+
+    #[test]
+    fn cache_affinity_is_on_for_the_chatgpt_backend_only() {
+        let default_endpoint =
+            OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
+                .unwrap();
+        assert!(default_endpoint.cache_affinity);
+
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let custom = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
+        assert!(!custom.cache_affinity);
+    }
+
+    #[tokio::test]
+    async fn custom_endpoint_sends_no_prompt_cache_key() {
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![ok_reply()]).await;
+        let messages = vec![ChatMessage::user("hello")];
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("gw_one".to_string()),
+                provider.chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "gpt-5-codex",
+                    None,
+                ),
+            )
+            .await
+            .expect("chat should succeed");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].get("prompt_cache_key").is_none(),
+            "an operator-configured endpoint must not receive a conversation key; got: {}",
+            requests[0]
+        );
+
+        server_handle.abort();
+    }
+
+    fn probe_request(prompt_cache_key: Option<String>) -> ResponsesRequest {
+        ResponsesRequest {
+            model: "gpt-5-codex".to_string(),
+            input: Vec::new(),
+            instructions: String::new(),
+            store: false,
+            stream: true,
+            text: ResponsesTextOptions {
+                verbosity: "medium".to_string(),
+            },
+            reasoning: ResponsesReasoningOptions {
+                effort: "medium".to_string(),
+                summary: "auto".to_string(),
+            },
+            include: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            prompt_cache_key,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_id_header_mirrors_the_prompt_cache_key() {
+        let (provider, _captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(Vec::new()).await;
+
+        let keyed = probe_request(Some("0123456789abcdef".to_string()));
+        let with_key = provider
+            .responses_request_builder("test-key", None, None, true, &keyed)
+            .build()
+            .expect("request");
+        assert_eq!(
+            with_key
+                .headers()
+                .get("session-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("0123456789abcdef")
+        );
+
+        let unkeyed = probe_request(None);
+        let without_key = provider
+            .responses_request_builder("test-key", None, None, true, &unkeyed)
+            .build()
+            .expect("request");
+        assert!(without_key.headers().get("session-id").is_none());
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_sends_one_prompt_cache_key_per_conversation() {
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider_with_cache_affinity(vec![
+                ok_reply(),
+                ok_reply(),
+                ok_reply(),
+                ok_reply(),
+            ])
+            .await;
+        let messages = vec![ChatMessage::user("hello")];
+        let chat = || {
+            provider.chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+        };
+
+        // Session keys embed channel and user identifiers.
+        let one = "telegram_1001_user_a";
+        let two = "telegram_1002_user_b";
+        for session_key in [one, one, two] {
+            zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                .scope(Some(session_key.to_string()), chat())
+                .await
+                .expect("chat should succeed");
+        }
+        chat().await.expect("chat should succeed");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[0]["prompt_cache_key"],
+            expected_prompt_cache_key(one)
+        );
+        assert_eq!(
+            requests[1]["prompt_cache_key"], requests[0]["prompt_cache_key"],
+            "every call of one conversation must carry the same key"
+        );
+        assert_eq!(
+            requests[2]["prompt_cache_key"],
+            expected_prompt_cache_key(two)
+        );
+        assert_ne!(
+            requests[2]["prompt_cache_key"], requests[0]["prompt_cache_key"],
+            "conversations must not share a key"
+        );
+        assert!(
+            requests[3].get("prompt_cache_key").is_none(),
+            "a call outside a conversation must not send a key; got: {}",
+            requests[3]
+        );
+        // The identifiers inside a session key must not leave the process.
+        for body in requests.iter() {
+            let wire = body.to_string();
+            assert!(!wire.contains(one) && !wire.contains(two), "{wire}");
+            assert!(!wire.contains("user_a"), "{wire}");
+        }
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn non_streaming_retry_keeps_the_prompt_cache_key() {
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider_with_cache_affinity(vec![
+                MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
+                MockCodexReply::Json(serde_json::json!({
+                    "output_text": "fallback ok",
+                    "output": []
+                })),
+            ])
+            .await;
+        let messages = vec![ChatMessage::user("hello")];
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("gw_one".to_string()),
+                provider.chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "gpt-5-codex",
+                    None,
+                ),
+            )
+            .await
+            .expect("provider should retry with stream=false");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "expected one retry request");
+        assert_eq!(
+            requests[0]["prompt_cache_key"],
+            expected_prompt_cache_key("gw_one")
+        );
+        assert_eq!(
+            requests[0]["prompt_cache_key"],
+            requests[1]["prompt_cache_key"]
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_chat_carries_the_conversation_prompt_cache_key() {
+        // The streaming path builds its request inside a spawned task, where
+        // the conversation scope is not visible. A key resolved there would
+        // silently be dropped, so assert the wire body.
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider_with_cache_affinity(vec![MockCodexReply::Sse(
+                "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"done\"}}\n\ndata: [DONE]\n",
+            )])
+            .await;
+        let messages = vec![ChatMessage::user("hello")];
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("gw_one".to_string()), async {
+                let mut events = provider.stream_chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "gpt-5-codex",
+                    None,
+                    StreamOptions::new(true),
+                );
+                while events.next().await.is_some() {}
+            })
+            .await;
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["prompt_cache_key"],
+            expected_prompt_cache_key("gw_one")
+        );
 
         server_handle.abort();
     }
