@@ -148,7 +148,10 @@ A turn collapses as a unit, in both native (`role=tool`) and prompt-mode
 (`[Tool results]` carrier) shapes, so no orphan call or result is created. A
 turn that ended on a call or a result keeps only its prompt and the summary; an
 assistant row that still carries native tool calls is never kept as a closing
-reply. Leading system messages and the trim breadcrumb are copied through. Two
+reply. Leading system messages and the trim breadcrumb are copied through. The loop's
+own mid-turn feedback row (`[Tool call parse error]`, user-role because no tool
+call id exists to attach it to) belongs to the turn it interrupts and does not
+open a new one for retention. Two
 loops that run on the caller's own history as part of the caller's turn never
 collapse: live SOP steps and the skill-review fork, since each step or review
 prompt is a user row and the caller's turn would otherwise look older from

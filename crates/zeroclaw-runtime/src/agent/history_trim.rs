@@ -11,6 +11,23 @@ use zeroclaw_providers::ChatMessage;
 /// must not mistake it for the user prompt that opened a turn.
 pub(crate) const TOOL_RESULTS_PREFIX: &str = "[Tool results]";
 
+/// Prefixes of the user-role rows the tool loop itself appends mid-turn to give
+/// the model feedback on its own output (see the malformed-protocol retry in
+/// `turn/mod.rs`). They are user-role only because no `tool_call_id` exists to
+/// attach them to, and they belong to the turn they interrupt.
+pub(crate) const RUNTIME_FEEDBACK_PREFIXES: &[&str] = &["[Tool call parse error]"];
+
+/// A user row that opens a turn for tool-context retention: a turn boundary
+/// that is not runtime feedback. Whole-turn trimming keeps its own boundary
+/// rule; retention must not let the loop's own feedback row push the running
+/// turn's tool rows out of the retained window.
+fn opens_retention_turn(msg: &ChatMessage) -> bool {
+    is_turn_boundary(msg)
+        && !RUNTIME_FEEDBACK_PREFIXES
+            .iter()
+            .any(|prefix| msg.content.starts_with(prefix))
+}
+
 /// Outcome of a trim pass. `trimmed` is true only when at least one whole turn
 /// was dropped, in which case the caller emits a user-visible event and injects
 /// a breadcrumb so the loss is never silent.
@@ -430,7 +447,7 @@ pub(crate) fn collapse_tool_context_older_than(
         .iter()
         .enumerate()
         .skip(body_start)
-        .filter(|(_, m)| is_turn_boundary(m))
+        .filter(|(_, m)| opens_retention_turn(m))
         .map(|(i, _)| i)
         .collect();
     let protected = keep_prior_turns.saturating_add(1);
@@ -1856,6 +1873,37 @@ mod collapse_tests {
         ];
         expected.extend(rows(&native_turn(2)));
         assert_eq!(rows(&c.messages), expected);
+    }
+
+    #[test]
+    fn runtime_feedback_rows_do_not_split_the_running_turn() {
+        // The running turn already holds a tool round when the loop appends
+        // its own feedback row (twice, the retry budget). With the smallest
+        // window the model must still see that round.
+        let mut h = native_turn(1);
+        h.extend(native_turn(2));
+        h.pop();
+        h.push(user(
+            "[Tool call parse error]\nYour previous response looked like...",
+        ));
+        h.push(user(
+            "[Tool call parse error]\nYour previous response looked like...",
+        ));
+        let c = collapse_tool_context_older_than(&h, 0, false);
+        assert_eq!(c.collapsed_turns, 1, "only the prior turn collapses");
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), summary(1)),
+            ("assistant".to_string(), "answer 1".to_string()),
+        ];
+        expected.extend(rows(&h[4..]));
+        assert_eq!(rows(&c.messages), expected);
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("result 2")),
+            "the running turn keeps its own tool result"
+        );
     }
 
     #[test]
