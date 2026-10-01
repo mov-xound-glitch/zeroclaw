@@ -1,10 +1,14 @@
 //! Live Canvas (A2UI) tool — push rendered content to a web canvas in real time.
 
+use crate::helpers::filesystem_boundary::write_file_atomic;
 use async_trait::async_trait;
+use cap_std::fs::Dir;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -44,11 +48,106 @@ struct CanvasEntry {
     tx: broadcast::Sender<CanvasFrame>,
 }
 
+/// Upper bound on a persisted canvas file. JSON string escaping can expand
+/// content several times over, so this is deliberately loose; the decoded frame
+/// is checked against `MAX_CONTENT_SIZE` after parsing.
+const MAX_PERSISTED_FILE_BYTES: u64 = (MAX_CONTENT_SIZE as u64) * 8 + 4096;
+
+/// What one canvas file holds.
+#[derive(Deserialize)]
+struct PersistedCanvas {
+    canvas_id: String,
+    frame: CanvasFrame,
+}
+
+#[derive(Serialize)]
+struct PersistedCanvasRef<'a> {
+    canvas_id: &'a str,
+    frame: &'a CanvasFrame,
+}
+
+/// On-disk copy of each canvas's current frame, so what the user is looking at
+/// survives a process restart. Only the current displayable frame is kept:
+/// history stays in memory, and an `eval` frame is a request to a live viewer,
+/// not content.
+#[derive(Clone)]
+struct CanvasPersistence {
+    dir: Arc<Dir>,
+    /// One disk operation at a time. Each one saves whatever is current when
+    /// it runs, so the file converges on memory whichever render gets here
+    /// first, without holding the store lock across file I/O.
+    io: Arc<parking_lot::Mutex<()>>,
+}
+
+impl CanvasPersistence {
+    /// Canvas ids come from the model and from the REST path, so the file name
+    /// is a digest of the id and never the id itself.
+    fn file_name(canvas_id: &str) -> String {
+        format!("{}.json", hex::encode(Sha256::digest(canvas_id.as_bytes())))
+    }
+
+    fn save(&self, canvas_id: &str, frame: &CanvasFrame) -> Result<(), String> {
+        let bytes = serde_json::to_vec(&PersistedCanvasRef { canvas_id, frame })
+            .map_err(|error| error.to_string())?;
+        write_file_atomic(&self.dir, Path::new(&Self::file_name(canvas_id)), &bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn remove(&self, canvas_id: &str) -> Result<(), String> {
+        match self.dir.remove_file(Self::file_name(canvas_id)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Every frame this store saved that is still valid, newest first, capped
+    /// at the canvas limit. Anything else in the directory is ignored.
+    fn load_all(&self) -> Vec<PersistedCanvas> {
+        let Ok(entries) = self.dir.entries() else {
+            return Vec::new();
+        };
+        let mut loaded = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.len() > MAX_PERSISTED_FILE_BYTES {
+                continue;
+            }
+            let Ok(bytes) = self.dir.read(name) else {
+                continue;
+            };
+            let Ok(saved) = serde_json::from_slice::<PersistedCanvas>(&bytes) else {
+                continue;
+            };
+            // A file is trusted only under the name its own id maps to.
+            if Self::file_name(&saved.canvas_id) != name
+                || saved.frame.content.len() > MAX_CONTENT_SIZE
+                || !ALLOWED_CONTENT_TYPES.contains(&saved.frame.content_type.as_str())
+            {
+                continue;
+            }
+            loaded.push(saved);
+        }
+        loaded.sort_by(|a, b| b.frame.timestamp.cmp(&a.frame.timestamp));
+        loaded.truncate(MAX_CANVAS_COUNT);
+        loaded
+    }
+}
+
 /// Shared canvas store — holds all active canvases.
 /// Thread-safe and cheaply cloneable (wraps `Arc`).
 #[derive(Clone)]
 pub struct CanvasStore {
     inner: Arc<RwLock<HashMap<String, CanvasEntry>>>,
+    persistence: Option<CanvasPersistence>,
 }
 
 impl Default for CanvasStore {
@@ -61,6 +160,96 @@ impl CanvasStore {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            persistence: None,
+        }
+    }
+
+    /// A store whose canvases keep their current frame across process restarts,
+    /// saved under `dir`. Without this a restart empties every canvas while the
+    /// conversation that says "it is on the canvas" persists. Falls back to an
+    /// in-memory store, with a warning, when the directory cannot be prepared.
+    pub fn persistent(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let opened = std::fs::create_dir_all(&dir).and_then(|()| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+            Dir::open_ambient_dir(&dir, cap_std::ambient_authority())
+        });
+        let dir = match opened {
+            Ok(dir) => dir,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "canvas: persistence directory unavailable; canvases will not survive a restart"
+                );
+                return Self::new();
+            }
+        };
+        let persistence = CanvasPersistence {
+            dir: Arc::new(dir),
+            io: Arc::new(parking_lot::Mutex::new(())),
+        };
+        let mut canvases = HashMap::new();
+        for saved in persistence.load_all() {
+            canvases.insert(
+                saved.canvas_id,
+                CanvasEntry {
+                    current: Some(saved.frame.clone()),
+                    history: vec![saved.frame],
+                    tx: broadcast::channel(BROADCAST_CAPACITY).0,
+                },
+            );
+        }
+        Self {
+            inner: Arc::new(RwLock::new(canvases)),
+            persistence: Some(persistence),
+        }
+    }
+
+    /// The store a deployment uses: canvases saved under `<data_dir>/canvas`.
+    pub fn for_data_dir(data_dir: &Path) -> Self {
+        Self::persistent(data_dir.join("canvas"))
+    }
+
+    /// Bring the saved copy of one canvas in line with what is in memory now.
+    /// A displayable frame is saved; an `eval` request leaves the saved frame
+    /// alone, because the canvas still shows it; anything else, including a
+    /// frame that could not be saved, removes the file so a restart never
+    /// brings back content that was replaced.
+    fn sync_to_disk(&self, canvas_id: &str) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let _one_at_a_time = persistence.io.lock();
+        let current = self
+            .inner
+            .read()
+            .get(canvas_id)
+            .and_then(|entry| entry.current.clone());
+        let outcome = match current {
+            None => persistence.remove(canvas_id),
+            Some(frame) if frame.content_type == "eval" => Ok(()),
+            Some(frame) if ALLOWED_CONTENT_TYPES.contains(&frame.content_type.as_str()) => {
+                persistence.save(canvas_id, &frame).inspect_err(|_| {
+                    let _ = persistence.remove(canvas_id);
+                })
+            }
+            Some(_) => persistence.remove(canvas_id),
+        };
+        if let Err(error) = outcome {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error})),
+                "canvas: could not update the saved frame; this canvas will not survive a restart"
+            );
         }
     }
 
@@ -104,6 +293,9 @@ impl CanvasStore {
         // Best-effort broadcast — ignore errors (no receivers is fine).
         let _ = entry.tx.send(frame.clone());
 
+        drop(store);
+        self.sync_to_disk(canvas_id);
+
         Some(frame)
     }
 
@@ -122,24 +314,37 @@ impl CanvasStore {
             .unwrap_or_default()
     }
 
-    /// Clear a canvas (removes current content and history).
+    /// Clear a canvas (removes current content and history). An entry nobody is
+    /// subscribed to is dropped, so it stops counting against the canvas limit;
+    /// a watched one keeps its channel for the next render.
     pub fn clear(&self, canvas_id: &str) -> bool {
-        let mut store = self.inner.write();
-        if let Some(entry) = store.get_mut(canvas_id) {
-            entry.current = None;
-            entry.history.clear();
-            // Send an empty frame to signal clear to subscribers.
-            let clear_frame = CanvasFrame {
-                frame_id: uuid::Uuid::new_v4().to_string(),
-                content_type: "clear".to_string(),
-                content: String::new(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
+        let existed = {
+            let mut store = self.inner.write();
+            let unwatched = match store.get_mut(canvas_id) {
+                Some(entry) => {
+                    entry.current = None;
+                    entry.history.clear();
+                    // Send an empty frame to signal clear to subscribers.
+                    let clear_frame = CanvasFrame {
+                        frame_id: uuid::Uuid::new_v4().to_string(),
+                        content_type: "clear".to_string(),
+                        content: String::new(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = entry.tx.send(clear_frame);
+                    Some(entry.tx.receiver_count() == 0)
+                }
+                None => None,
             };
-            let _ = entry.tx.send(clear_frame);
-            true
-        } else {
-            false
+            if unwatched == Some(true) {
+                store.remove(canvas_id);
+            }
+            unwatched.is_some()
+        };
+        if existed {
+            self.sync_to_disk(canvas_id);
         }
+        existed
     }
 
     /// Subscribe to real-time updates for a canvas.
@@ -306,7 +511,12 @@ impl Tool for CanvasTool {
                 }),
                 None => Ok(ToolResult {
                     success: true,
-                    output: format!("Canvas '{}' is empty", canvas_id).into(),
+                    output: format!(
+                        "Canvas '{}' has no content: it was never rendered or has been \
+                         cleared, so nothing is displayed. Render it again to show something.",
+                        canvas_id
+                    )
+                    .into(),
                     error: None,
                 }),
             },
@@ -526,7 +736,8 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("empty"));
+        assert!(result.output.contains("has no content"));
+        assert!(result.output.contains("Render it again"));
     }
 
     #[tokio::test]
@@ -653,5 +864,182 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("expression"));
+    }
+
+    #[test]
+    fn persistent_store_restores_the_current_frame_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = CanvasStore::persistent(dir.path());
+        first.render("report", "html", "<p>v1</p>").unwrap();
+        let shown = first.render("report", "html", "<p>v2</p>").unwrap();
+        drop(first);
+
+        let second = CanvasStore::persistent(dir.path());
+        let frame = second.snapshot("report").expect("the canvas survives");
+        assert_eq!(frame.content, "<p>v2</p>");
+        assert_eq!(frame.frame_id, shown.frame_id);
+        assert_eq!(second.list(), vec!["report".to_string()]);
+        assert_eq!(
+            second.history("report").len(),
+            1,
+            "only the current frame is kept on disk"
+        );
+    }
+
+    #[test]
+    fn persistent_store_forgets_a_cleared_canvas() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = CanvasStore::persistent(dir.path());
+        first.render("report", "html", "<p>v1</p>").unwrap();
+        assert!(first.clear("report"));
+        drop(first);
+
+        let second = CanvasStore::persistent(dir.path());
+        assert!(second.snapshot("report").is_none());
+        assert!(second.list().is_empty());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn persistent_store_keeps_the_last_displayable_frame_when_an_eval_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = CanvasStore::persistent(dir.path());
+        first.render("report", "markdown", "# shown").unwrap();
+        first.render("report", "eval", "document.title").unwrap();
+        drop(first);
+
+        let second = CanvasStore::persistent(dir.path());
+        let frame = second.snapshot("report").expect("the canvas survives");
+        assert_eq!(frame.content_type, "markdown");
+        assert_eq!(frame.content, "# shown");
+    }
+
+    #[test]
+    fn persistent_store_never_uses_the_canvas_id_as_a_path() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("canvas");
+        let hostile = "../../outside/evil";
+        let first = CanvasStore::persistent(&dir);
+        first.render(hostile, "text", "contained").unwrap();
+        drop(first);
+
+        assert!(!root.path().join("outside").exists());
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        let stem = names[0].strip_suffix(".json").expect("a .json file");
+        assert_eq!(stem.len(), 64, "{names:?}");
+        assert!(stem.chars().all(|c| c.is_ascii_hexdigit()), "{names:?}");
+
+        let second = CanvasStore::persistent(&dir);
+        assert_eq!(second.snapshot(hostile).unwrap().content, "contained");
+    }
+
+    #[test]
+    fn persistent_store_ignores_files_it_did_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = CanvasStore::persistent(dir.path());
+        first.render("kept", "text", "real").unwrap();
+        drop(first);
+
+        std::fs::write(dir.path().join("notes.json"), b"not a canvas").unwrap();
+        // A well-formed frame under a name its id does not map to.
+        let stray = serde_json::json!({
+            "canvas_id": "smuggled",
+            "frame": {"frame_id": "f", "content_type": "html", "content": "x", "timestamp": "2026-01-01T00:00:00+00:00"}
+        });
+        std::fs::write(dir.path().join("stray.json"), stray.to_string()).unwrap();
+        // The right name, but a frame type that is never displayed.
+        let eval = serde_json::json!({
+            "canvas_id": "evaluated",
+            "frame": {"frame_id": "f", "content_type": "eval", "content": "x", "timestamp": "2026-01-01T00:00:00+00:00"}
+        });
+        std::fs::write(
+            dir.path().join(CanvasPersistence::file_name("evaluated")),
+            eval.to_string(),
+        )
+        .unwrap();
+
+        let second = CanvasStore::persistent(dir.path());
+        assert_eq!(second.list(), vec!["kept".to_string()]);
+    }
+
+    #[test]
+    fn a_frame_that_is_not_saved_does_not_leave_the_previous_one_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = CanvasStore::persistent(dir.path());
+        first.render("report", "html", "<p>v1</p>").unwrap();
+        // The tool accepts content types the REST allow-list does not; such a
+        // frame replaces v1 in memory, so v1 must not come back after a restart.
+        first
+            .render("report", "mermaid", "graph TD; a-->b")
+            .unwrap();
+        drop(first);
+
+        let second = CanvasStore::persistent(dir.path());
+        assert!(second.snapshot("report").is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn clear_frees_the_canvas_slot_unless_someone_is_watching() {
+        let store = CanvasStore::new();
+        store.render("unwatched", "text", "a").unwrap();
+        assert!(store.clear("unwatched"));
+        assert!(
+            store.list().is_empty(),
+            "a cleared canvas nobody watches is dropped"
+        );
+
+        store.render("watched", "text", "b").unwrap();
+        let mut viewer = store.subscribe("watched").unwrap();
+        assert!(store.clear("watched"));
+        assert_eq!(store.list(), vec!["watched".to_string()]);
+        assert_eq!(viewer.try_recv().unwrap().content_type, "clear");
+        drop(viewer);
+        assert!(store.clear("watched"));
+
+        for i in 0..MAX_CANVAS_COUNT {
+            store.render(&format!("fill-{i}"), "text", "x").unwrap();
+        }
+        assert!(store.render("one-more", "text", "x").is_none());
+        assert!(store.clear("fill-0"));
+        assert!(
+            store.render("one-more", "text", "x").is_some(),
+            "clearing an unwatched canvas makes room for a new one"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_frames_are_readable_by_the_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = CanvasStore::persistent(dir.path().join("canvas"));
+        store.render("report", "html", "<p>private</p>").unwrap();
+
+        let saved = std::fs::read_dir(dir.path().join("canvas"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let dir_mode = std::fs::metadata(dir.path().join("canvas"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn in_memory_store_writes_nothing() {
+        let store = CanvasStore::new();
+        store.render("report", "html", "<p>v1</p>").unwrap();
+        assert!(store.persistence.is_none());
     }
 }
