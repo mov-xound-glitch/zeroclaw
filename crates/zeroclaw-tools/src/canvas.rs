@@ -45,6 +45,11 @@ pub struct CanvasFrame {
 struct CanvasEntry {
     current: Option<CanvasFrame>,
     history: Vec<CanvasFrame>,
+    /// What the canvas shows, for a persistent store: the last frame rendered
+    /// that was not an `eval` request, or `None` once cleared. Recorded under
+    /// the store lock by the render or clear that changed it, so the saved
+    /// copy never has to be worked out from `current` or the bounded history.
+    displayed: Option<CanvasFrame>,
     tx: broadcast::Sender<CanvasFrame>,
 }
 
@@ -73,10 +78,13 @@ struct PersistedCanvasRef<'a> {
 #[derive(Clone)]
 struct CanvasPersistence {
     dir: Arc<Dir>,
-    /// One disk operation at a time. Each one saves whatever is current when
-    /// it runs, so the file converges on memory whichever render gets here
-    /// first, without holding the store lock across file I/O.
-    io: Arc<parking_lot::Mutex<()>>,
+    /// Per canvas, the frame id its file was last brought in line with:
+    /// saved, or removed because the save failed. A canvas with nothing
+    /// displayed has no entry. Holding this lock is also what makes disk
+    /// operations one at a time: each one settles whatever the canvas shows
+    /// when it runs, so the file converges on memory whichever render gets
+    /// here first, without holding the store lock across file I/O.
+    settled: Arc<parking_lot::Mutex<HashMap<String, String>>>,
 }
 
 impl CanvasPersistence {
@@ -100,19 +108,30 @@ impl CanvasPersistence {
         }
     }
 
-    /// Every frame this store saved that is still valid, newest first, capped
-    /// at the canvas limit. Anything else in the directory is ignored.
+    /// Whether `name` is a file name this store writes: a SHA-256 digest in
+    /// hex plus `.json`.
+    fn is_canvas_file_name(name: &str) -> bool {
+        name.strip_suffix(".json").is_some_and(|stem| {
+            stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }
+
+    /// The most recently written frames this store saved that are still
+    /// valid, up to the canvas limit. Anything else in the directory is
+    /// ignored. Files are ranked by modification time before any is read, so
+    /// at most the canvas limit of frames is ever held, however many files the
+    /// directory has. Files beyond the limit are left where they are.
     fn load_all(&self) -> Vec<PersistedCanvas> {
         let Ok(entries) = self.dir.entries() else {
             return Vec::new();
         };
-        let mut loaded = Vec::new();
+        let mut candidates = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !name.ends_with(".json") {
+            if !Self::is_canvas_file_name(name) {
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
@@ -121,23 +140,34 @@ impl CanvasPersistence {
             if !metadata.is_file() || metadata.len() > MAX_PERSISTED_FILE_BYTES {
                 continue;
             }
-            let Ok(bytes) = self.dir.read(name) else {
+            // A file whose time cannot be read is still a canvas; it ranks last.
+            let modified = metadata.modified().unwrap_or_else(|_| {
+                cap_std::time::SystemTime::from_std(std::time::SystemTime::UNIX_EPOCH)
+            });
+            candidates.push((modified, name.to_string()));
+        }
+        candidates.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+
+        let mut loaded = Vec::new();
+        for (_, name) in candidates {
+            if loaded.len() >= MAX_CANVAS_COUNT {
+                break;
+            }
+            let Ok(bytes) = self.dir.read(&name) else {
                 continue;
             };
-            let Ok(saved) = serde_json::from_slice::<PersistedCanvas>(&bytes) else {
+            let Ok(canvas) = serde_json::from_slice::<PersistedCanvas>(&bytes) else {
                 continue;
             };
             // A file is trusted only under the name its own id maps to.
-            if Self::file_name(&saved.canvas_id) != name
-                || saved.frame.content.len() > MAX_CONTENT_SIZE
-                || !ALLOWED_CONTENT_TYPES.contains(&saved.frame.content_type.as_str())
+            if Self::file_name(&canvas.canvas_id) != name
+                || canvas.frame.content.len() > MAX_CONTENT_SIZE
+                || !ALLOWED_CONTENT_TYPES.contains(&canvas.frame.content_type.as_str())
             {
                 continue;
             }
-            loaded.push(saved);
+            loaded.push(canvas);
         }
-        loaded.sort_by(|a, b| b.frame.timestamp.cmp(&a.frame.timestamp));
-        loaded.truncate(MAX_CANVAS_COUNT);
         loaded
     }
 }
@@ -191,21 +221,25 @@ impl CanvasStore {
                 return Self::new();
             }
         };
+        let mut canvases = HashMap::new();
+        let mut settled = HashMap::new();
         let persistence = CanvasPersistence {
             dir: Arc::new(dir),
-            io: Arc::new(parking_lot::Mutex::new(())),
+            settled: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
-        let mut canvases = HashMap::new();
-        for saved in persistence.load_all() {
+        for canvas in persistence.load_all() {
+            settled.insert(canvas.canvas_id.clone(), canvas.frame.frame_id.clone());
             canvases.insert(
-                saved.canvas_id,
+                canvas.canvas_id,
                 CanvasEntry {
-                    current: Some(saved.frame.clone()),
-                    history: vec![saved.frame],
+                    current: Some(canvas.frame.clone()),
+                    history: vec![canvas.frame.clone()],
+                    displayed: Some(canvas.frame),
                     tx: broadcast::channel(BROADCAST_CAPACITY).0,
                 },
             );
         }
+        *persistence.settled.lock() = settled;
         Self {
             inner: Arc::new(RwLock::new(canvases)),
             persistence: Some(persistence),
@@ -217,30 +251,46 @@ impl CanvasStore {
         Self::persistent(data_dir.join("canvas"))
     }
 
-    /// Bring the saved copy of one canvas in line with what is in memory now.
-    /// A displayable frame is saved; an `eval` request leaves the saved frame
-    /// alone, because the canvas still shows it; anything else, including a
-    /// frame that could not be saved, removes the file so a restart never
+    /// Bring the saved copy of one canvas in line with what it shows now.
+    /// What it shows is recorded by the render or clear that changed it, so
+    /// an `eval` request, which is not content, never decides what is saved:
+    /// a render is saved even when an `eval` became the current frame before
+    /// this ran, and a cleared canvas loses its file even when an `eval`
+    /// recreated the entry. A frame is settled once, saved or not, so later
+    /// `eval` requests never touch the disk. A canvas that shows nothing, and
+    /// a frame that could not be saved, remove the file so a restart never
     /// brings back content that was replaced.
     fn sync_to_disk(&self, canvas_id: &str) {
         let Some(persistence) = &self.persistence else {
             return;
         };
-        let _one_at_a_time = persistence.io.lock();
-        let current = self
-            .inner
-            .read()
-            .get(canvas_id)
-            .and_then(|entry| entry.current.clone());
-        let outcome = match current {
-            None => persistence.remove(canvas_id),
-            Some(frame) if frame.content_type == "eval" => Ok(()),
-            Some(frame) if ALLOWED_CONTENT_TYPES.contains(&frame.content_type.as_str()) => {
-                persistence.save(canvas_id, &frame).inspect_err(|_| {
-                    let _ = persistence.remove(canvas_id);
-                })
+        let mut settled = persistence.settled.lock();
+        let unsettled = {
+            let store = self.inner.read();
+            match store
+                .get(canvas_id)
+                .and_then(|entry| entry.displayed.as_ref())
+            {
+                Some(frame) if settled.get(canvas_id) == Some(&frame.frame_id) => return,
+                Some(frame) => Some(frame.clone()),
+                None => None,
             }
-            Some(_) => persistence.remove(canvas_id),
+        };
+        let outcome = match unsettled {
+            Some(frame) => {
+                settled.insert(canvas_id.to_string(), frame.frame_id.clone());
+                if ALLOWED_CONTENT_TYPES.contains(&frame.content_type.as_str()) {
+                    persistence.save(canvas_id, &frame).inspect_err(|_| {
+                        let _ = persistence.remove(canvas_id);
+                    })
+                } else {
+                    persistence.remove(canvas_id)
+                }
+            }
+            None => {
+                settled.remove(canvas_id);
+                persistence.remove(canvas_id)
+            }
         };
         if let Err(error) = outcome {
             ::zeroclaw_log::record!(
@@ -280,10 +330,14 @@ impl CanvasStore {
             .or_insert_with(|| CanvasEntry {
                 current: None,
                 history: Vec::new(),
+                displayed: None,
                 tx: broadcast::channel(BROADCAST_CAPACITY).0,
             });
 
         entry.current = Some(frame.clone());
+        if self.persistence.is_some() && content_type != "eval" {
+            entry.displayed = Some(frame.clone());
+        }
         entry.history.push(frame.clone());
         if entry.history.len() > MAX_HISTORY_FRAMES {
             let excess = entry.history.len() - MAX_HISTORY_FRAMES;
@@ -323,6 +377,7 @@ impl CanvasStore {
             let unwatched = match store.get_mut(canvas_id) {
                 Some(entry) => {
                     entry.current = None;
+                    entry.displayed = None;
                     entry.history.clear();
                     // Send an empty frame to signal clear to subscribers.
                     let clear_frame = CanvasFrame {
@@ -363,6 +418,7 @@ impl CanvasStore {
             .or_insert_with(|| CanvasEntry {
                 current: None,
                 history: Vec::new(),
+                displayed: None,
                 tx: broadcast::channel(BROADCAST_CAPACITY).0,
             });
         Some(entry.tx.subscribe())
@@ -511,10 +567,9 @@ impl Tool for CanvasTool {
                 }),
                 None => Ok(ToolResult {
                     success: true,
-                    output: format!(
-                        "Canvas '{}' has no content: it was never rendered or has been \
-                         cleared, so nothing is displayed. Render it again to show something.",
-                        canvas_id
+                    output: crate::i18n::get_required_tool_string_with_args(
+                        "tool-canvas-snapshot-empty",
+                        &[("canvas_id", canvas_id)],
                     )
                     .into(),
                     error: None,
@@ -912,6 +967,137 @@ mod tests {
         let frame = second.snapshot("report").expect("the canvas survives");
         assert_eq!(frame.content_type, "markdown");
         assert_eq!(frame.content, "# shown");
+    }
+
+    /// Replace a canvas file's bytes without the store knowing, so a test can
+    /// tell whether a later operation wrote the file again.
+    fn overwrite_with_sentinel(dir: &Path, canvas_id: &str) -> PathBuf {
+        let file = dir.join(CanvasPersistence::file_name(canvas_id));
+        std::fs::write(&file, b"sentinel").unwrap();
+        file
+    }
+
+    #[test]
+    fn a_render_overtaken_by_an_eval_is_still_saved() {
+        // A render and an `eval` can arrive close enough together that the
+        // `eval` is already the current frame when the render's disk sync
+        // runs. Reproduce that state: the render is in memory but not on
+        // disk, and the sync that runs sees `eval` as current.
+        let dir = tempfile::tempdir().unwrap();
+        let store = CanvasStore::persistent(dir.path());
+        store.render("report", "markdown", "# shown").unwrap();
+        let persistence = store.persistence.as_ref().unwrap();
+        persistence.remove("report").unwrap();
+        persistence.settled.lock().clear();
+
+        store.render("report", "eval", "document.title").unwrap();
+        drop(store);
+
+        let restarted = CanvasStore::persistent(dir.path());
+        let frame = restarted.snapshot("report").expect("the render was saved");
+        assert_eq!(frame.content_type, "markdown");
+        assert_eq!(frame.content, "# shown");
+    }
+
+    #[test]
+    fn a_clear_overtaken_by_an_eval_still_removes_the_file() {
+        // The mirror case: the clear dropped the entry, an `eval` recreated
+        // it, and only then does a disk sync run.
+        let dir = tempfile::tempdir().unwrap();
+        let store = CanvasStore::persistent(dir.path());
+        store.render("report", "markdown", "# shown").unwrap();
+        let file = dir.path().join(CanvasPersistence::file_name("report"));
+        {
+            let mut canvases = store.inner.write();
+            canvases.remove("report");
+        }
+        assert!(file.exists(), "the clear's own sync has not run yet");
+
+        store.render("report", "eval", "document.title").unwrap();
+        assert!(!file.exists());
+        drop(store);
+
+        let restarted = CanvasStore::persistent(dir.path());
+        assert!(restarted.snapshot("report").is_none());
+    }
+
+    #[test]
+    fn an_eval_does_not_rewrite_a_frame_that_is_already_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CanvasStore::persistent(dir.path());
+        store.render("report", "markdown", "# shown").unwrap();
+        let file = overwrite_with_sentinel(dir.path(), "report");
+
+        store.render("report", "eval", "document.title").unwrap();
+
+        assert_eq!(std::fs::read(&file).unwrap(), b"sentinel");
+    }
+
+    #[test]
+    fn a_restored_frame_counts_as_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        CanvasStore::persistent(dir.path())
+            .render("report", "markdown", "# shown")
+            .unwrap();
+
+        let restarted = CanvasStore::persistent(dir.path());
+        let file = overwrite_with_sentinel(dir.path(), "report");
+        restarted
+            .render("report", "eval", "document.title")
+            .unwrap();
+
+        assert_eq!(std::fs::read(&file).unwrap(), b"sentinel");
+    }
+
+    #[test]
+    fn startup_keeps_the_newest_frames_up_to_the_canvas_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CanvasStore::persistent(dir.path());
+        let persistence = store.persistence.as_ref().unwrap();
+        let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for index in 0..MAX_CANVAS_COUNT + 5 {
+            let canvas_id = format!("canvas-{index}");
+            let frame = CanvasFrame {
+                frame_id: format!("frame-{index}"),
+                content_type: "text".to_string(),
+                content: format!("canvas {index}"),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            };
+            persistence.save(&canvas_id, &frame).unwrap();
+            if index < 5 {
+                std::fs::File::options()
+                    .write(true)
+                    .open(dir.path().join(CanvasPersistence::file_name(&canvas_id)))
+                    .unwrap()
+                    .set_modified(aged)
+                    .unwrap();
+            }
+        }
+        drop(store);
+
+        let restarted = CanvasStore::persistent(dir.path());
+        let kept = restarted.list();
+        assert_eq!(kept.len(), MAX_CANVAS_COUNT);
+        for index in 0..5 {
+            assert!(
+                !kept.contains(&format!("canvas-{index}")),
+                "the oldest files fall outside the limit"
+            );
+        }
+    }
+
+    #[test]
+    fn only_files_this_store_names_are_read_at_startup() {
+        assert!(CanvasPersistence::is_canvas_file_name(
+            &CanvasPersistence::file_name("report")
+        ));
+        assert!(!CanvasPersistence::is_canvas_file_name("report.json"));
+        assert!(!CanvasPersistence::is_canvas_file_name(
+            "zz3f0c1a9b0e7d55a1c2b3d4e5f60718293a4b5c6d7e8f9012345678901234ab.json"
+        ));
+        assert!(!CanvasPersistence::is_canvas_file_name(
+            "aa3f0c1a9b0e7d55a1c2b3d4e5f60718293a4b5c6d7e8f9012345678901234ab.tmp"
+        ));
     }
 
     #[test]
