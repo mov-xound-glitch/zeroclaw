@@ -9940,23 +9940,18 @@ async fn process_channel_message_body(
     // composed with the channel preamble (whose channel names real tool
     // triggers contain) and before any memory enrichment a retry would
     // otherwise rescan. The engine only consumes the recorded decision.
-    {
-        let prescan_excluded: &[String] =
-            if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-                &[]
-            } else {
-                ctx.non_cli_excluded_tools.as_ref()
-            };
-        zeroclaw_runtime::agent::loop_::prescan_inbound_for_elicitation(
-            Some(ctx.prompt_config.as_ref()),
-            Some(ctx.agent_alias.as_str()),
-            &turn_id,
-            &inbound_content,
-            ctx.tools_registry.as_ref(),
-            ctx.activated_tools.as_ref(),
-            prescan_excluded,
-        );
-    }
+    //
+    // It scans under the same exclusion list the turn executes under, so a
+    // tool this sender cannot run is never hinted.
+    zeroclaw_runtime::agent::loop_::prescan_inbound_for_elicitation(
+        Some(ctx.prompt_config.as_ref()),
+        Some(ctx.agent_alias.as_str()),
+        &turn_id,
+        &inbound_content,
+        ctx.tools_registry.as_ref(),
+        ctx.activated_tools.as_ref(),
+        per_turn_excluded_tools,
+    );
     // Bracket the channel turn so lifecycle events
     // reach observers (and, via the broadcast hook, /api/events and
     // /api/events/history) for channel-originated turns — mirroring the CLI

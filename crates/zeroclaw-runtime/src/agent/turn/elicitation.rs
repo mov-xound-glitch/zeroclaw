@@ -36,30 +36,40 @@ pub(crate) struct TurnElicitation {
     pub call_recorded: bool,
 }
 
+type HintedTurns = Mutex<HashMap<String, TurnElicitation>>;
+
 /// Entries live exactly as long as their turn: the frame that owns the turn
 /// id (and any model-switch retries) holds a [`TurnHintScope`] whose drop
 /// removes them on every exit.
-fn hinted_turns() -> &'static Mutex<HashMap<String, TurnElicitation>> {
-    static HINTED_TURNS: OnceLock<Mutex<HashMap<String, TurnElicitation>>> = OnceLock::new();
-    HINTED_TURNS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+///
+/// Only a recorded prescan decision creates the map. With the flag off for
+/// every agent nothing is ever recorded, so every other access finds no map
+/// and takes no lock.
+static HINTED_TURNS: OnceLock<HintedTurns> = OnceLock::new();
 
-fn hinted_turns_lock() -> std::sync::MutexGuard<'static, HashMap<String, TurnElicitation>> {
-    match hinted_turns().lock() {
+fn lock_turns(
+    turns: &'static HintedTurns,
+) -> std::sync::MutexGuard<'static, HashMap<String, TurnElicitation>> {
+    match turns.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
 }
 
+/// The map, if any turn in this process has recorded a decision.
+fn recorded_turns() -> Option<std::sync::MutexGuard<'static, HashMap<String, TurnElicitation>>> {
+    HINTED_TURNS.get().map(lock_turns)
+}
+
 /// This turn's elicitation state, if an inbound prescan recorded one.
 pub(crate) fn state_for(turn_id: &str) -> Option<TurnElicitation> {
-    hinted_turns_lock().get(turn_id).cloned()
+    recorded_turns()?.get(turn_id).cloned()
 }
 
 /// Record the prescan decision for this turn — hit or no-match — exactly
 /// once; a later call for the same turn is ignored (first decision wins).
 pub(crate) fn record_scan_decision(turn_id: &str, decision: Option<String>) {
-    hinted_turns_lock()
+    lock_turns(HINTED_TURNS.get_or_init(|| Mutex::new(HashMap::new())))
         .entry(turn_id.to_string())
         .or_insert(TurnElicitation {
             decision,
@@ -72,7 +82,9 @@ pub(crate) fn record_scan_decision(turn_id: &str, decision: Option<String>) {
 /// history, so a model-switch re-entry neither stacks it nor re-fires the
 /// injection event.
 pub(crate) fn mark_injected(turn_id: &str) {
-    if let Some(state) = hinted_turns_lock().get_mut(turn_id) {
+    if let Some(mut turns) = recorded_turns()
+        && let Some(state) = turns.get_mut(turn_id)
+    {
         state.injected = true;
     }
 }
@@ -80,7 +92,9 @@ pub(crate) fn mark_injected(turn_id: &str) {
 /// Record that this turn's hinted tool was called and the correlation
 /// event fired, so a model-switch retry does not fire it again.
 pub(crate) fn record_hint_call(turn_id: &str) {
-    if let Some(state) = hinted_turns_lock().get_mut(turn_id) {
+    if let Some(mut turns) = recorded_turns()
+        && let Some(state) = turns.get_mut(turn_id)
+    {
         state.call_recorded = true;
     }
 }
@@ -106,7 +120,9 @@ impl TurnHintScope {
 
 impl Drop for TurnHintScope {
     fn drop(&mut self) {
-        hinted_turns_lock().remove(&self.turn_id);
+        if let Some(mut turns) = recorded_turns() {
+            turns.remove(&self.turn_id);
+        }
     }
 }
 
