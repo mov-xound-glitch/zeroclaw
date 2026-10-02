@@ -251,9 +251,10 @@ where
 }
 
 /// Answer a turn the agent lifecycle did not admit. Returns `true` when the
-/// socket was closed as well: a retired or replaced generation never admits
-/// this socket again, whereas a delete in progress may still be refused, so
-/// that case keeps the socket.
+/// socket is finished: a retired or replaced generation never admits this
+/// socket again, so it is closed, and a refusal that could not be delivered
+/// means the peer is already gone. A delete in progress may still be refused,
+/// so that case keeps the socket and returns `false`.
 async fn refuse_unadmitted_turn<S, R>(
     sender: &mut S,
     receiver: &mut R,
@@ -270,7 +271,13 @@ where
         "message": error.to_string(),
         "code": "AGENT_LIFECYCLE_UNAVAILABLE"
     });
-    let _ = sender.send(Message::Text(err.to_string().into())).await;
+    if sender
+        .send(Message::Text(err.to_string().into()))
+        .await
+        .is_err()
+    {
+        return true;
+    }
     if matches!(error, AgentAdmissionError::Deleting { .. }) {
         return false;
     }
@@ -629,7 +636,12 @@ async fn handle_socket(
         match state.agent_lifecycle.reserve_admission(agent_alias.clone()) {
             Ok(reservation) => reservation,
             Err(error) => {
-                refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await;
+                // Without an admitted agent there is nothing for this socket
+                // to wait on, whichever way the lifecycle refused it.
+                if !refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await {
+                    close_for_reconnect(&mut sender, &mut receiver, "agent lifecycle changed")
+                        .await;
+                }
                 return;
             }
         };
@@ -794,44 +806,50 @@ async fn handle_socket(
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
                 if let Some(content) = first_chat_message_content(text) {
-                    let _turn_lease =
-                        match state.reserve_agent_turn_at(agent_alias.clone(), turn_generation) {
-                            Ok(lease) => lease,
-                            Err(error) => {
-                                refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await;
+                    let turn_lease = match state
+                        .reserve_agent_turn_at(agent_alias.clone(), turn_generation)
+                    {
+                        Ok(lease) => Some(lease),
+                        Err(error) => {
+                            if refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await {
+                                return;
+                            }
+                            // Refused, but the socket stays for a retry.
+                            None
+                        }
+                    };
+                    if let Some(_turn_lease) = turn_lease {
+                        let _session_guard = match state.session_queue.acquire(&session_key).await {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "message": e.to_string(),
+                                    "code": session_queue_ws_error_code(&e)
+                                });
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
                                 return;
                             }
                         };
-                    let _session_guard = match state.session_queue.acquire(&session_key).await {
-                        Ok(guard) => guard,
-                        Err(e) => {
-                            let err = serde_json::json!({
-                                "type": "error",
-                                "message": e.to_string(),
-                                "code": session_queue_ws_error_code(&e)
-                            });
-                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        let client_gone = process_chat_message(
+                            &state,
+                            &mut agent,
+                            &mut sender,
+                            &mut receiver,
+                            &mut approval_event_rx,
+                            &pending_approvals,
+                            &mut ping_interval,
+                            &ws_memory,
+                            &mut persisted_watermark,
+                            &content,
+                            &session_key,
+                            &session_id,
+                            auth_subject.as_deref(),
+                        )
+                        .await;
+                        if client_gone {
                             return;
                         }
-                    };
-                    let client_gone = process_chat_message(
-                        &state,
-                        &mut agent,
-                        &mut sender,
-                        &mut receiver,
-                        &mut approval_event_rx,
-                        &pending_approvals,
-                        &mut ping_interval,
-                        &ws_memory,
-                        &mut persisted_watermark,
-                        &content,
-                        &session_key,
-                        &session_id,
-                        auth_subject.as_deref(),
-                    )
-                    .await;
-                    if client_gone {
-                        return;
                     }
                 }
             } else {
@@ -859,11 +877,10 @@ async fn handle_socket(
 
     loop {
         tokio::select! {
-            // Polled in order, so the stop arm at the end runs only when no
-            // client frame or event is waiting: a message that has already
-            // arrived is answered rather than dropped with the socket. One
-            // still on the wire when the close goes out is not, and the
-            // client finds that out by reconnecting.
+            // Polled in order: a client frame that has already arrived is
+            // answered before the stop arm can close the socket. One still on
+            // the wire when the close goes out is not, and the client finds
+            // that out by reconnecting.
             biased;
 
             // ── Keepalive ─────────────────────────────────────────────
@@ -1030,6 +1047,16 @@ async fn handle_socket(
                 }
             }
 
+            // ── Gateway instance stopping ─────────────────────────────
+            // Reached only between turns: a running turn is awaited inside
+            // the client-message arm and finishes first. Ahead of the shared
+            // event arms, whose traffic is not this socket's and must not be
+            // able to hold the close back.
+            _ = gateway_stop_signal(&mut gateway_stopping) => {
+                close_for_reconnect(&mut sender, &mut receiver, "gateway restarting").await;
+                break;
+            }
+
             // ── Broadcast event (cron/heartbeat results) ──────────────
             event = broadcast_rx.recv() => {
                 if let Ok(event) = event
@@ -1065,13 +1092,6 @@ async fn handle_socket(
                 let _ = sender.send(Message::Text(frame.to_string().into())).await;
             }
 
-            // ── Gateway instance stopping ─────────────────────────────
-            // Reached only between turns: a running turn is awaited inside
-            // the client-message arm and finishes first.
-            _ = gateway_stop_signal(&mut gateway_stopping) => {
-                close_for_reconnect(&mut sender, &mut receiver, "gateway restarting").await;
-                break;
-            }
         }
     }
 }
@@ -3601,6 +3621,35 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             assert_eq!(code, WS_CLOSE_GOING_AWAY);
             assert_eq!(reason, "gateway restarting");
         }
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_socket_that_cannot_be_admitted_at_setup_is_refused_and_closed() {
+        run_ws_regression(
+            "ws-setup-refused",
+            a_socket_that_cannot_be_admitted_at_setup_is_refused_and_closed_inner,
+        );
+    }
+
+    async fn a_socket_that_cannot_be_admitted_at_setup_is_refused_and_closed_inner() {
+        let fixture = ParkedTurnFixture::spawn().await;
+        let _deleting = fixture
+            .state
+            .agent_lifecycle
+            .begin_delete("web")
+            .expect("nothing blocks the delete");
+
+        // The agent is built on the first frame; with a delete in progress it
+        // cannot be, so there is no socket to keep for a retry.
+        let (mut client, _) = fixture.connect("setup-refused").await;
+        send_chat(&mut client, "hello").await;
+
+        let refusal = next_text_frame(&mut client).await;
+        assert_eq!(refusal["code"], "AGENT_LIFECYCLE_UNAVAILABLE");
+        let (code, reason) = next_close_frame(&mut client).await;
+        assert_eq!(code, WS_CLOSE_GOING_AWAY);
+        assert_eq!(reason, "agent lifecycle changed");
         fixture.shutdown();
     }
 
