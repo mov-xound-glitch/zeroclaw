@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
+use tokio_util::sync::CancellationToken;
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage,
@@ -368,6 +369,14 @@ impl Channel for PacedChannel {
         self.inner.start_typing(recipient).await
     }
 
+    fn set_cancel_token(&self, token: CancellationToken) {
+        self.inner.set_cancel_token(token);
+    }
+
+    fn uses_cancel_token(&self) -> bool {
+        self.inner.uses_cancel_token()
+    }
+
     async fn stop_typing(&self, recipient: &str) -> Result<()> {
         self.inner.stop_typing(recipient).await
     }
@@ -386,6 +395,12 @@ impl Channel for PacedChannel {
 
     fn multi_message_delay_ms(&self) -> u64 {
         self.inner.multi_message_delay_ms()
+    }
+
+    async fn multi_message_confirmed_offset(&self, recipient: &str, message_id: &str) -> usize {
+        self.inner
+            .multi_message_confirmed_offset(recipient, message_id)
+            .await
     }
 
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
@@ -518,6 +533,16 @@ impl Channel for PacedChannel {
         self.inner.invite_user(room_id, user_id).await
     }
 
+    /// Forwarded rather than paced: a poll is one stanza, and the inner
+    /// channel owns whatever limits apply to it.
+    fn supports_native_polls(&self) -> bool {
+        self.inner.supports_native_polls()
+    }
+
+    async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
+        self.inner.send_poll(poll).await
+    }
+
     /// Must be forwarded explicitly: the trait default returns `None`, so
     /// without this every channel wrapped here would report that it supplies no
     /// room context, no matter what the inner channel knows. Pacing concerns
@@ -544,6 +569,17 @@ impl Channel for PacedChannel {
     ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         self.inner
             .request_approval_attributed(recipient, request)
+            .await
+    }
+
+    async fn request_approval_attributed_with_timeout(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: Duration,
+    ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        self.inner
+            .request_approval_attributed_with_timeout(recipient, request, timeout)
             .await
     }
 
@@ -706,6 +742,7 @@ mod tests {
     struct RoomManagementChannel {
         creates: AtomicUsize,
         invites: AtomicUsize,
+        polls: AtomicUsize,
     }
 
     impl Attributable for RoomManagementChannel {
@@ -737,6 +774,14 @@ mod tests {
             assert_eq!(room_id, "!ops:example.org");
             assert_eq!(user_id, "@alice:example.org");
             self.invites.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn supports_native_polls(&self) -> bool {
+            true
+        }
+        async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
+            assert_eq!(poll.question, "Which tasting slot?");
+            self.polls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1064,6 +1109,7 @@ mod tests {
         let counting = Arc::new(RoomManagementChannel {
             creates: AtomicUsize::new(0),
             invites: AtomicUsize::new(0),
+            polls: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -1086,6 +1132,96 @@ mod tests {
 
         assert_eq!(counting.creates.load(Ordering::SeqCst), 1);
         assert_eq!(counting.invites.load(Ordering::SeqCst), 1);
+    }
+
+    /// A multi-message-streaming channel that reports a fixed nonzero
+    /// confirmed-delivery offset, so the test can prove the paced wrapper
+    /// forwards the query instead of falling back to the trait default of 0.
+    struct ConfirmedOffsetChannel {
+        confirmed_offset: usize,
+    }
+
+    impl Attributable for ConfirmedOffsetChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Matrix)
+        }
+        fn alias(&self) -> &str {
+            "confirmed-offset"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ConfirmedOffsetChannel {
+        fn name(&self) -> &str {
+            "confirmed-offset"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        fn supports_multi_message_streaming(&self) -> bool {
+            true
+        }
+        async fn multi_message_confirmed_offset(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+        ) -> usize {
+            self.confirmed_offset
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_message_confirmed_offset_forwards_to_inner_channel() {
+        let inner: Arc<dyn Channel> = Arc::new(ConfirmedOffsetChannel {
+            confirmed_offset: 42,
+        });
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+
+        assert!(paced.supports_multi_message_streaming());
+        assert_eq!(
+            paced
+                .multi_message_confirmed_offset("alice", "draft-1")
+                .await,
+            42,
+            "paced wrapper must report the inner channel's confirmed offset, not the trait default of 0",
+        );
+    }
+
+    /// Without the forwarding overrides the wrapper would report that no
+    /// channel posts native polls, and every poll would silently become text.
+    #[tokio::test]
+    async fn native_polls_reach_the_inner_channel() {
+        let counting = Arc::new(RoomManagementChannel {
+            creates: AtomicUsize::new(0),
+            invites: AtomicUsize::new(0),
+            polls: AtomicUsize::new(0),
+        });
+        let inner: Arc<dyn Channel> = counting.clone();
+        let paced = PacedChannel::wrap(
+            inner,
+            &PacingFixture {
+                interval_secs: 3600,
+                depth: 4,
+            },
+        );
+
+        assert!(paced.supports_native_polls());
+        paced
+            .send_poll(&zeroclaw_api::channel::PollRequest::new(
+                "15550001111",
+                "Which tasting slot?",
+                vec!["Friday".into(), "Saturday".into()],
+            ))
+            .await
+            .expect("the inner channel accepts the poll");
+        assert_eq!(counting.polls.load(Ordering::SeqCst), 1);
     }
 
     /// A channel whose `send` blocks until the test releases a gate, so the

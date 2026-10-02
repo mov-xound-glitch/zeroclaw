@@ -19,16 +19,16 @@ use zeroclaw_config::schema::CacheTtl;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+/// Per-image ceiling for base64-encoded payloads, shared with the multimodal
+/// structural check so this adapter and the pre-dispatch resolvability count
+/// cannot drift apart on what an image may weigh (see
+/// `MAX_ENCODED_IMAGE_PAYLOAD_BYTES` in `crate::multimodal`). Anthropic
+/// documents 10 MB encoded per image for the direct API; its separate
+/// per-request budget (32 MB across all images) is not enforced here.
+use crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES;
 use crate::safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
 };
-/// Anthropic's documented per-image ceiling for the direct API: 10 MB
-/// **base64-encoded**. Measured on the encoded payload length, unlike the
-/// multimodal config's `max_image_size_mb`, which bounds decoded bytes. MB is
-/// read as 1024 * 1024 here, the same way `max_image_size_mb` reads it, so the
-/// two ceilings stay consistent with each other. Anthropic's separate
-/// per-request budget (32 MB across all images) is not enforced here.
-const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Replaces a raw `data:<media type>;base64,<payload>` run that survived marker
 /// parsing and would otherwise sit in a text position. See
 /// [`AnthropicModelProvider::sweep_residual_image_data`].
@@ -40,10 +40,11 @@ const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// the model reads as fact.
 const TRUNCATED_DATA_NOTE: &str = "[truncated inline data removed]";
 /// Stand-in prose for a user message whose only content is an image, so the
-/// message never ends on an `image` block — `apply_cache_to_last_message` is a
-/// silent no-op on one, which would cost the request its cache breakpoint with
-/// nothing reporting it. Used by the user arm of
-/// [`AnthropicModelProvider::convert_messages`].
+/// message never ends on an `image` block. The turn then carries a block that
+/// `apply_cache_to_last_message` can mark, which keeps the rolling breakpoint
+/// on the latest message instead of rolling it back to an earlier one, and the
+/// model reads prose about the attachment rather than a bare image. Used by
+/// the user arm of [`AnthropicModelProvider::convert_messages`].
 const IMAGE_ONLY_TEXT_PLACEHOLDER: &str = "[image]";
 /// Stands in for a `tool_result` that never arrived, so an interrupted turn
 /// cannot wedge the session with a hard 400 on replay. See
@@ -266,17 +267,26 @@ fn anthropic_beta_features(
     }
 }
 
-/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
-/// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
-/// require `adaptive`; budget-based models require `enabled`.
+/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7, the
+/// whole Fable 5 family) reject the fixed-budget `enabled` shape with HTTP
+/// 400 and require `adaptive`; budget-based models require `enabled`.
+///
+/// Shared crate-wide: the OpenAI-compatible passthrough builder resolves the
+/// same style so gateway requests match the native provider's shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnthropicThinkingStyle {
+pub(crate) enum AnthropicThinkingStyle {
     Budget,
     Adaptive,
 }
 
-fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
+/// Substring matching on purpose: gateway model IDs may carry routing
+/// prefixes (`claude-group/claude-opus-4-7`) that must resolve to the same
+/// style as the bare model name. The whole Fable 5 family is adaptive-only,
+/// so the bare `claude-fable-5` substring intentionally covers `fable-5` and
+/// `fable-5-1` alike; a hypothetical future budget-shaped member of the
+/// family would need this matcher revisited.
+pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5") {
         AnthropicThinkingStyle::Adaptive
     } else {
         AnthropicThinkingStyle::Budget
@@ -813,22 +823,46 @@ impl AnthropicModelProvider {
         messages.iter().filter(|m| m.role != "system").count() > 1
     }
 
-    /// Apply cache control to the last message content block. The rolling
-    /// marker carries the configured cache entry lifetime.
+    /// Apply the rolling cache breakpoint: the last `text` or `tool_result`
+    /// block of the last message, rolling back when that message cannot host
+    /// it. The rolling marker carries the configured cache entry lifetime.
+    ///
+    /// A message whose trailing block is `tool_use`, `image` or `thinking`
+    /// takes the marker on its last `text`/`tool_result` block instead, and a
+    /// message with no such block at all (an image-only turn) rolls the marker
+    /// back to the nearest earlier message that has one, so a turn that cannot
+    /// carry the breakpoint does not leave the request with the system
+    /// breakpoint alone. `tool_use`, `image` and `thinking` blocks are never
+    /// marked. At most one block is marked per call, and none when no message
+    /// holds a `text` or `tool_result` block. This is the conversation
+    /// breakpoint only: the last tool definition, the system block and, under
+    /// OAuth, the identity prefix carry their own, so a request has at most
+    /// four, which is Anthropic's limit.
     fn apply_cache_to_last_message(messages: &mut [NativeMessage], cache_ttl: CacheTtl) {
-        if let Some(last_msg) = messages.last_mut()
-            && let Some(last_content) = last_msg.content.last_mut()
-        {
-            match last_content {
+        for message in messages.iter_mut().rev() {
+            if Self::apply_cache_to_message(message, cache_ttl) {
+                return;
+            }
+        }
+    }
+
+    /// Mark the last `text` or `tool_result` block of `message` and return
+    /// whether one was found. A trailing markable block is just the first hit
+    /// of the same backward scan that serves the fallback case.
+    fn apply_cache_to_message(message: &mut NativeMessage, cache_ttl: CacheTtl) -> bool {
+        for content in message.content.iter_mut().rev() {
+            match content {
                 NativeContentOut::Text { cache_control, .. }
                 | NativeContentOut::ToolResult { cache_control, .. } => {
                     *cache_control = Some(CacheControl::ephemeral_with_ttl(cache_ttl));
+                    return true;
                 }
                 NativeContentOut::ToolUse { .. }
                 | NativeContentOut::Image { .. }
                 | NativeContentOut::Thinking { .. } => {}
             }
         }
+        false
     }
 
     fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -950,11 +984,14 @@ impl AnthropicModelProvider {
     fn tool_result_content(content: &str) -> ToolResultContent {
         let (cleaned, refs) = crate::multimodal::parse_image_markers(content);
         if refs.is_empty() {
-            // The early return still sweeps. An unterminated marker yields zero
-            // references and copies its payload verbatim into the cleaned text,
-            // so returning here without sweeping would leave raw base64 in a
-            // text position on exactly the path that has no references.
-            return ToolResultContent::Text(Self::sweep_residual_image_data(content).into_owned());
+            // Sweep the *cleaned* text, never the original. An over-ceiling
+            // marker yields zero references and lands in `cleaned` as the
+            // fixed refusal note - returning the original instead would
+            // forward its raw oversized body past the marker ceiling. The
+            // sweep is still needed on top of `cleaned` because an
+            // unterminated marker also yields zero references and copies its
+            // payload verbatim into the cleaned text.
+            return ToolResultContent::Text(Self::sweep_residual_image_data(&cleaned).into_owned());
         }
 
         let (sources, omitted) = Self::deliverable_image_sources(&refs);
@@ -1462,20 +1499,48 @@ impl AnthropicModelProvider {
                                 Ok((mime, payload)) => {
                                     (mime.to_ascii_lowercase(), payload.to_string())
                                 }
-                                Err(_) => {
+                                Err(reason) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({
+                                            "error": format!("{reason}"),
+                                            "error_key": "anthropic_image_marker_malformed_data_uri",
+                                        })),
+                                        "dropping image marker: data URI failed the structural check"
+                                    );
                                     omitted += 1;
                                     continue;
                                 }
                             }
                         } else {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "error_key": "anthropic_image_source_missing",
+                                })),
+                                "dropping image marker: source is neither a data URI nor an existing file"
+                            );
                             // Counted exactly like the tool-result arm. The
-                            // multimodal normalizer is the only component that
-                            // may turn a file reference into inline image
-                            // content, and it has already run by the time a
-                            // message reaches this adapter; reading the path
-                            // here (extension-inferred MIME, no size or
-                            // content validation) would reopen the hole the
-                            // normalizer exists to close.
+                            // multimodal normalizer is the only component
+                            // allowed to turn a file reference into inline
+                            // image content: callers that want images run it
+                            // before dispatch, and the seam replaces any
+                            // path/URL marker that reaches it with a
+                            // placeholder. This adapter therefore counts a
+                            // non-inline reference as omitted instead of
+                            // reading it; reading the path (extension-inferred
+                            // MIME, no size or content validation) would
+                            // reopen the hole the normalizer exists to close.
                             omitted += 1;
                             continue;
                         };
@@ -2693,14 +2758,19 @@ impl AnthropicModelProvider {
                     return;
                 }
                 "error" => {
-                    let msg = event
-                        .get("error")
+                    let error = event.get("error");
+                    let msg = error
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown streaming error");
-                    let _ = tx
-                        .send(Err(StreamError::ModelProvider(msg.to_string())))
-                        .await;
+                    // Carry the machine-readable type (`overloaded_error`,
+                    // `rate_limit_error`, ...) so downstream retry
+                    // classification can match on it.
+                    let msg = match error.and_then(|e| e.get("type")).and_then(|t| t.as_str()) {
+                        Some(error_type) => format!("{error_type}: {msg}"),
+                        None => msg.to_string(),
+                    };
+                    let _ = tx.send(Err(StreamError::ModelProvider(msg))).await;
                     return;
                 }
                 _ => {}
@@ -3143,10 +3213,17 @@ impl ModelProvider for AnthropicModelProvider {
                 {
                     req = req.header("anthropic-beta", beta_features);
                 }
-                let response = req
-                    .send()
-                    .await
-                    .map_err(|e| StreamError::Http(e.to_string()))?;
+                let response = req.send().await.map_err(|e| {
+                    // Tag the transport's verdict at the send site: a
+                    // connect failure gets the typed variant Reliable reads
+                    // for its recovery exception. See the variant's doc for
+                    // the redirect limit.
+                    if e.is_connect() {
+                        StreamError::ConnectFailed(e.to_string())
+                    } else {
+                        StreamError::Http(e.to_string())
+                    }
+                })?;
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response
@@ -3294,9 +3371,17 @@ impl ModelProvider for AnthropicModelProvider {
             let response = match tokio::time::timeout(phase_timeout, req.send()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
-                        .await;
+                    // Tag the transport's verdict at the send site: a connect
+                    // failure gets the typed variant Reliable reads for its
+                    // recovery exception (the variant's doc carries the
+                    // redirect limit). Any other send error keeps the
+                    // unclassified Http form.
+                    let error = if e.is_connect() {
+                        StreamError::ConnectFailed(super::format_error_chain(&e))
+                    } else {
+                        StreamError::Http(super::format_error_chain(&e))
+                    };
+                    let _ = tx.send(Err(error)).await;
                     return;
                 }
                 Err(_) => {
@@ -3520,10 +3605,11 @@ mod tests {
 
     /// Asserts that no converted message ends on an `image` block.
     ///
-    /// `apply_cache_to_last_message` writes nothing to an `image` block and says
-    /// nothing about it, so a message ending on one costs the request its
-    /// conversation cache breakpoint silently. `label` names the sub-case,
-    /// because the caller drives several histories through the same invariant.
+    /// The converter puts a turn's prose, or the `[image]` placeholder, after
+    /// its images so the turn holds a block `apply_cache_to_last_message` can
+    /// mark and the rolling breakpoint stays on the latest message instead of
+    /// rolling back to an earlier one. `label` names the sub-case, because the
+    /// caller drives several histories through the same invariant.
     fn assert_no_message_ends_on_an_image(label: &str, native_msgs: &[NativeMessage]) {
         let wire = serde_json::to_value(native_msgs).expect("serialize native messages");
         for message in wire.as_array().expect("messages array") {
@@ -3708,6 +3794,66 @@ data: {\"type\":\"message_stop\"}\n\n"
             Some(42),
             "cache_read_input_tokens from message_start"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_carries_error_type() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(err) = ev {
+                last_err = Some(err);
+            }
+        }
+        match last_err.expect("error frame must emit a StreamError") {
+            StreamError::ModelProvider(msg) => {
+                assert_eq!(
+                    msg, "overloaded_error: Overloaded",
+                    "the machine-readable type must prefix the message so retry classification can match it"
+                );
+            }
+            other => panic!("expected ModelProvider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_without_type_keeps_message() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"Overloaded\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(err) = ev {
+                last_err = Some(err);
+            }
+        }
+        match last_err.expect("error frame must emit a StreamError") {
+            StreamError::ModelProvider(msg) => {
+                assert_eq!(
+                    msg, "Overloaded",
+                    "message must be unchanged when the type is absent"
+                );
+            }
+            other => panic!("expected ModelProvider error, got {other:?}"),
+        }
     }
 
     /// A reader that yields one buffer of bytes, then parks forever — models
@@ -4324,6 +4470,16 @@ data: {\"type\":\"message_stop\"}\n\n";
             anthropic_thinking_style("claude-fable-5-1-20260815"),
             AnthropicThinkingStyle::Adaptive
         );
+        // The whole Fable 5 family is adaptive-only: bare fable-5 and
+        // gateway-prefixed IDs resolve like fable-5-1.
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-group/claude-fable-5"),
+            AnthropicThinkingStyle::Adaptive
+        );
         // Budget-based families keep the `enabled` shape.
         assert_eq!(
             anthropic_thinking_style("claude-opus-4-6"),
@@ -4882,6 +5038,225 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
+    /// A message ending in an image takes the rolling breakpoint on its text
+    /// block; the image block never carries one.
+    #[test]
+    fn apply_cache_to_last_message_text_then_image_marks_text() {
+        let mut messages = vec![NativeMessage {
+            role: "user".to_string(),
+            content: vec![
+                NativeContentOut::Text {
+                    text: "look at this".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: CANONICAL_PNG_B64.to_string(),
+                    },
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[0].content[0] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_some());
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[0]["content"][1].get("cache_control").is_none(),
+            "the trailing image must not gain a cache marker: {wire}"
+        );
+    }
+
+    /// An image-only last message cannot host the breakpoint, so it rolls back
+    /// to the nearest earlier message that can; the image-only message itself
+    /// stays unmarked.
+    #[test]
+    fn apply_cache_to_last_message_image_only_rolls_back() {
+        let mut messages = vec![
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "assistant".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hello".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: CANONICAL_PNG_B64.to_string(),
+                    },
+                }],
+            },
+        ];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[1].content[0] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(
+                    cache_control.is_some(),
+                    "the nearest earlier text block must carry the rolling breakpoint"
+                );
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[2]["content"][0].get("cache_control").is_none(),
+            "the image-only last message must stay unmarked: {wire}"
+        );
+    }
+
+    /// An assistant tool-call message holds thinking, then text, then tool_use.
+    /// The backward scan skips the tool_use and marks the text, leaving both
+    /// unmarkable blocks alone. A second shape puts the thinking block last, so
+    /// the scan has to step over it too; the converter never emits thinking
+    /// after text, so that half pins the helper's contract, not a wire shape.
+    ///
+    /// Neither shape reaches this helper from `convert_messages` at present:
+    /// `backfill_orphaned_tool_uses` appends a stub `tool_result` message after
+    /// a trailing tool_use before the breakpoint pass runs. The test pins what
+    /// the helper does on its own, without that upstream step.
+    #[test]
+    fn apply_cache_to_last_message_skips_thinking_and_tool_use_to_mark_text() {
+        let mut messages = vec![NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                NativeContentOut::Thinking {
+                    thinking: "let me check".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+                NativeContentOut::Text {
+                    text: "checking the weather".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::ToolUse {
+                    id: "tool_123".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({}),
+                    cache_control: None,
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[0].content[1] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_some());
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[0]["content"][0].get("cache_control").is_none()
+                && wire[0]["content"][2].get("cache_control").is_none(),
+            "thinking and tool_use blocks must stay unmarked: {wire}"
+        );
+
+        let mut trailing_thinking = vec![NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                NativeContentOut::Text {
+                    text: "checking the weather".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::Thinking {
+                    thinking: "let me check".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(
+            &mut trailing_thinking,
+            CacheTtl::default(),
+        );
+
+        let wire = serde_json::to_value(&trailing_thinking).expect("serialize native messages");
+        assert_eq!(
+            wire[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "the scan must step over a trailing thinking block to the text: {wire}"
+        );
+        assert!(
+            wire[0]["content"][1].get("cache_control").is_none(),
+            "a trailing thinking block must stay unmarked: {wire}"
+        );
+    }
+
+    /// Whatever the last message's shape, the rolling pass leaves at most one
+    /// breakpoint in the whole message list; here, with markable blocks in
+    /// every message, exactly one.
+    #[test]
+    fn apply_cache_to_last_message_places_exactly_one_breakpoint() {
+        let mut messages = vec![
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "assistant".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hello".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![
+                    NativeContentOut::Text {
+                        text: "look at this".to_string(),
+                        cache_control: None,
+                    },
+                    NativeContentOut::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: CANONICAL_PNG_B64.to_string(),
+                        },
+                    },
+                ],
+            },
+        ];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        let breakpoints = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|block| match block {
+                NativeContentOut::Text { cache_control, .. }
+                | NativeContentOut::ToolResult { cache_control, .. }
+                | NativeContentOut::ToolUse { cache_control, .. } => cache_control.is_some(),
+                NativeContentOut::Image { .. } | NativeContentOut::Thinking { .. } => false,
+            })
+            .count();
+        assert_eq!(
+            breakpoints, 1,
+            "exactly one rolling breakpoint per request, got {breakpoints}"
+        );
+    }
+
     #[test]
     fn apply_cache_empty_messages() {
         let mut messages = vec![];
@@ -5184,6 +5559,78 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(native_msgs[0].role, "user");
         assert_eq!(native_msgs[1].role, "assistant");
         assert_eq!(native_msgs[2].role, "user");
+    }
+
+    // The seam sanitizer rewrites an assistant tool-call envelope
+    // field-wise, so the thinking text (marker included) and its signature
+    // survive to the adapter. This converts the sanitized envelope through
+    // the real conversion path and asserts the native blocks the provider
+    // would send: the leading thinking block replays the exact signed bytes
+    // and the following text block carries the placeholder, not the path.
+    #[test]
+    fn convert_messages_replays_sanitized_envelope_thinking_and_signature_byte_for_byte() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let thinking_text = format!("look at {marker} first");
+        let reasoning = format!(r#"{{"thinking":"{thinking_text}","signature":"sig_abc"}}"#);
+        let envelope = serde_json::json!({
+            "content": format!("saved {marker}"),
+            "tool_calls": [{
+                "id": "toolu_1",
+                "name": "shell",
+                "arguments": "{}",
+                "extra_content": {"google": {"thought_signature": "sig_gemini"}},
+            }],
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("describe the screenshot"),
+            ChatMessage::assistant(envelope),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": "done",
+                    "tool_call_id": "toolu_1",
+                })
+                .to_string(),
+            ),
+        ];
+        let sanitized = crate::multimodal::sanitize_image_markers(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&sanitized, CacheTtl::default());
+        let assistant = native_msgs
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant message survives conversion");
+        match &assistant.content[0] {
+            NativeContentOut::Thinking {
+                thinking,
+                signature,
+            } => {
+                assert_eq!(
+                    thinking, &thinking_text,
+                    "thinking text must replay byte-for-byte, marker included"
+                );
+                assert_eq!(
+                    signature,
+                    &Some("sig_abc".to_string()),
+                    "the thinking signature must round-trip unchanged"
+                );
+            }
+            other => panic!("expected a leading thinking block, got {other:?}"),
+        }
+        match &assistant.content[1] {
+            NativeContentOut::Text { text, .. } => {
+                assert!(
+                    text.contains(crate::multimodal::MEDIA_PLACEHOLDER),
+                    "the content marker must be replaced with the placeholder: {text}"
+                );
+                assert!(
+                    !text.contains("/tmp/shot.png"),
+                    "no raw path may reach the provider as visible text: {text}"
+                );
+            }
+            other => panic!("expected a text block after the thinking block, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -6325,6 +6772,52 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
+    /// An oversized local-path marker in a tool result is refused with the
+    /// fixed note, never forwarded as raw text.
+    #[test]
+    fn oversized_local_tool_result_marker_is_refused_not_forwarded() {
+        for (label, marker) in [
+            (
+                "terminated",
+                format!(
+                    "[IMAGE:/tmp/{}.png]",
+                    "A".repeat(crate::multimodal::MAX_IMAGE_MARKER_BYTES + 1)
+                ),
+            ),
+            (
+                "unterminated",
+                format!(
+                    "[IMAGE:/tmp/{}",
+                    "A".repeat(crate::multimodal::MAX_IMAGE_MARKER_BYTES + 1)
+                ),
+            ),
+        ] {
+            let messages = history_with_tool_result(&format!("screenshot {marker}"));
+
+            let (_, native_msgs) =
+                AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
+            let tool_result = first_tool_result_on_the_wire(&native_msgs);
+
+            let text = tool_result["content"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{label}: expected plain text content: {tool_result}"));
+            assert!(
+                text.contains("screenshot"),
+                "{label}: prose must survive: {text}"
+            );
+            assert!(
+                text.contains("[image omitted: image marker exceeds safety limit]"),
+                "{label}: the refusal note must replace the oversized marker: {text}"
+            );
+
+            let wire = serde_json::to_string(&native_msgs).expect("serialize");
+            assert!(
+                !wire.contains("AAAA"),
+                "{label}: the raw oversized body must not reach the wire"
+            );
+        }
+    }
+
     /// A tool result whose content is a block list still takes the conversation
     /// cache breakpoint.
     ///
@@ -6356,6 +6849,57 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(
             tool_result["cache_control"]["type"], "ephemeral",
             "block-list content must not cost the request its cache breakpoint: {tool_result}"
+        );
+    }
+
+    /// A user turn that carries an attachment keeps its rolling breakpoint:
+    /// the marker lands on the turn's text block, the image block stays
+    /// unmarked, and the message list holds exactly one breakpoint.
+    #[test]
+    fn image_carrying_user_turn_keeps_rolling_breakpoint_on_text() {
+        let messages = vec![
+            ChatMessage::system("You look at pictures."),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+        ];
+
+        let (_, mut native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
+        assert!(
+            AnthropicModelProvider::should_cache_conversation(&messages),
+            "this history must be long enough to be cached, or the test is vacuous"
+        );
+        AnthropicModelProvider::apply_cache_to_last_message(&mut native_msgs, CacheTtl::default());
+
+        let wire = serde_json::to_value(&native_msgs).expect("serialize native messages");
+        let last = wire
+            .as_array()
+            .and_then(|on_wire| on_wire.last())
+            .expect("a last message");
+        let blocks = last["content"].as_array().expect("content blocks");
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .expect("a text block in the image turn");
+        assert_eq!(
+            text["cache_control"]["type"], "ephemeral",
+            "the image turn's text block must carry the rolling breakpoint: {last}"
+        );
+        let image = blocks
+            .iter()
+            .find(|block| block["type"] == "image")
+            .expect("an image block in the image turn");
+        assert!(
+            image.get("cache_control").is_none(),
+            "the image block must not carry a cache marker: {last}"
+        );
+        assert_eq!(
+            wire.to_string().matches("cache_control").count(),
+            1,
+            "exactly one rolling breakpoint in the message list: {wire}"
         );
     }
 
@@ -7951,14 +8495,15 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// No converted message ends on an `image` block, whatever the user arm was
     /// given.
     ///
-    /// `apply_cache_to_last_message` is a silent no-op on an `image` block, so a
-    /// message ending on one costs the request its conversation cache breakpoint
-    /// with nothing reporting it. Four fallback tests used to assert this as a
-    /// trailing detail, but each built its image through a path that no longer
-    /// exists: the ambiguous carrier and the demoted duplicate both stopped
-    /// emitting top-level blocks. The user arm is now the only place an `image`
-    /// block reaches top-level content, so the invariant is stated once, here,
-    /// against it.
+    /// The user arm pushes a turn's images first and its prose, or the `[image]`
+    /// placeholder, last, so the turn holds a block `apply_cache_to_last_message`
+    /// can mark and the rolling breakpoint stays on the latest message rather
+    /// than rolling back to an earlier one. Four fallback tests used to assert
+    /// this as a trailing detail, but each built its image through a path that
+    /// no longer exists: the ambiguous carrier and the demoted duplicate both
+    /// stopped emitting top-level blocks. The user arm is now the only place an
+    /// `image` block reaches top-level content, so the invariant is stated once,
+    /// here, against it.
     ///
     /// The blank-prose case pins a dependency across the two modules. `[image]`
     /// stands in only when the text is exactly empty, and a real text block is
@@ -8033,13 +8578,20 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn prepared_local_image_reaches_the_wire_as_a_nested_block() {
         let temp = tempfile::tempdir().expect("temp dir");
         let image_path = temp.path().join("screenshot.png");
-        // A PNG signature is enough for MIME detection, and its 12-character
-        // base64 is canonical.
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .expect("write png");
+        // A real 1x1 PNG, not a bare signature. Preparation decodes pixels to
+        // reject corrupt images, so a signature-only file would be dropped.
+        let png_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 0, 0, 255]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buf.into_inner()
+        };
+        std::fs::write(&image_path, &png_bytes).expect("write png");
 
         let messages = vec![
             ChatMessage::user("take a screenshot"),
@@ -8095,7 +8647,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .expect("payload must be decodable base64"),
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            png_bytes,
             "the bytes written to disk must be the bytes on the wire"
         );
 
@@ -9272,6 +9824,142 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
         assert_eq!(refusal.to_string(), ANTHROPIC_REFUSAL_MESSAGE);
     }
 
+    /// A streaming request to a closed local port fails at connect on the
+    /// first hop: the adapter must tag the transport failure as
+    /// `ConnectFailed` so Reliable can retry the entry.
+    #[tokio::test]
+    async fn connect_failed_tagged_on_connect_failure_to_closed_port() {
+        use futures_util::StreamExt;
+
+        // Take a port and drop the listener: nothing is listening there.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("closed-port stream must fail immediately");
+        match first.expect("closed-port stream must yield an item") {
+            Err(StreamError::ConnectFailed(message)) => {
+                assert!(
+                    message.contains("error sending request"),
+                    "the transport chain must stay in the message: {message}"
+                );
+            }
+            Err(other) => panic!("connect failure must be tagged ConnectFailed, got {other:?}"),
+            Ok(_) => panic!("a closed port cannot produce stream events"),
+        }
+    }
+
+    /// B1's counterexample at the adapter boundary: an accepted HTTP 200
+    /// stream whose SSE error frame says `failed to resolve backend` is a
+    /// provider-side error, never `ConnectFailed`, so error text cannot
+    /// purchase the connect-failed recovery grant.
+    #[tokio::test]
+    async fn connect_failed_not_tagged_on_sse_error_frame_after_accepted_response() {
+        use futures_util::StreamExt;
+
+        const SSE: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":100}}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"failed to resolve backend\"}}\n\n"
+        );
+        let (addr, server) = spawn_messages_sse_server(SSE).await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let mut saw_error = None;
+        while let Some(item) = stream.next().await {
+            if let Err(err) = item {
+                saw_error = Some(err);
+                break;
+            }
+        }
+        server.abort();
+        match saw_error.expect("the SSE error frame must surface an error") {
+            StreamError::ModelProvider(message) => {
+                assert!(
+                    message.contains("failed to resolve backend"),
+                    "the frame text must stay in the message: {message}"
+                );
+            }
+            other => panic!(
+                "an accepted stream's error frame must not be tagged ConnectFailed, got {other:?}"
+            ),
+        }
+    }
+
+    /// The redirect limit documented on `StreamError::ConnectFailed`: a
+    /// client that follows redirects may already have delivered an earlier
+    /// hop. A local gateway accepts the POST and answers 303 See Other
+    /// pointing at a closed local port; the follow-up GET fails at
+    /// connect, and the adapter still tags the error `ConnectFailed`, so
+    /// the tag alone is not proof that nothing was delivered.
+    #[tokio::test]
+    async fn connect_failed_on_redirect_hop_is_tagged_known_limit() {
+        use futures_util::StreamExt;
+
+        // The redirect target: a port with nothing listening.
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        // The first hop: accepts the POST, answers 303 See Other.
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                axum::response::Redirect::to(&format!("http://{closed_addr}/v1/messages"))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("the redirect-following stream must fail");
+        match first.expect("the redirect stream must yield an item") {
+            Err(StreamError::ConnectFailed(message)) => {
+                assert!(
+                    message.contains("error sending request"),
+                    "the transport chain must stay in the message: {message}"
+                );
+            }
+            Err(other) => panic!(
+                "a connect failure on the redirect hop must still be tagged ConnectFailed, got {other:?}"
+            ),
+            Ok(_) => panic!("a closed redirect target cannot produce stream events"),
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn unwrapped_anthropic_refusal_recovery_bills_exactly_one_attempt() {
         use futures_util::StreamExt;
@@ -9956,5 +10644,152 @@ data: {\"type\":\"message_stop\"}\n\n";
             serde_json::from_str(&reasoning).expect("reasoning_content line must be a JSON object");
         assert_eq!(parsed["thinking"], "");
         assert_eq!(parsed["signature"], "sigX");
+    }
+
+    /// Remove every `cache_control` key at any depth. The rolling cache
+    /// breakpoint moves to the newest message by design, so eviction
+    /// stability is asserted with every breakpoint stripped: everything
+    /// else must stay byte-identical across requests.
+    fn strip_cache_control(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove("cache_control");
+                for child in map.values_mut() {
+                    strip_cache_control(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items.iter_mut() {
+                    strip_cache_control(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Eviction stability must survive the Anthropic request converter, not
+    /// just prepared-message equality. The same fixture as the multimodal
+    /// contract test (four user images, a fifth image, then an image-free
+    /// user turn; `max_images: 4`, `max_image_turns: 0`) goes through the
+    /// production conversion sequence of `chat`: prepare, convert, then the
+    /// rolling cache breakpoint. The breakpoint moves by design; everything
+    /// else must not.
+    #[tokio::test]
+    async fn image_cap_eviction_keeps_prior_native_messages_identical() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // A real PNG: preparation decodes pixels and drops corrupt images.
+        let png_data = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 0, 0, 255]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buf.into_inner()
+        };
+        let config = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let img = |i: usize| {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, &png_data).unwrap();
+            p
+        };
+        // Four image turns (one image-only, three with captions), each answered.
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..4 {
+            let content = if i == 1 {
+                format!("[IMAGE:{}]", img(i).display())
+            } else {
+                format!("[IMAGE:{}]\ncaption {i}", img(i).display())
+            };
+            history.push(ChatMessage::user(content));
+            history.push(ChatMessage::assistant(format!("saw {i}")));
+        }
+
+        // The conversion sequence of `chat`, mirrored: prepare, convert,
+        // then the rolling breakpoint on a long conversation.
+        async fn convert_stripped(
+            messages: &[ChatMessage],
+            config: &zeroclaw_config::schema::MultimodalConfig,
+        ) -> Vec<String> {
+            let prepared = crate::multimodal::prepare_messages_for_provider(messages, config)
+                .await
+                .expect("preparation must succeed");
+            let (_, mut native) =
+                AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+            if AnthropicModelProvider::should_cache_conversation(&prepared.messages) {
+                AnthropicModelProvider::apply_cache_to_last_message(
+                    &mut native,
+                    CacheTtl::default(),
+                );
+            }
+            native
+                .iter()
+                .map(|message| {
+                    let mut value =
+                        serde_json::to_value(message).expect("serialize native message");
+                    strip_cache_control(&mut value);
+                    value.to_string()
+                })
+                .collect()
+        }
+
+        let p0 = convert_stripped(&history, &config).await;
+
+        // Fifth image arrives: the oldest image message loses its image.
+        history.push(ChatMessage::user(format!(
+            "[IMAGE:{}]\ncaption 4",
+            img(4).display()
+        )));
+        let p1 = convert_stripped(&history, &config).await;
+        // The fixtures must reach the wire as image blocks; otherwise the
+        // stability assertions below hold with no image in play.
+        let image_blocks = |messages: &[String]| {
+            messages
+                .iter()
+                .map(|m| m.matches("\"type\":\"image\"").count())
+                .sum::<usize>()
+        };
+        assert_eq!(image_blocks(&p0), 4, "all four fixtures reach the wire");
+        assert_eq!(
+            image_blocks(&p1),
+            4,
+            "the cap keeps exactly four image blocks"
+        );
+
+        // Image-free follow-up.
+        history.push(ChatMessage::assistant("saw 4"));
+        history.push(ChatMessage::user("no image this time"));
+        let p2 = convert_stripped(&history, &config).await;
+
+        // Every pre-existing serialized native message stays byte-identical
+        // on the image-free follow-up, breakpoints aside.
+        assert_eq!(
+            &p2[..p1.len()],
+            p1.as_slice(),
+            "the image-free follow-up must not change any prior native message"
+        );
+
+        // Exactly one message differs from before the fifth image: the
+        // position holding the oldest image, the first user message.
+        let changed: Vec<usize> = p0
+            .iter()
+            .zip(p1.iter())
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            changed,
+            vec![0],
+            "the fifth image must rewrite only the oldest image message"
+        );
     }
 }

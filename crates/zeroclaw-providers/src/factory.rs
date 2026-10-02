@@ -300,6 +300,9 @@ pub fn apply_compat_options(
     if let Some(ref effort) = opts.reasoning_effort {
         b = b.reasoning_effort(Some(effort.clone()));
     }
+    if opts.reasoning_effort_passthrough {
+        b = b.with_reasoning_effort_passthrough();
+    }
     if !opts.extra_headers.is_empty() {
         b = b.extra_headers(opts.extra_headers.clone());
     }
@@ -313,10 +316,16 @@ pub fn apply_compat_options(
         b = b.tls_ca_cert_path(cert_path);
     }
     b = b.tool_result_image_policy(opts.tool_result_image_policy);
-    b = b.multimodal(opts.multimodal.clone());
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
+    if opts.thinking_passthrough {
+        b = b.with_thinking_passthrough();
+    }
+    // The configured `[multimodal]` policy. Without this the provider boundary
+    // would re-normalize already-prepared messages under defaults and could
+    // trim images the runtime had accepted under the operator's settings.
+    b = b.multimodal(opts.multimodal.clone());
     if opts.cache_passthrough {
         b = b.with_cache_passthrough();
     }
@@ -2412,6 +2421,12 @@ mod tests {
     fn grok_cli_factory_enables_explicit_vision_override() {
         let working_directory = tempfile::tempdir().expect("temporary working directory");
         let config = GrokCliModelProviderConfig {
+            binary_path: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
             working_directory: working_directory.path().display().to_string(),
             ..Default::default()
         };

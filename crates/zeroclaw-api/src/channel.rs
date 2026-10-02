@@ -476,6 +476,44 @@ pub struct SendMessage {
     pub force_voice: bool,
 }
 
+/// A native poll to post in a chat.
+///
+/// Channels that cannot post one report [`Channel::supports_native_polls`] as
+/// `false`, and callers fall back to whatever they did before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollRequest {
+    /// Chat or peer to post the poll in, in the channel's own addressing.
+    pub recipient: String,
+    pub question: String,
+    /// Answer options, in the order they should be shown.
+    pub options: Vec<String>,
+    /// How many options one voter may pick. `1` is a single-choice poll.
+    pub selectable_count: u32,
+}
+
+impl PollRequest {
+    /// Single-choice poll. Use [`PollRequest::with_selectable_count`] for a
+    /// poll that accepts more than one answer per voter.
+    pub fn new(
+        recipient: impl Into<String>,
+        question: impl Into<String>,
+        options: Vec<String>,
+    ) -> Self {
+        Self {
+            recipient: recipient.into(),
+            question: question.into(),
+            options,
+            selectable_count: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn with_selectable_count(mut self, selectable_count: u32) -> Self {
+        self.selectable_count = selectable_count;
+        self
+    }
+}
+
 /// Cross-channel room visibility used by room-management APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -854,6 +892,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
 
+    /// Receive the supervisor lifecycle token before `listen()` is called.
+    /// Channels that internally wait for shutdown can subscribe instead of
+    /// independently catching SIGINT.
+    fn set_cancel_token(&self, _token: CancellationToken) {}
+
+    /// Whether this channel participates in the cooperative cancellation
+    /// contract via `set_cancel_token`. Only participating channels get
+    /// a bounded grace period for cleanup after cancellation.
+    fn uses_cancel_token(&self) -> bool {
+        false
+    }
+
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
@@ -984,6 +1034,13 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether this channel can post a native poll through [`Channel::send_poll`].
+    /// Callers check this before offering one, so a channel without native
+    /// polls keeps whatever fallback the caller already had.
+    fn supports_native_polls(&self) -> bool {
+        false
+    }
+
     /// Whether `send` actually delivers a message OUTBOUND on this channel. Default
     /// `true`. An INBOUND-ONLY transport (e.g. an AMQP trigger source whose `send` is a
     /// deliberate no-op that returns `Ok`) overrides this to `false`, so a surface that
@@ -1073,6 +1130,20 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// completed agent turns).
     fn multi_message_delay_ms(&self) -> u64 {
         800
+    }
+
+    /// Confirmed-delivery byte offset for a MultiMessage draft: how many bytes
+    /// of the cumulative visible text previously handed to `update_draft` have
+    /// already been emitted on the transport as paragraph messages (including
+    /// their trailing `\n\n` delimiters).
+    ///
+    /// The orchestrator reads this before `finalize_draft` so it can reconcile
+    /// a sanitized final response against the paragraphs that are already on
+    /// the wire without stranding or replaying content. Channels that do not
+    /// support multi-message streaming keep the default of `0` (nothing
+    /// confirmed).
+    async fn multi_message_confirmed_offset(&self, _recipient: &str, _message_id: &str) -> usize {
+        0
     }
 
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
@@ -1243,6 +1314,11 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("channel does not support room creation")
     }
 
+    /// Post a native poll when the channel supports it.
+    async fn send_poll(&self, _poll: &PollRequest) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support native polls")
+    }
+
     /// Invite a user to an existing platform room/conversation.
     async fn invite_user(&self, _room_id: &str, _user_id: &str) -> anyhow::Result<()> {
         anyhow::bail!("channel does not support room invites")
@@ -1297,6 +1373,31 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
             .request_approval(recipient, request)
             .await?
             .map(AttributedApprovalResponse::operator))
+    }
+
+    /// Request an attributed approval using a caller-owned response budget.
+    ///
+    /// The default keeps the existing caller-side timeout semantics. Channels
+    /// with a claim-aware deadline handoff may override this so their pending
+    /// decision and any bounded resolution grace share one deadline owner.
+    async fn request_approval_attributed_with_timeout(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        match tokio::time::timeout(
+            timeout,
+            self.request_approval_attributed(recipient, request),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(Some(AttributedApprovalResponse::from_runtime(
+                ChannelApprovalResponse::Deny,
+                ApprovalSource::TimedOut,
+            ))),
+        }
     }
 
     /// Present a long-lived, out-of-band gate prompt (e.g. a parked SOP
