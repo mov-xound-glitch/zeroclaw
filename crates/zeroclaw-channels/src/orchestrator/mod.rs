@@ -3977,9 +3977,12 @@ fn channel_history_cap(ctx: &ChannelRuntimeContext) -> usize {
 /// serialized write, so no concurrent turn lands between its messages.
 ///
 /// Unlike [`append_sender_turn`], a failed durable write is an error: the
-/// caller records whether the exchange was persisted. Messages written
-/// before a failure stay in both the store and the cache, so the two never
-/// disagree.
+/// caller records whether the exchange was persisted. The exchange lands
+/// whole or not at all: when the store rejects a message part-way, the
+/// messages it had already accepted are taken back, under the same lock,
+/// before anything reaches the cache. If even that fails, what the store
+/// kept is mirrored into the cache, so the two never disagree, and the error
+/// says how much of the exchange stayed behind.
 fn append_bound_exchange(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
@@ -3992,34 +3995,46 @@ fn append_bound_exchange(
         anyhow::bail!("conversation history exists but could not be verified");
     }
 
-    let mut written = 0;
+    let mut kept = messages.len();
     let mut failure = None;
     if let Some(ref store) = ctx.session_store {
+        kept = 0;
         for message in messages {
             if let Err(e) = store.append(sender_key, message) {
                 failure = Some(e);
                 break;
             }
-            written += 1;
+            kept += 1;
         }
-    } else {
-        written = messages.len();
+        if failure.is_some() {
+            // The persist lock is held, so the rows just written are still
+            // the last ones of this history.
+            while kept > 0 && matches!(store.remove_last(sender_key), Ok(true)) {
+                kept -= 1;
+            }
+        }
     }
 
-    let max_history = channel_history_cap(ctx);
-    let mut histories = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
-    turns.extend(messages[..written].iter().cloned());
-    while turns.len() > max_history {
-        turns.remove(0);
+    if kept > 0 {
+        let max_history = channel_history_cap(ctx);
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
+        turns.extend(messages[..kept].iter().cloned());
+        while turns.len() > max_history {
+            turns.remove(0);
+        }
     }
-    drop(histories);
 
     match failure {
-        Some(e) => Err(anyhow::Error::new(e).context("failed to persist bound exchange")),
+        Some(e) if kept == 0 => {
+            Err(anyhow::Error::new(e).context("failed to persist bound exchange; nothing kept"))
+        }
+        Some(e) => Err(anyhow::Error::new(e).context(format!(
+            "failed to persist bound exchange; its first {kept} message(s) could not be taken back"
+        ))),
         None => Ok(()),
     }
 }
@@ -4056,27 +4071,18 @@ impl zeroclaw_api::conversation_binding::ConversationBindingOwner for ChannelCon
         binding: &zeroclaw_api::conversation_binding::ConversationBinding,
     ) -> anyhow::Result<Vec<ChatMessage>> {
         let key = self.served_key(binding)?;
-        // Same lock, same hydrate-on-miss as an append: hydration can write
-        // to the store (orphan closure, cap rewrite), so it must not race a
-        // channel turn's own append.
+        // The lock every writer of this history takes, so the read is of one
+        // consistent state.
         let persist_lock = acquire_persist_lock(&self.ctx, key);
         let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if !hydrate_sender_history_if_missing(&self.ctx, key) {
-            anyhow::bail!("conversation history exists but could not be verified");
-        }
 
-        let mut turns = self
+        let cached = self
             .ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .peek(key)
-            .cloned()
-            .unwrap_or_default();
-        // A trim breadcrumb is this cache's own bookkeeping, recorded beside
-        // it rather than inferred from text. The reader receives no such
-        // record, so it must not receive the breadcrumb as if it were a turn.
-        // Both the record and the text must agree before anything is dropped.
+            .cloned();
         let recorded = self
             .ctx
             .history_crumb_flags
@@ -4084,9 +4090,36 @@ impl zeroclaw_api::conversation_binding::ConversationBindingOwner for ChannelCon
             .unwrap_or_else(|e| e.into_inner())
             .peek(key)
             .copied();
-        let crumb_recorded = match recorded {
-            Some(flag) => flag,
-            None => resolve_cold_crumb_provenance(self.ctx.session_store.as_deref(), key, &turns),
+        // A trim breadcrumb is the history's own bookkeeping, recorded beside
+        // it rather than inferred from text. The reader receives no such
+        // record, so it must not receive the breadcrumb as if it were a turn.
+        // Both the record and the text must agree before anything is dropped.
+        let (mut turns, crumb_recorded) = match (cached, self.ctx.session_store.as_deref()) {
+            (Some(turns), store) => {
+                let crumb_recorded =
+                    recorded.unwrap_or_else(|| resolve_cold_crumb_provenance(store, key, &turns));
+                (turns, crumb_recorded)
+            }
+            // Not in the cache: read the durable transcript as it stands.
+            // Reloading it into the cache is a writer's job, because that
+            // reconciliation can itself write (it closes a transcript that
+            // ends unanswered, and persists a cap). A reader must leave the
+            // conversation exactly as it found it.
+            (None, Some(store)) => {
+                let mut turns = store
+                    .try_load(key)
+                    .map_err(|_| anyhow::Error::msg("conversation history could not be read"))?;
+                let crumb_recorded = resolve_cold_crumb_provenance_result(Some(store), key, &turns)
+                    .map_err(|()| {
+                        anyhow::Error::msg("conversation history could not be verified")
+                    })?;
+                let cap = channel_history_cap(&self.ctx);
+                if turns.len() > cap {
+                    turns.drain(..turns.len() - cap);
+                }
+                (turns, crumb_recorded)
+            }
+            (None, None) => (Vec::new(), false),
         };
         let leads_with_crumb = turns.first().is_some_and(|first| {
             first.role == "user"
@@ -19612,17 +19645,19 @@ fn bound_load_reports_an_unverifiable_history() {
     );
 }
 
-/// A durable write that fails part-way is reported, and the cache keeps
-/// exactly what the store accepted.
+/// An exchange lands whole or not at all. When the store rejects its second
+/// message, the first is taken back; when even that is impossible, the cache
+/// keeps exactly what the store kept. Either way the failure is reported.
 #[cfg(test)]
 #[test]
-fn bound_exchange_reports_a_failed_durable_write() {
+fn bound_exchange_that_fails_part_way_is_taken_back() {
     use std::sync::Mutex as StdMutex;
     use zeroclaw_infra::session_backend::SessionBackend;
     use zeroclaw_providers::ChatMessage;
 
     struct SecondAppendFails {
         messages: StdMutex<Vec<ChatMessage>>,
+        can_take_back: bool,
     }
     impl SessionBackend for SecondAppendFails {
         fn load(&self, _key: &str) -> Vec<ChatMessage> {
@@ -19637,7 +19672,10 @@ fn bound_exchange_reports_a_failed_durable_write() {
             Ok(())
         }
         fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
-            Ok(false)
+            if !self.can_take_back {
+                return Err(std::io::Error::other("simulated durable delete failure"));
+            }
+            Ok(self.messages.lock().unwrap().pop().is_some())
         }
         fn list_sessions(&self) -> Vec<String> {
             Vec::new()
@@ -19647,33 +19685,104 @@ fn bound_exchange_reports_a_failed_durable_write() {
         }
     }
 
-    let backend = Arc::new(SecondAppendFails {
-        messages: StdMutex::new(Vec::new()),
-    });
+    for (can_take_back, left_behind) in [(true, 0), (false, 1)] {
+        let backend = Arc::new(SecondAppendFails {
+            messages: StdMutex::new(Vec::new()),
+            can_take_back,
+        });
+        let ctx = test_channel_ctx_with_backend(backend.clone());
+        let sender = "bound_exchange_failure_key";
+
+        let result = append_bound_exchange(
+            ctx.as_ref(),
+            sender,
+            &[
+                ChatMessage::user("[cron:job-1 reminder] Remind me"),
+                ChatMessage::assistant("Reminder sent."),
+            ],
+        );
+        assert!(result.is_err(), "a failed durable write must be reported");
+
+        let durable = backend.load(sender);
+        let cached = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(durable.len(), left_behind, "can_take_back={can_take_back}");
+        assert_eq!(cached.len(), left_behind, "can_take_back={can_take_back}");
+        assert_eq!(
+            cached.first().map(|m| m.content.as_str()),
+            durable.first().map(|m| m.content.as_str())
+        );
+    }
+}
+
+/// Reading a history that is not in the cache changes nothing: the durable
+/// transcript is not closed, capped or rewritten, and nothing is installed
+/// in the cache. An unanswered last message is handed over as it is.
+#[cfg(test)]
+#[test]
+fn bound_load_of_an_uncached_history_writes_nothing() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_load_cold_read_key".to_string();
+    for message in [
+        ChatMessage::user("summarise this room at six"),
+        ChatMessage::assistant("Scheduled."),
+        ChatMessage::user("the release is on Friday"),
+    ] {
+        backend.append(&sender, &message).expect("seed append");
+    }
     let ctx = test_channel_ctx_with_backend(backend.clone());
-    let sender = "bound_exchange_failure_key";
+    let owner = test_conversation_owner(&ctx);
 
-    let result = append_bound_exchange(
-        ctx.as_ref(),
-        sender,
-        &[
-            ChatMessage::user("[cron:job-1 reminder] Remind me"),
-            ChatMessage::assistant("Reminder sent."),
-        ],
+    let loaded: Vec<(String, String)> = owner
+        .load(&test_conversation_binding(&sender))
+        .expect("load")
+        .into_iter()
+        .map(|m| (m.role, m.content))
+        .collect();
+
+    assert_eq!(
+        loaded,
+        vec![
+            ("user".to_string(), "summarise this room at six".to_string()),
+            ("assistant".to_string(), "Scheduled.".to_string()),
+            ("user".to_string(), "the release is on Friday".to_string()),
+        ]
     );
-    assert!(result.is_err(), "a failed durable write must be reported");
-
-    let durable = backend.load(sender);
-    let cached = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .peek(sender)
-        .cloned()
-        .unwrap_or_default();
-    assert_eq!(durable.len(), 1);
-    assert_eq!(cached.len(), 1);
-    assert_eq!(cached[0].content, durable[0].content);
+    let durable: Vec<String> = backend
+        .load(&sender)
+        .into_iter()
+        .map(|m| m.content)
+        .collect();
+    assert_eq!(
+        durable,
+        [
+            "summarise this room at six",
+            "Scheduled.",
+            "the release is on Friday"
+        ],
+        "a read must not close or rewrite the transcript"
+    );
+    assert!(
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .is_none(),
+        "a read must not install the history in the cache"
+    );
 }
 
 /// A bounded cache (`max_history_messages`) evicts from the front, so a
