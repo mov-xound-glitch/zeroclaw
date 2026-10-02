@@ -215,6 +215,79 @@ fn websocket_ping_interval(
     Some(interval)
 }
 
+/// Close code for "this endpoint is going away" (RFC 6455, 1001): the peer
+/// did nothing wrong and should connect again.
+const WS_CLOSE_GOING_AWAY: u16 = 1001;
+
+/// How long a closing socket waits for the peer's own close frame.
+const WS_CLOSE_HANDSHAKE_GRACE: Duration = Duration::from_secs(2);
+
+/// End a chat socket that can no longer run a turn, so the client connects
+/// again. A socket is admitted under one gateway instance and one agent
+/// lifecycle generation; once either is retired it could only answer every
+/// message with a refusal, and clients reconnect on a close, not on an error
+/// frame. The peer's close is awaited briefly: dropping the socket straight
+/// after sending can reset the connection and lose the frame.
+async fn close_for_reconnect<S, R>(sender: &mut S, receiver: &mut R, reason: &'static str)
+where
+    S: futures_util::Sink<Message> + Unpin,
+    R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
+{
+    let close = Message::Close(Some(axum::extract::ws::CloseFrame {
+        code: WS_CLOSE_GOING_AWAY,
+        reason: axum::extract::ws::Utf8Bytes::from_static(reason),
+    }));
+    if sender.send(close).await.is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(WS_CLOSE_HANDSHAKE_GRACE, async {
+        while let Some(Ok(frame)) = receiver.next().await {
+            if matches!(frame, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
+/// Answer a turn the agent lifecycle did not admit. Returns `true` when the
+/// socket was closed as well: a retired or replaced generation never admits
+/// this socket again, whereas a delete in progress may still be refused, so
+/// that case keeps the socket.
+async fn refuse_unadmitted_turn<S, R>(
+    sender: &mut S,
+    receiver: &mut R,
+    error: &zeroclaw_runtime::live_config_authority::AgentAdmissionError,
+) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+    R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
+{
+    use zeroclaw_runtime::live_config_authority::AgentAdmissionError;
+
+    let err = serde_json::json!({
+        "type": "error",
+        "message": error.to_string(),
+        "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+    });
+    let _ = sender.send(Message::Text(err.to_string().into())).await;
+    if matches!(error, AgentAdmissionError::Deleting { .. }) {
+        return false;
+    }
+    close_for_reconnect(sender, receiver, "agent lifecycle changed").await;
+    true
+}
+
+/// Resolves when this gateway instance is told to stop. Like the listener, it
+/// waits for a new signal rather than reading the current value: the channel
+/// outlives one gateway instance, so a value left by an earlier stop says
+/// nothing about this one. Never resolves if the signal can no longer arrive.
+async fn gateway_stop_signal(stopping: &mut tokio::sync::watch::Receiver<bool>) {
+    if stopping.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn tick_websocket_ping(interval: &mut Option<tokio::time::Interval>) {
     if let Some(interval) = interval.as_mut() {
         interval.tick().await;
@@ -387,6 +460,10 @@ async fn handle_socket(
     auth_subject: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
+    // An upgraded socket outlives the listener it arrived on, so a reload or
+    // stop of this gateway instance has to end it here. Subscribed before any
+    // setup awaits so a stop during setup is still seen.
+    let mut gateway_stopping = state.shutdown_tx.subscribe();
 
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -485,7 +562,14 @@ async fn handle_socket(
 
     loop {
         let first = tokio::select! {
+            // A frame that has already arrived is answered before the socket
+            // is closed for a stop.
+            biased;
             first = receiver.next() => first,
+            _ = gateway_stop_signal(&mut gateway_stopping) => {
+                close_for_reconnect(&mut sender, &mut receiver, "gateway restarting").await;
+                return;
+            }
             _ = tick_websocket_ping(&mut ping_interval) => {
                 if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
                     return;
@@ -545,12 +629,7 @@ async fn handle_socket(
         match state.agent_lifecycle.reserve_admission(agent_alias.clone()) {
             Ok(reservation) => reservation,
             Err(error) => {
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": error.to_string(),
-                    "code": "AGENT_LIFECYCLE_UNAVAILABLE"
-                });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await;
                 return;
             }
         };
@@ -719,12 +798,7 @@ async fn handle_socket(
                         match state.reserve_agent_turn_at(agent_alias.clone(), turn_generation) {
                             Ok(lease) => lease,
                             Err(error) => {
-                                let err = serde_json::json!({
-                                    "type": "error",
-                                    "message": error.to_string(),
-                                    "code": "AGENT_LIFECYCLE_UNAVAILABLE"
-                                });
-                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await;
                                 return;
                             }
                         };
@@ -785,6 +859,13 @@ async fn handle_socket(
 
     loop {
         tokio::select! {
+            // Polled in order, so the stop arm at the end runs only when no
+            // client frame or event is waiting: a message that has already
+            // arrived is answered rather than dropped with the socket. One
+            // still on the wire when the close goes out is not, and the
+            // client finds that out by reconnecting.
+            biased;
+
             // ── Keepalive ─────────────────────────────────────────────
             _ = tick_websocket_ping(&mut ping_interval) => {
                 if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
@@ -907,12 +988,9 @@ async fn handle_socket(
                 {
                     Ok(lease) => lease,
                     Err(error) => {
-                        let err = serde_json::json!({
-                            "type": "error",
-                            "message": error.to_string(),
-                            "code": "AGENT_LIFECYCLE_UNAVAILABLE"
-                        });
-                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        if refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await {
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -985,6 +1063,14 @@ async fn handle_socket(
                     }
                 };
                 let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            }
+
+            // ── Gateway instance stopping ─────────────────────────────
+            // Reached only between turns: a running turn is awaited inside
+            // the client-message arm and finishes first.
+            _ = gateway_stop_signal(&mut gateway_stopping) => {
+                close_for_reconnect(&mut sender, &mut receiver, "gateway restarting").await;
+                break;
             }
         }
     }
@@ -3448,6 +3534,193 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             "both turns persist in order without duplication: {turns:?}"
         );
         drop(second);
+        fixture.shutdown();
+    }
+
+    /// The next frame, expected to be the server's close frame.
+    async fn next_close_frame(client: &mut WsClient) -> (u16, String) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match client.next().await {
+                    Some(Ok(ClientMessage::Close(Some(frame)))) => {
+                        break (u16::from(frame.code), frame.reason.to_string());
+                    }
+                    Some(Ok(ClientMessage::Close(None))) => {
+                        panic!("the gateway must say why it closes the socket")
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("socket ended without a close frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("close frame deadline")
+    }
+
+    /// Run one turn on `client` to its `done` frame.
+    async fn run_turn_to_done(
+        fixture: &mut ParkedTurnFixture,
+        client: &mut WsClient,
+        content: &str,
+    ) {
+        fixture.start_parked_turn(client, content).await;
+        fixture.release_next();
+        loop {
+            if next_text_frame(client).await["type"] == "done" {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn idle_sockets_are_closed_for_reconnect_when_the_gateway_instance_stops() {
+        run_ws_regression(
+            "ws-stop-closes-idle",
+            idle_sockets_are_closed_for_reconnect_when_the_gateway_instance_stops_inner,
+        );
+    }
+
+    async fn idle_sockets_are_closed_for_reconnect_when_the_gateway_instance_stops_inner() {
+        let mut fixture = ParkedTurnFixture::spawn().await;
+
+        // One socket that has never sent a frame, and one that has finished a
+        // turn and is waiting for the next message. A reload leaves both
+        // attached to an instance that will never run another turn.
+        let (mut unused, _) = fixture.connect("stop-unused").await;
+        let (mut used, _) = fixture.connect("stop-used").await;
+        run_turn_to_done(&mut fixture, &mut used, "hello").await;
+
+        fixture
+            .state
+            .shutdown_tx
+            .send(true)
+            .expect("the chat sockets watch the stop signal");
+
+        for client in [&mut unused, &mut used] {
+            let (code, reason) = next_close_frame(client).await;
+            assert_eq!(code, WS_CLOSE_GOING_AWAY);
+            assert_eq!(reason, "gateway restarting");
+        }
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_stop_signal_lets_a_running_turn_finish_before_the_socket_closes() {
+        run_ws_regression(
+            "ws-stop-spares-turn",
+            a_stop_signal_lets_a_running_turn_finish_before_the_socket_closes_inner,
+        );
+    }
+
+    async fn a_stop_signal_lets_a_running_turn_finish_before_the_socket_closes_inner() {
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let (mut client, _) = fixture.connect("stop-mid-turn").await;
+        fixture.start_parked_turn(&mut client, "hello").await;
+
+        fixture
+            .state
+            .shutdown_tx
+            .send(true)
+            .expect("the chat socket watches the stop signal");
+
+        // While the turn is parked the socket must stay open.
+        let early = tokio::time::timeout(Duration::from_millis(400), async {
+            loop {
+                if let Some(Ok(ClientMessage::Close(_))) | None = client.next().await {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            early.is_err(),
+            "the socket closed while its turn was running"
+        );
+
+        fixture.release_next();
+        loop {
+            if next_text_frame(&mut client).await["type"] == "done" {
+                break;
+            }
+        }
+        let (code, reason) = next_close_frame(&mut client).await;
+        assert_eq!(code, WS_CLOSE_GOING_AWAY);
+        assert_eq!(reason, "gateway restarting");
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_stop_signal_from_before_the_connection_does_not_close_it() {
+        run_ws_regression(
+            "ws-stale-stop-signal",
+            a_stop_signal_from_before_the_connection_does_not_close_it_inner,
+        );
+    }
+
+    async fn a_stop_signal_from_before_the_connection_does_not_close_it_inner() {
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        // The signal's channel outlives one gateway instance: a supervisor
+        // that restarts the gateway hands the next instance a channel whose
+        // value is still `true`.
+        fixture.state.shutdown_tx.send_replace(true);
+
+        let (mut client, _) = fixture.connect("after-stale-stop").await;
+        run_turn_to_done(&mut fixture, &mut client, "hello").await;
+        run_turn_to_done(&mut fixture, &mut client, "and again").await;
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_socket_whose_lifecycle_generation_closed_is_refused_once_then_closed() {
+        run_ws_regression(
+            "ws-generation-closed",
+            a_socket_whose_lifecycle_generation_closed_is_refused_once_then_closed_inner,
+        );
+    }
+
+    async fn a_socket_whose_lifecycle_generation_closed_is_refused_once_then_closed_inner() {
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let (mut client, _) = fixture.connect("generation-closed").await;
+        run_turn_to_done(&mut fixture, &mut client, "hello").await;
+
+        // The generation is retired without the stop signal reaching the
+        // socket, so the refusal path is the one under test.
+        fixture.state.agent_lifecycle.close_generation();
+        send_chat(&mut client, "are you still there").await;
+
+        let refusal = next_text_frame(&mut client).await;
+        assert_eq!(refusal["code"], "AGENT_LIFECYCLE_UNAVAILABLE");
+        let (code, reason) = next_close_frame(&mut client).await;
+        assert_eq!(code, WS_CLOSE_GOING_AWAY);
+        assert_eq!(reason, "agent lifecycle changed");
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_delete_in_progress_refuses_the_turn_but_keeps_the_socket() {
+        run_ws_regression(
+            "ws-delete-in-progress",
+            a_delete_in_progress_refuses_the_turn_but_keeps_the_socket_inner,
+        );
+    }
+
+    async fn a_delete_in_progress_refuses_the_turn_but_keeps_the_socket_inner() {
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let (mut client, _) = fixture.connect("delete-in-progress").await;
+        run_turn_to_done(&mut fixture, &mut client, "hello").await;
+
+        let deleting = fixture
+            .state
+            .agent_lifecycle
+            .begin_delete("web")
+            .expect("an idle socket does not block a delete");
+        send_chat(&mut client, "during the delete").await;
+        let refusal = next_text_frame(&mut client).await;
+        assert_eq!(refusal["code"], "AGENT_LIFECYCLE_UNAVAILABLE");
+
+        // The delete was not committed, so the same socket runs the next turn.
+        drop(deleting);
+        run_turn_to_done(&mut fixture, &mut client, "after the delete was abandoned").await;
         fixture.shutdown();
     }
 
