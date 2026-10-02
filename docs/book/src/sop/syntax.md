@@ -52,6 +52,9 @@ while this SOP's execution slots are full:
 | `admission_policy` | `parallel` | How a trigger that cannot admit right now is handled (see below). |
 | `max_pending_approvals` | `0` (unlimited) | Upper bound on runs of this SOP parked at a HITL approval simultaneously. Past the bound, further triggers are deferred (backpressure), never silently dropped (except under `drop`). |
 
+An optional `[decision]` table lets a decision model gate each matched event
+and choose the run's execution mode. See [Decision models](./decision-models.md).
+
 `admission_policy` values (`SopAdmissionPolicy`, snake_case):
 
 - `parallel` (default) - admit up to `max_concurrent`; a trigger that cannot admit
@@ -196,6 +199,8 @@ Parser behavior:
 - `- prompt:` sets the approval-gate notice template.
 - `- policy:` names an approval-broker policy in `[sop.approval].policies`; the policy gates approval through required-group membership and quorum. An absent policy fails closed rather than clearing on a single approval, while omission leaves the gate unpoliced.
 - `- edit:` opts a checkpoint into editing the named field before resume.
+- `- decide:` makes the step a conditional part: a yes/no question the SOP's `[decision]` model answers about the triggering event when the run starts. The step runs only on yes; on no it is recorded as skipped and the run continues. If the model cannot answer, the step runs.
+- `- unless_decided: N` skips the step when step N's `decide` question was answered yes, so one decision can switch between alternative sets of steps.
 - Unrecognized sub-bullets and other non-empty continuation lines are appended to the step body.
 <!-- >>> end generated:sop-parser-behavior <<< -->
 

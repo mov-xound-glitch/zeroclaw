@@ -641,6 +641,7 @@ runtime_profile = "hinted"
                     observer: &observability::NoopObserver {},
                     silent: true,
                     approval: None,
+                    security: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                     config: spec.config,
                     hooks: None,
