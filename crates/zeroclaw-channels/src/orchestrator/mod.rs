@@ -29052,6 +29052,363 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// Plays the model in a channel conversation about a reminder: asks for
+    /// `cron_add` when the user wants one, for `cron_run` when the user wants
+    /// it run now, confirms once a tool has run, and otherwise answers
+    /// plainly. Records every request.
+    #[derive(Default)]
+    struct ReminderConversationProvider {
+        /// The scheduled job, once the test knows it, for `cron_run`.
+        job_id: std::sync::Mutex<Option<String>>,
+        requests: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ReminderConversationProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            let tool_call = |name: &str, arguments: serde_json::Value| {
+                format!(
+                    "<tool_call>\n{}\n</tool_call>",
+                    serde_json::json!({ "name": name, "arguments": arguments })
+                )
+            };
+            let mut user_messages = messages
+                .iter()
+                .rev()
+                .filter(|msg| msg.role == "user")
+                .map(|msg| msg.content.as_str());
+            let last_user = user_messages.next().unwrap_or_default();
+            if last_user.contains("[Tool results]") {
+                // The request that led to the tool call is the user message
+                // before the results.
+                let asked = user_messages.next().unwrap_or_default();
+                return Ok(if asked.contains("run it now") {
+                    "I ran it.".to_string()
+                } else {
+                    "Scheduled.".to_string()
+                });
+            }
+            if last_user.contains("remind me at five") {
+                return Ok(tool_call(
+                    "cron_add",
+                    serde_json::json!({
+                        "schedule": { "kind": "every", "every_ms": 2000 },
+                        "job_type": "agent",
+                        "name": "reminder",
+                        "prompt": "Remind me to call Sam",
+                        "session_target": "main",
+                        "uses_memory": false,
+                    }),
+                ));
+            }
+            if last_user.contains("run it now") {
+                let job_id = self.job_id.lock().unwrap().clone().unwrap_or_default();
+                return Ok(tool_call(
+                    "cron_run",
+                    serde_json::json!({ "job_id": job_id }),
+                ));
+            }
+            Ok("Yes, I reminded you.".to_string())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ReminderConversationProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ReminderConversationProvider"
+        }
+    }
+
+    /// The reported sequence end to end: a reminder is scheduled from a
+    /// channel conversation, the job runs with that conversation as context,
+    /// and the next message in the same conversation sees what the job said.
+    #[tokio::test]
+    async fn reminder_scheduled_from_a_channel_conversation_is_visible_to_its_next_turn() {
+        use axum::{Json, Router, routing::post};
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+            RuntimeProfileConfig,
+        };
+        use zeroclaw_infra::session_backend::SessionBackend;
+        use zeroclaw_infra::session_store::SessionStore;
+        use zeroclaw_runtime::cron;
+
+        const AGENT: &str = "reminder-sequence-agent";
+
+        // The model the scheduled job runs against.
+        let cron_requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let cron_requests_for_handler = Arc::clone(&cron_requests);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                cron_requests_for_handler.lock().unwrap().push(body);
+                async {
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "Reminder: call Sam."}}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.reliability.scheduler_retries = 0;
+        config.reliability.scheduler_poll_secs = 5;
+        config.risk_profiles.insert(
+            AGENT.to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                ..Default::default()
+            },
+        );
+        config
+            .runtime_profiles
+            .insert(AGENT.to_string(), RuntimeProfileConfig::default());
+        config.providers.models.ollama.insert(
+            "reminder".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("reminder-test-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{address}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            AGENT.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "ollama.reminder".into(),
+                risk_profile: AGENT.into(),
+                runtime_profile: AGENT.into(),
+                ..Default::default()
+            },
+        );
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let config = Arc::new(config);
+        let security = Arc::new(SecurityPolicy::for_agent(&config, AGENT).unwrap());
+
+        // The channel conversation, served by the same agent.
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SessionStore::new(&tmp.path().join("sessions")).expect("session store"));
+        let provider = Arc::new(ReminderConversationProvider::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut runtime_ctx = test_channel_ctx_with_backend_channel_and_provider(
+            backend.clone(),
+            channel,
+            provider.clone(),
+            0,
+        );
+        let tool_runtime: Arc<dyn zeroclaw_api::runtime_traits::RuntimeAdapter> = Arc::from(
+            zeroclaw_runtime::platform::create_runtime(&config.runtime).expect("default runtime"),
+        );
+        {
+            let ctx = Arc::get_mut(&mut runtime_ctx).expect("context not yet shared");
+            ctx.agent_alias = Arc::new(AGENT.to_string());
+            ctx.tools_registry = Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(zeroclaw_runtime::tools::CronAddTool::new_with_runtime(
+                        Arc::clone(&config),
+                        Arc::clone(&security),
+                        AGENT,
+                        Arc::clone(&tool_runtime),
+                    )),
+                    Box::new(zeroclaw_runtime::tools::CronRunTool::new_with_runtime(
+                        Arc::clone(&config),
+                        security,
+                        AGENT,
+                        tool_runtime,
+                    )),
+                ]),
+            );
+            ctx.approval_manager =
+                Arc::new(ApprovalManager::for_non_interactive(&RiskProfileConfig {
+                    level: AutonomyLevel::Full,
+                    ..Default::default()
+                }));
+        }
+        let _lease = zeroclaw_infra::conversation_owners::publish_conversation_owner(
+            zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+            AGENT,
+            Arc::new(test_conversation_owner(&runtime_ctx)),
+        );
+
+        // The scheduler is already running, as in a daemon. It gets its own
+        // thread and runtime: its future is too deeply nested for this
+        // crate's recursion limit to prove `Send`, and the conversation
+        // owner it resolves is process-wide either way.
+        let stop_scheduler = CancellationToken::new();
+        let scheduler = std::thread::spawn({
+            let config = (*config).clone();
+            let stop = stop_scheduler.clone();
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("scheduler runtime")
+                    .block_on(cron::scheduler::run(config, None, stop))
+            }
+        });
+
+        // Turn 1: the user asks for a reminder and the agent schedules it.
+        let mut ask = message_sent_hook_test_message();
+        ask.content = "remind me at five to call Sam".to_string();
+        process_channel_message(runtime_ctx.clone(), ask, CancellationToken::new()).await;
+
+        let jobs = cron::list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1, "the turn must have scheduled the reminder");
+        let job_id = jobs[0].id.clone();
+        *provider.job_id.lock().unwrap() = Some(job_id.clone());
+        assert_eq!(jobs[0].session_target, cron::SessionTarget::Main);
+        let cron_prompt = format!("[cron:{job_id} reminder] Remind me to call Sam");
+
+        // The reminder comes due and the scheduler runs it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let run = loop {
+            if let Some(run) = cron::list_runs(&config, &job_id, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+            {
+                break run;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scheduler never ran the reminder"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        stop_scheduler.cancel();
+        scheduler
+            .join()
+            .expect("scheduler thread")
+            .expect("scheduler stops cleanly");
+        assert_eq!(run.execution.as_deref(), Some("ok"), "{:?}", run.output);
+        assert_eq!(run.persistence.as_deref(), Some("persisted"));
+        let job_request = cron_requests.lock().unwrap()[0]["messages"].to_string();
+        assert!(
+            job_request.contains("remind me at five to call Sam")
+                && job_request.contains("Scheduled."),
+            "the job must run with the conversation it was created from: {job_request}"
+        );
+
+        // Turn 2: the user asks about it in the same conversation.
+        let mut follow_up = message_sent_hook_test_message();
+        follow_up.id = "msg-2".to_string();
+        follow_up.content = "did you remind me?".to_string();
+        let history_key = conversation_history_key(&follow_up);
+        process_channel_message(runtime_ctx.clone(), follow_up, CancellationToken::new()).await;
+
+        {
+            let requests = provider.requests.lock().unwrap();
+            let seen = requests.last().expect("the follow-up reached the model");
+            let position = |role: &str, needle: &str| {
+                seen.iter()
+                    .position(|msg| msg.role == role && msg.content.contains(needle))
+                    .unwrap_or_else(|| panic!("{role} message containing {needle:?} in {seen:?}"))
+            };
+            let ran = position("user", &cron_prompt);
+            let reminded = position("assistant", "Reminder: call Sam.");
+            let asked_again = position("user", "did you remind me?");
+            assert_eq!(reminded, ran + 1, "the run is one contiguous exchange");
+            assert!(reminded < asked_again);
+        }
+
+        // Turn 3: the user asks for the reminder to be run now. `cron_run`
+        // executes inside the turn, from the job's own conversation, so the
+        // run reads and writes the history the turn itself is in the middle
+        // of using.
+        let mut run_now = message_sent_hook_test_message();
+        run_now.id = "msg-3".to_string();
+        run_now.content = "run it now please".to_string();
+        process_channel_message(runtime_ctx.clone(), run_now, CancellationToken::new()).await;
+
+        assert!(
+            channel_impl
+                .sent_messages
+                .lock()
+                .await
+                .last()
+                .is_some_and(|reply| reply.contains("I ran it.")),
+            "the turn that ran the job must still complete"
+        );
+        let runs = cron::list_runs(&config, &job_id, 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].persistence.as_deref(), Some("persisted"));
+        let manual_request: Vec<(String, String)> = cron_requests.lock().unwrap()[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap_or_default().to_string(),
+                    m["content"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let (job_message, before) = manual_request.split_last().expect("a request");
+        assert!(
+            job_message.1.contains("run it now please") && job_message.1.contains(&cron_prompt),
+            "the job's message joins the turn in progress: {manual_request:?}"
+        );
+        assert_eq!(
+            before.last().map(|(role, _)| role.as_str()),
+            Some("assistant"),
+            "no two user messages in a row: {manual_request:?}"
+        );
+        assert!(
+            before
+                .iter()
+                .any(|(_, content)| content.contains("Yes, I reminded you.")),
+            "the run sees the conversation so far: {manual_request:?}"
+        );
+        // Both the manual run and the turn that started it are on record.
+        let durable = backend.load(&history_key);
+        let count = |needle: &str| {
+            durable
+                .iter()
+                .filter(|m| m.content.contains(needle))
+                .count()
+        };
+        assert_eq!(count(&cron_prompt), 2, "{durable:?}");
+        assert_eq!(count("I ran it."), 1, "{durable:?}");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
         let channel_impl = Arc::new(RecordingChannel::default());
