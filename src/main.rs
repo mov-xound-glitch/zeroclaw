@@ -6523,6 +6523,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             config.data_dir.display()
         );
     }
+    // This process has just become the data directory's only owner and has
+    // admitted nothing yet: any session turn still marked running belongs to
+    // a process that is gone. It happens once per process, so a reload does
+    // not repeat it.
+    #[cfg(feature = "agent-runtime")]
+    if let Some((_, ownership)) = daemon_ownership.as_ref() {
+        ownership.recover_abandoned_turns(&config.channels.session_backend);
+    }
     #[cfg(feature = "agent-runtime")]
     let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
         anyhow::ensure!(
@@ -6543,6 +6551,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             );
             anyhow::Error::msg("standalone ownership was not acquired")
         })?;
+        ownership.recover_abandoned_turns(&config.channels.session_backend);
         Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
             config.clone(),
             ownership,

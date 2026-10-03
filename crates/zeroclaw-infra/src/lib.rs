@@ -56,6 +56,23 @@ pub fn make_session_backend(
     }
 }
 
+/// Settle the turns a previous process left marked "running" in the session
+/// store under `workspace_dir`, and return how many there were. See
+/// [`SessionBackend::recover_abandoned_turns`] for who may call this and
+/// when.
+///
+/// Only the SQLite store tracks run state, so the JSONL backend has nothing
+/// to settle. The store is neither created nor migrated for this.
+pub fn recover_abandoned_session_turns(
+    workspace_dir: &Path,
+    backend: &str,
+) -> std::io::Result<usize> {
+    if backend == "jsonl" {
+        return Ok(0);
+    }
+    session_sqlite::SqliteSessionBackend::recover_abandoned_turns_at(workspace_dir)
+}
+
 fn open_sqlite_with_jsonl_import(
     workspace_dir: &Path,
 ) -> std::io::Result<session_sqlite::SqliteSessionBackend> {
@@ -125,6 +142,56 @@ mod tests {
             .append("reload_user", &user_msg("hello after reload"))
             .unwrap();
         assert_eq!(jsonl.load("reload_user").len(), 1);
+    }
+
+    #[test]
+    fn recovery_settles_the_store_other_handles_then_read() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let killed = make_session_backend(tmp.path(), "sqlite").unwrap();
+            killed.append("s1", &ChatMessage::user("hello")).unwrap();
+            killed
+                .set_session_state("s1", "running", Some("turn-1"))
+                .unwrap();
+        }
+
+        // An unknown backend name falls back to SQLite everywhere else, so
+        // it must here too.
+        assert_eq!(
+            recover_abandoned_session_turns(tmp.path(), "typo").unwrap(),
+            1
+        );
+        assert_eq!(
+            recover_abandoned_session_turns(tmp.path(), "sqlite").unwrap(),
+            0
+        );
+
+        let restarted = make_session_backend(tmp.path(), "sqlite").unwrap();
+        assert!(restarted.list_running_sessions().is_empty());
+        let state = restarted.get_session_state("s1").unwrap().unwrap();
+        assert_eq!(state.state, "error");
+        assert_eq!(restarted.load("s1").len(), 1);
+    }
+
+    #[test]
+    fn recovery_creates_no_store_and_skips_the_jsonl_backend() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(
+            recover_abandoned_session_turns(tmp.path(), "sqlite").unwrap(),
+            0
+        );
+        assert!(!tmp.path().join("sessions").exists());
+
+        let sqlite = make_session_backend(tmp.path(), "sqlite").unwrap();
+        sqlite.append("s1", &ChatMessage::user("hello")).unwrap();
+        sqlite
+            .set_session_state("s1", "running", Some("turn-1"))
+            .unwrap();
+        assert_eq!(
+            recover_abandoned_session_turns(tmp.path(), "jsonl").unwrap(),
+            0
+        );
+        assert_eq!(sqlite.list_running_sessions().len(), 1);
     }
 
     #[test]
