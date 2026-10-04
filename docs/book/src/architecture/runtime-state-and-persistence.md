@@ -86,7 +86,8 @@ restarted. This happens once per process. A reload stays in the same process,
 so it leaves the run state of turns still in progress alone, and merely
 opening the session store never changes it. If the store cannot be written at
 that moment, the attempt is logged and not repeated until the next process
-start. Only the SQLite backend tracks run state.
+start. Only the SQLite backend tracks run state, and its store is settled
+whenever it exists, whichever backend is configured.
 
 ## Session backend migration
 

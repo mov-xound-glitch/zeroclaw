@@ -6529,7 +6529,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     // not repeat it.
     #[cfg(feature = "agent-runtime")]
     if let Some((_, ownership)) = daemon_ownership.as_ref() {
-        ownership.recover_abandoned_turns(&config.channels.session_backend);
+        ownership.recover_abandoned_turns_or_log();
     }
     #[cfg(feature = "agent-runtime")]
     let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
@@ -6551,7 +6551,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             );
             anyhow::Error::msg("standalone ownership was not acquired")
         })?;
-        ownership.recover_abandoned_turns(&config.channels.session_backend);
+        ownership.recover_abandoned_turns_or_log();
         Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
             config.clone(),
             ownership,
