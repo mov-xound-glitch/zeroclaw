@@ -73,7 +73,9 @@ impl SqliteSessionBackend {
     /// [`SessionBackend::recover_abandoned_turns`] for who may call this.
     pub fn recover_abandoned_turns_at(workspace_dir: &Path) -> std::io::Result<usize> {
         let db_path = Self::db_path(workspace_dir);
-        if !db_path.exists() {
+        // Only a store that is known to be absent has nothing to settle. One
+        // that cannot be examined is an error for the caller to report.
+        if !db_path.try_exists()? {
             return Ok(0);
         }
         let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -3028,6 +3030,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(columns, 5, "recovery must not migrate the store");
+    }
+
+    /// A store that cannot be examined is not the same as no store: the
+    /// caller must hear about it.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_reports_a_store_it_cannot_examine() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(sessions_dir.join("sessions.db"), b"").unwrap();
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads through any mode; the check cannot fail for it.
+        let unreadable = std::fs::read_dir(&sessions_dir).is_err();
+
+        let result = SqliteSessionBackend::recover_abandoned_turns_at(tmp.path());
+
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if unreadable {
+            assert!(result.is_err(), "got {result:?}");
+        }
     }
 
     #[test]
