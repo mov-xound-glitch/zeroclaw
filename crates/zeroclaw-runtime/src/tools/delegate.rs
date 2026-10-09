@@ -13672,6 +13672,7 @@ mod tests {
         Sync,
         Background,
         Parallel,
+        ParallelMany(&'static [&'static str]),
         ListResults,
     }
 
@@ -13680,6 +13681,121 @@ mod tests {
     /// result is in history the final text closes the loop. The tool-result
     /// message is captured so tests can assert exactly what the sub-agent's
     /// delegation returned to the delegating loop.
+    /// Stopping the root turn stops every worker of a parallel fan-out. The
+    /// workers run in spawned tasks with no turn scope of their own, so this
+    /// is the path that depends on the lineage handed to the worker's tool.
+    #[tokio::test]
+    async fn cancelling_the_root_turn_stops_every_parallel_worker() {
+        let temp = TempDir::new().unwrap();
+        // Each worker's model first asks for one more delegation, so a worker
+        // that is still alive after the cancel makes a second request. The
+        // replies are held until the test releases them, after the cancel.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (server, captured) = start_scripted_chat_server_released_by(
+            &[
+                chat_completion_tool_call(
+                    DelegateTool::NAME,
+                    "call_more_a",
+                    serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+                ),
+                chat_completion_tool_call(
+                    DelegateTool::NAME,
+                    "call_more_b",
+                    serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+                ),
+                serde_json::json!({"choices": [{"message": {"content": "worker finished"}}]}),
+                serde_json::json!({"choices": [{"message": {"content": "worker finished"}}]}),
+            ],
+            Some(Arc::clone(&release)),
+        )
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap3"),
+                ("middle", &["leaf", "other"], "cap3"),
+                ("leaf", &["deep"], "cap3"),
+                ("other", &["deep"], "cap3"),
+                ("deep", &[], "cap3"),
+            ],
+            &[("cap3", 3, 20)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = Arc::new(DelegateCallThenFinalModelProvider::new_parallel_many(&[
+            "leaf", "other",
+        ]));
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let turn = CancellationToken::new();
+        let foreground = {
+            let turn = turn.clone();
+            let provider = Arc::clone(&provider);
+            zeroclaw_spawn::spawn!(async move {
+                crate::agent::tool_execution::scope_turn_cancellation(turn, async move {
+                    tool.execute_agentic(
+                        "middle",
+                        &middle_config,
+                        "custom.local",
+                        "test-model",
+                        provider.as_ref(),
+                        "fan out, then get stopped",
+                        None,
+                    )
+                    .await
+                })
+                .await
+            })
+        };
+
+        // Both workers are up, each waiting in its first model call.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if captured.lock().unwrap().len() >= 2 {
+                break;
+            }
+            assert!(
+                provider.tool_message().is_none(),
+                "the fan-out settled before its workers reached the provider: {:?}",
+                provider.tool_message().map(|m| decoded_tool_message(&m))
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the parallel workers never started"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        turn.cancel();
+        release.notify_one();
+        release.notify_one();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), foreground)
+            .await
+            .expect("the fan-out must stop once the turn is cancelled")
+            .expect("the foreground task must not panic");
+        match outcome {
+            Ok(result) => assert!(
+                !result.success,
+                "the cancelled fan-out must not report success: {result:?}"
+            ),
+            Err(error) => assert!(
+                error.to_string().to_lowercase().contains("cancel"),
+                "unexpected foreground error: {error:#}"
+            ),
+        }
+
+        // A worker that survived the cancel would act on the released reply
+        // and make its second request. Give it the time to do so.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "every parallel worker must stop with the turn, not go on to a second request: {bodies:?}"
+        );
+    }
+
     /// Middle's model for the turn-cancellation test: the first call launches
     /// `target_agent` in the background, the call after the tool result
     /// records the receipt and then hangs, so the foreground worker ends only
@@ -13904,6 +14020,10 @@ mod tests {
             Self::with_transport(target_agent, MockDelegationTransport::Parallel)
         }
 
+        fn new_parallel_many(targets: &'static [&'static str]) -> Self {
+            Self::with_transport(targets[0], MockDelegationTransport::ParallelMany(targets))
+        }
+
         fn new_list_results() -> Self {
             Self::with_transport("leaf", MockDelegationTransport::ListResults)
         }
@@ -13960,6 +14080,10 @@ mod tests {
                 }),
                 MockDelegationTransport::Parallel => serde_json::json!({
                     "parallel": [self.target_agent],
+                    "prompt": "subtask from parent loop"
+                }),
+                MockDelegationTransport::ParallelMany(targets) => serde_json::json!({
+                    "parallel": targets,
                     "prompt": "subtask from parent loop"
                 }),
                 MockDelegationTransport::ListResults => {
@@ -14024,26 +14148,42 @@ mod tests {
         let uri = format!("http://{}", listener.local_addr().unwrap());
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_clone = Arc::clone(&captured);
-        let scripted: Vec<serde_json::Value> = responses.to_vec();
+        let scripted: Arc<Vec<serde_json::Value>> = Arc::new(responses.to_vec());
         let task = zeroclaw_spawn::spawn!(async move {
-            let mut served = 0;
+            let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
-                let request = read_http_request(&mut socket).await;
-                captured_clone
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&request).to_string());
-                let response = scripted.get(served).cloned().unwrap_or_else(|| {
-                    serde_json::json!({"error": {"message": "unexpected extra provider request"}})
-                });
-                if let Some(release) = &release {
-                    release.notified().await;
+                let captured = Arc::clone(&captured_clone);
+                let scripted = Arc::clone(&scripted);
+                let served = Arc::clone(&served);
+                let gated = release.is_some();
+                let release = release.clone();
+                let serve = async move {
+                    let request = read_http_request(&mut socket).await;
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&request).to_string());
+                    let index = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = scripted.get(index).cloned().unwrap_or_else(|| {
+                        serde_json::json!({"error": {"message": "unexpected extra provider request"}})
+                    });
+                    if let Some(release) = &release {
+                        release.notified().await;
+                    }
+                    write_json_response(&mut socket, response).await;
+                };
+                // Held replies must not hold the listener: a gated server
+                // serves its connections concurrently, so several callers can
+                // be waiting on the gate at once. Ungated ones keep the
+                // request order the scripted replies rely on.
+                if gated {
+                    zeroclaw_spawn::spawn!(serve);
+                } else {
+                    serve.await;
                 }
-                write_json_response(&mut socket, response).await;
-                served += 1;
             }
         });
 
