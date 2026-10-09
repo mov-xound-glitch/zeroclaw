@@ -415,7 +415,7 @@ where
                     state.sop_driver_handles.as_ref(),
                     &outcome,
                     Some(zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
-                        std::sync::Arc::clone(&state.config),
+                        state.config.clone(),
                         state.agent_lifecycle.clone(),
                     )),
                 );
@@ -677,12 +677,12 @@ async fn handle_socket(
     }
 
     let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
-        Arc::clone(&state.config),
+        state.config.clone(),
         state.agent_lifecycle.clone(),
     );
     let mut agent =
         match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-            Arc::clone(&state.config),
+            state.config.clone(),
             &agent_alias,
             Some(&session_cwd),
             true,
@@ -1894,7 +1894,8 @@ async fn process_chat_message(
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (steering_tx, mut steering_rx) =
+        tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::SteeringInput>(32);
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
@@ -2039,7 +2040,7 @@ async fn process_chat_message(
                                             let _ = sender.send(Message::Text(err.to_string().into())).await;
                                             continue;
                                         }
-                                        match steering_tx.try_send(content) {
+                                        match steering_tx.try_send(content.into()) {
                                             Ok(()) => {}
                                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                                 let err = serde_json::json!({
@@ -2312,7 +2313,7 @@ async fn process_chat_message(
                     let memory_config = state.config.read().memory.clone();
                     let user_msg = content.to_string();
                     let assistant_resp = outcome.response.clone();
-                    let live_config = Arc::clone(&state.config);
+                    let live_config = state.config.clone();
                     zeroclaw_spawn::spawn!(async move {
                         let config = live_config.read().clone();
                         let Some((model_provider, model, temperature)) =
