@@ -65,12 +65,22 @@ impl SqliteSessionBackend {
         workspace_dir.join("sessions").join("sessions.db")
     }
 
-    /// Settle the turns left marked "running" in the store under
-    /// `workspace_dir`, without opening it as a backend: no store is
+    /// Settle every turn left marked "running" in the store under
+    /// `workspace_dir` as "error", in one atomic statement, and return how
+    /// many there were. The turn id stays on the session so a client can
+    /// tell which turn ended, the session's messages are untouched, and
+    /// nothing is restarted. The store is not opened as a backend: none is
     /// created, and an existing one gets this one statement and nothing
     /// else (no schema work, no import). A store from before run state was
-    /// tracked has nothing to settle. See
-    /// [`SessionBackend::recover_abandoned_turns`] for who may call this.
+    /// tracked has nothing to settle.
+    ///
+    /// A "running" row only says a turn started; it cannot say the process
+    /// that ran it is still alive. Only a process that has just become the
+    /// sole owner of the data directory knows that none is, so only that
+    /// process may call this, once, before it admits any turn of its own:
+    /// the startup path reaches it through `recover_abandoned_session_turns`,
+    /// behind the once-per-process claim. Opening a backend never does it
+    /// implicitly, and no backend handle exposes it.
     pub fn recover_abandoned_turns_at(workspace_dir: &Path) -> std::io::Result<usize> {
         let db_path = Self::db_path(workspace_dir);
         // Only a store that is known to be absent has nothing to settle. One
@@ -1383,12 +1393,6 @@ impl SessionBackend for SqliteSessionBackend {
         )
         .map_err(std::io::Error::other)?;
         Ok(())
-    }
-
-    fn recover_abandoned_turns(&self) -> std::io::Result<usize> {
-        let conn = self.conn.lock();
-        conn.execute(SETTLE_RUNNING_TURNS_SQL, [])
-            .map_err(std::io::Error::other)
     }
 
     fn get_session_state(&self, session_key: &str) -> std::io::Result<Option<SessionState>> {
@@ -2976,7 +2980,10 @@ mod tests {
             .set_session_state("failed", "error", Some("turn-f"))
             .unwrap();
 
-        assert_eq!(backend.recover_abandoned_turns().unwrap(), 1);
+        assert_eq!(
+            SqliteSessionBackend::recover_abandoned_turns_at(tmp.path()).unwrap(),
+            1
+        );
 
         let abandoned = backend.get_session_state("abandoned").unwrap().unwrap();
         assert_eq!(abandoned.state, "error");
@@ -2995,7 +3002,10 @@ mod tests {
         assert_eq!(failed.state, "error");
         assert_eq!(failed.turn_id.as_deref(), Some("turn-f"));
         assert!(backend.list_running_sessions().is_empty());
-        assert_eq!(backend.recover_abandoned_turns().unwrap(), 0);
+        assert_eq!(
+            SqliteSessionBackend::recover_abandoned_turns_at(tmp.path()).unwrap(),
+            0
+        );
     }
 
     #[test]
