@@ -519,6 +519,15 @@ pub const EXAMPLE_FRAMING_WINDOW: usize = 200;
 /// completed-response check and the streaming guard so both paths reach the
 /// same verdict for the same text.
 pub fn example_framing_precedes(prose_before: &str) -> bool {
+    // Prose that still has a JSON value open at the object is the inside of
+    // quoted data that never closed, so never parsed, so was never skipped
+    // as data: its strings cannot frame the object, whatever clause
+    // terminators they carry. Balanced brackets in a sentence (inline code,
+    // a mention of `[]`) do not count, and nor does a brace that opens no
+    // value.
+    if prose_opens_a_json_value(prose_before) {
+        return false;
+    }
     let mut window_start = prose_before.len().saturating_sub(EXAMPLE_FRAMING_WINDOW);
     while !prose_before.is_char_boundary(window_start) {
         window_start += 1;
@@ -547,11 +556,66 @@ pub fn example_framing_precedes(prose_before: &str) -> bool {
     // Only the clause that ends at the object counts. A line break closes it
     // as firmly as a sentence terminator does: in "For example:\nI am now
     // going to run the command for you\n{...}" the framing introduces the
-    // paragraph, not the object on the last line.
+    // paragraph, not the object on the last line. The CJK enders close a
+    // clause too, so a `例如` earlier in a Chinese or Japanese paragraph
+    // does not frame an object two sentences later. The colon is not a
+    // boundary in either script: it is what joins a framing phrase to the
+    // object it introduces.
     let clause_start = clause
-        .rfind(['.', '!', '?', '\n', '\r'])
-        .map_or(0, |idx| idx + 1);
+        .char_indices()
+        .rev()
+        .find(|(_, c)| is_clause_terminator(*c))
+        .map_or(0, |(idx, c)| idx + c.len_utf8());
     has_explicit_example_phrase(&window[clause_start..clause.len()])
+}
+
+/// Whether `prose` leaves a JSON value open at its end: an object opener
+/// followed by a quoted key, or an array opener followed by a value, that
+/// no closer has matched. Openers and closers inside string literals do not
+/// count; a JSON string cannot span a line, so a quote left open in prose
+/// stops mattering at the next line break.
+fn prose_opens_a_json_value(prose: &str) -> bool {
+    let bytes = prose.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in prose.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' || ch == '\n' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => {
+                let next = bytes[offset + 1..]
+                    .iter()
+                    .copied()
+                    .find(|b| !b.is_ascii_whitespace());
+                let opens_value = match ch {
+                    '{' => next == Some(b'"'),
+                    _ => matches!(next, Some(b'"' | b'{' | b'[')),
+                };
+                if opens_value {
+                    depth += 1;
+                }
+            }
+            '}' | ']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth > 0
+}
+
+/// Characters that end a clause for example framing: ASCII sentence
+/// terminators and line breaks, plus the full-width enders CJK prose uses.
+fn is_clause_terminator(c: char) -> bool {
+    matches!(c, '.' | '!' | '?' | '\n' | '\r' | '。' | '！' | '？')
 }
 
 /// `text` with the periods inside "e.g." replaced by `_`, so the phrase does
@@ -570,6 +634,15 @@ fn mask_abbreviation_periods(text: &str) -> String {
     String::from_utf8(bytes).unwrap_or_else(|_| text.to_string())
 }
 
+/// Whether `text`, the visible prose of a reply streamed so far, carries the
+/// loose example wording the reply-level tag verdict keys on. The streaming
+/// guard keeps this as one reply-wide flag, since the completed-response
+/// check judges a tagged example against the whole reply while the guard's
+/// own framing window holds only the most recent prose.
+pub fn has_reply_example_context(text: &str) -> bool {
+    has_example_context(text)
+}
+
 /// Loose example wording, for the reply-level tag verdict only: any mention
 /// of an example or sample, or any explicit framing phrase ("e.g.", "for
 /// instance"). It accepts everything the strict test accepts, so no wording
@@ -579,9 +652,21 @@ fn has_example_context(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("example")
         || lower.contains("sample")
-        || ["示例", "例如", "比如", "举例", "例子", "比方说", "譬如"]
-            .iter()
-            .any(|phrase| text.contains(phrase))
+        || lower.contains("ejemplo")
+        || lower.contains("exemple")
+        || [
+            "示例",
+            "例如",
+            "比如",
+            "举例",
+            "例子",
+            "比方说",
+            "譬如",
+            "例えば",
+            "たとえば",
+        ]
+        .iter()
+        .any(|phrase| text.contains(phrase))
         || has_explicit_example_phrase(text)
 }
 
@@ -589,6 +674,8 @@ fn has_example_context(text: &str) -> bool {
 /// "sample" or "examples/" is ordinary narration in real leaks ("creating
 /// the sample page now"), so only phrases that introduce an illustration
 /// count, and documentation-domain links (`https://example.com/...`) never do.
+/// The phrases cover the locales the runtime ships: English, Spanish,
+/// French, Japanese and Chinese.
 fn has_explicit_example_phrase(prose: &str) -> bool {
     let lower = prose.to_ascii_lowercase();
     [
@@ -599,15 +686,30 @@ fn has_explicit_example_phrase(prose: &str) -> bool {
         "an example",
         "example of",
         "looks like this",
+        // Spanish
+        "por ejemplo",
+        "ejemplo:",
+        "un ejemplo",
+        "se ve así",
+        // French: "exemple" alone is not "example" to this test, the same
+        // narration trap as the English noun. The colon and article forms
+        // are kept in parity with "example:" and "an example" above.
+        "par exemple",
+        "exemple :",
+        "exemple:",
+        "un exemple",
+        "ressemble à ceci",
     ]
     .iter()
     .any(|phrase| lower.contains(phrase))
         // `例子` is the plain noun, like "an example" above; `示例` is left
         // out because it also reads as "sample" (`示例页面`, a sample page),
-        // the same narration trap as the English word.
-        || ["例如", "比如", "举例", "譬如", "比方说", "例子"]
-            .iter()
-            .any(|phrase| prose.contains(phrase))
+        // the same narration trap as the English word. The Japanese
+        // phrases are the explicit "for example" forms; the bare `例`
+        // label is left out because it is also the tail of `比例` (ratio).
+        || ["例如", "比如", "举例", "譬如", "比方说", "例子", "例えば", "たとえば"]
+        .iter()
+        .any(|phrase| prose.contains(phrase))
 }
 
 fn leading_json_fence_body_and_trailing_text(trimmed: &str) -> Option<(&str, &str)> {
@@ -3510,6 +3612,88 @@ mod embedded_protocol_detection_tests {
         ));
         let docs_link = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"curl https://docs.example.io/x\"}","id":"call_1","name":"shell"}]}"#;
         assert_detected_never_executed(&format!("Fetching the docs page. {docs_link}"));
+    }
+
+    #[test]
+    fn framing_phrases_cover_the_shipped_locales() {
+        // The runtime ships en, es, fr, ja and zh-CN. A documentation reply
+        // in any of them that quotes an envelope after an explicit framing
+        // phrase is an example, through the clause rule and the reply-level
+        // example test alike.
+        let envelope = r#"{"content":null,"tool_calls":[{"arguments":{"command":"ls"},"id":"c1","name":"shell"}]}"#;
+        let framed = [
+            "Por ejemplo, el protocolo se ve así: ",
+            "Un ejemplo de llamada: ",
+            "Par exemple, le protocole ressemble à ceci : ",
+            "Voici un exemple d'appel : ",
+            "例えば、プロトコルはこのようになります：",
+            "たとえば、このような形です：",
+            "例如，协议如下：",
+        ];
+        for prose in framed {
+            assert!(example_framing_precedes(prose), "{prose:?} must frame");
+            assert!(
+                looks_like_tool_protocol_example(&format!("{prose}{envelope}")),
+                "{prose:?} must make the reply an example"
+            );
+        }
+        // "exemple" and "ejemplo" alone are the noun, not a framing phrase,
+        // like "example" in English.
+        assert!(!example_framing_precedes(
+            "Dans cet exemple de page, je lance : "
+        ));
+        assert!(!example_framing_precedes(
+            "Creo la página de ejemplo ahora: "
+        ));
+    }
+
+    #[test]
+    fn cjk_sentence_enders_close_the_framing_clause() {
+        // A framing phrase in an earlier sentence does not reach an object
+        // two sentences later, whichever script ends the sentence.
+        assert!(!example_framing_precedes("例如，格式如上。现在运行："));
+        assert!(!example_framing_precedes(
+            "例えば、こうなります。では実行します："
+        ));
+        assert!(!example_framing_precedes("比如这样！现在执行？"));
+        assert!(example_framing_precedes("格式如上。例如："));
+        // The colon is what joins a phrase to its object, in either width.
+        assert!(example_framing_precedes("例如：\n"));
+        assert!(example_framing_precedes("For example: "));
+    }
+
+    #[test]
+    fn prose_with_a_value_still_open_does_not_frame() {
+        // A truncated outer value never parses, so its inside is not skipped
+        // as data. Its strings must still not frame the leak that follows,
+        // whether or not they carry a clause terminator of their own.
+        let envelope =
+            r#"{"content":null,"tool_calls":[{"function":{"name":"shell","arguments":{}}}]}"#;
+        for prose in [
+            r#"Results: [{"note":"for example", "x": "#,
+            r#"Results: [{"note":"Done. For example, it looks like this: ", "x": "#,
+            r#"{"items": ["for example: "#,
+        ] {
+            assert!(!example_framing_precedes(prose), "{prose:?}");
+            let text = format!("{prose}{envelope}");
+            assert!(
+                !looks_like_tool_protocol_example(&text),
+                "quoted data must not frame the leak after it: {text:?}"
+            );
+            assert!(embedded_tool_protocol_envelope_mentions_known_tool(
+                &text,
+                &shell_is_known()
+            ));
+        }
+        // Balanced brackets in a sentence are prose: inline code, a
+        // mention of an empty array, a closed quoted value.
+        for prose in [
+            "For example, with `[]` as arguments the call looks like this: ",
+            "For example, `{}` is the empty object and the call looks like this: ",
+            r#"The result was {"ok": true}. For example, the call looks like this: "#,
+        ] {
+            assert!(example_framing_precedes(prose), "{prose:?}");
+        }
     }
 
     #[test]

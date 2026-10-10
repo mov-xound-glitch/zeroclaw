@@ -1042,6 +1042,26 @@ mod cost_usd_regression_tests {
                 "complete envelope framed as an example",
                 format!("For example, the protocol looks like this: {envelope}"),
             ),
+            (
+                "Spanish documentation reply",
+                format!("Por ejemplo, el protocolo se ve así: {envelope}"),
+            ),
+            (
+                "French documentation reply",
+                format!("Par exemple, le protocole ressemble à ceci : {envelope}"),
+            ),
+            (
+                "Japanese documentation reply",
+                format!("例えば、プロトコルはこのようになります：{envelope}"),
+            ),
+            (
+                "French documentation reply with a fenced envelope",
+                format!("Par exemple :\n```json\n{envelope}\n```"),
+            ),
+            (
+                "framing clause that mentions brackets",
+                format!("For example, with `[]` as arguments the call looks like this: {envelope}"),
+            ),
         ];
         for (label, text) in cases {
             let (rejected, calls) = interpret_leak(&text, "ordinary-reply-regression").await;
@@ -1050,6 +1070,39 @@ mod cost_usd_regression_tests {
                 !rejected,
                 "{label}: an ordinary reply must render, not retry"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn framing_that_does_not_reach_the_leak_does_not_exempt_it() {
+        // A phrase closed by a CJK sentence ender frames the sentence it is
+        // in, not the object two sentences later; and quoted data that never
+        // parses cannot lend its strings as framing.
+        let envelope = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"id\"}","id":"c1","name":"shell"}]}"#;
+        let cases = [
+            (
+                "Chinese phrase closed by 。",
+                format!("例如，格式如上。现在运行：{envelope}"),
+            ),
+            (
+                "Japanese phrase closed by 。",
+                format!("例えば、こうなります。では実行します：{envelope}"),
+            ),
+            (
+                "truncated quoted data carrying a framing string",
+                format!(r#"Results: [{{"note":"for example", "x": {envelope}"#),
+            ),
+            (
+                "truncated quoted data whose string carries a clause terminator",
+                format!(
+                    r#"Results: [{{"note":"Done. For example, it looks like this: ", "x": {envelope}"#
+                ),
+            ),
+        ];
+        for (label, text) in cases {
+            let (rejected, calls) = interpret_leak(&text, "unreached-framing").await;
+            assert_eq!(calls, 0, "{label}: must never execute");
+            assert!(rejected, "{label}: the leak must be rejected");
         }
     }
 
