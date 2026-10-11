@@ -378,6 +378,7 @@ fn append_provider_fallback_footer(
     mut response: String,
     fallback: Option<&ProviderFallbackInfo>,
     safeguard: Option<&SafeguardFallbackNotice>,
+    model_notice: zeroclaw_config::schema::ModelFallbackNotice,
 ) -> String {
     // The ordinary recovery leg comes first so the footers read in route
     // order: the provider fallback, then the safeguard switch the accepted
@@ -423,6 +424,27 @@ fn append_provider_fallback_footer(
                         ("model", fallback.actual_model.as_str()),
                     ],
                 ));
+            } else if fallback.requested_model != fallback.actual_model {
+                use zeroclaw_config::schema::ModelFallbackNotice;
+                let notice = match model_notice {
+                    ModelFallbackNotice::Off => None,
+                    ModelFallbackNotice::Redacted => Some(channel_runtime_cli_string(
+                        "channel-runtime-model-fallback-redacted",
+                    )),
+                    ModelFallbackNotice::Detailed => Some(channel_runtime_cli_string_with_args(
+                        "turn-model-fallback-notice",
+                        &[
+                            ("requested_model", fallback.requested_model.as_str()),
+                            ("requested_provider", fallback.requested_provider.as_str()),
+                            ("actual_model", fallback.actual_model.as_str()),
+                            ("actual_provider", fallback.actual_provider.as_str()),
+                        ],
+                    )),
+                };
+                if let Some(notice) = notice {
+                    response.push_str("\n\n---\n");
+                    response.push_str(&notice);
+                }
             }
         }
         _ => {}
@@ -642,7 +664,7 @@ struct ChannelRuntimeContext {
     /// channel.`<type>`.`<alias>`) is a follow-up.
     agent_cfg: Arc<zeroclaw_config::schema::AliasedAgentConfig>,
     prompt_config: Arc<zeroclaw_config::schema::Config>,
-    live_config: Arc<RwLock<zeroclaw_config::schema::Config>>,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
     memory: Arc<dyn Memory>,
     memory_strategy: Arc<dyn MemoryStrategy>,
     tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry>,
@@ -2172,6 +2194,21 @@ fn build_channel_system_prompt(
         } else {
             prompt = format!("{prompt}\n\n{instructions}");
         }
+        // Both WhatsApp backends share a name, but only Web delivers documents.
+        if instructions.contains("[DOCUMENT:")
+            && !matches!(channel_name, "whatsapp" | "whatsapp-web")
+        {
+            prompt.push_str(
+                "\n\nWhen generating large HTML, scripts, spreadsheets or exports, use available \
+                 file-writing tools to save the complete artifact at an absolute path inside the \
+                 configured workspace instead of pasting it into chat. After saving successfully, \
+                 send a short summary plus the document marker described above, using that same absolute path \
+                 and following this channel's path and URL restrictions. If file-writing tools \
+                 are unavailable or saving fails, explain the limitation and provide the content \
+                 in chat. Do not emit a document marker for an \
+                 unsaved file.",
+            );
+        }
     }
 
     if let Some(mention) = bot_mention {
@@ -2547,7 +2584,19 @@ fn strip_tool_result_content(text: &str) -> String {
             .expect("TOOL_RESULT_RE regex must compile")
     });
 
-    let cleaned = TOOL_RESULT_RE.replace_all(text, "");
+    // A new-shape carrier opens with a results prefix, an attachments count
+    // line, and that many marker lines before the body. Parse the carrier so
+    // the fixed-position header and marker lines drop out exactly, and only
+    // the body's tool_result blocks are stripped below.
+    let body = if let Some(parts) = zeroclaw_api::tool_carrier::classify("user", text)
+        && parts.declared
+    {
+        parts.text
+    } else {
+        text.to_string()
+    };
+
+    let cleaned = TOOL_RESULT_RE.replace_all(&body, "");
     let cleaned = cleaned.trim();
 
     // If the only remaining content is the header, drop it entirely.
@@ -2949,6 +2998,9 @@ async fn load_runtime_config_and_defaults(
     let mut parsed: Config = zeroclaw_config::migration::migrate_to_current(&contents)
         .with_context(|| format!("Failed to migrate {}", path.display()))?;
     parsed.config_path = path.to_path_buf();
+    // This value was parsed from the file at `path`; it holds save-over
+    // provenance for the guard in `Config::save`.
+    parsed.loaded_from = Some(path.to_path_buf());
 
     if let Some(zeroclaw_dir) = path.parent() {
         let store =
@@ -4543,19 +4595,7 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     if zeroclaw_runtime::agent::context_window_exceeded_from_error(err).is_some() {
         return false;
     }
-    let lower = err.to_string().to_lowercase();
-    [
-        "exceeds the context window",
-        "context window of this model",
-        "maximum context length",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "prompt is too long",
-        "input is too long",
-    ]
-    .iter()
-    .any(|hint| lower.contains(hint))
+    zeroclaw_providers::reliable::is_context_window_exceeded(err)
 }
 
 fn load_cached_model_preview(
@@ -10239,7 +10279,7 @@ async fn process_channel_message_body(
                 served_route_sink: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
-                    live_config: Some(Arc::clone(&ctx.live_config)),
+                    live_config: Some(ctx.live_config.clone()),
                 }),
             }));
             // Scope this turn's routing handle so concurrent same-agent turns,
@@ -10599,10 +10639,12 @@ async fn process_channel_message_body(
             // The runtime commits this candidate only after semantic acceptance.
             // This renderer must therefore receive only the final accepted route.
             let history_response = delivered_response.clone();
+            let model_notice = ctx.live_config.read().channels.model_fallback_notice;
             delivered_response = append_provider_fallback_footer(
                 delivered_response,
                 fallback_info.as_ref(),
                 safeguard_notice.as_ref(),
+                model_notice,
             );
 
             ::zeroclaw_log::record!(
@@ -12775,10 +12817,10 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
 
 #[cfg(feature = "channel-slack")]
 fn slack_thread_context_max_messages_resolver(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     alias: &str,
 ) -> Arc<dyn Fn() -> usize + Send + Sync> {
-    let cfg_arc = Arc::clone(config_arc);
+    let cfg_arc = config_arc.clone();
     let alias = alias.to_string();
     Arc::new(move || {
         cfg_arc
@@ -12815,9 +12857,21 @@ impl std::error::Error for UnknownChannelId {}
 
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     channel_id: &str,
 ) -> Result<Arc<dyn Channel>> {
+    // One-shot construction: a private, unsupervised authority seeded from
+    // the caller's own one-shot handle, matching that handle's semantics —
+    // a pairing write here would persist to disk but publish only into
+    // this throwaway storage, never entering a supervised publication
+    // domain (one-shot senders never pair).
+    #[cfg(any(
+        feature = "channel-telegram",
+        feature = "whatsapp-web",
+        feature = "channel-wechat",
+        feature = "channel-line"
+    ))]
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config_arc.snapshot());
     #[allow(unused_variables)]
     let config = config_arc.read();
     match channel_id {
@@ -12849,7 +12903,7 @@ fn build_channel_by_id(
                     tg.mention_only,
                 )
                 .with_voice_peer_resolver(voice_peer_resolver)
-                .with_persistence(config_arc.clone())
+                .with_persistence_authority(authority.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
@@ -12946,6 +13000,7 @@ fn build_channel_by_id(
                 .with_thread_context_max_messages_resolver(thread_context_max_messages_resolver)
                 .with_workspace_dir(workspace_dir)
                 .with_markdown_blocks(sl.use_markdown_blocks)
+                .with_allow_bot_messages(sl.allow_bot_messages)
                 .with_transcription_manager(
                     config.transcription.clone(),
                     resolved_transcription_manager(&config, &format!("slack.{alias}")),
@@ -13043,9 +13098,9 @@ fn build_channel_by_id(
                 };
                 let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "matrix", &alias);
-                let transcription_config_arc = Arc::clone(config_arc);
+                let transcription_config_arc = config_arc.clone();
                 let transcription_channel_key = format!("matrix.{alias}");
-                let tts_config_arc = Arc::clone(config_arc);
+                let tts_config_arc = config_arc.clone();
                 let tts_channel_key = format!("matrix.{alias}");
                 let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                     let cfg_arc = config_arc.clone();
@@ -13123,7 +13178,7 @@ fn build_channel_by_id(
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
                 Ok(Arc::new(
                     WhatsAppWebChannel::new(wa, alias, peer_resolver, allowed_groups_resolver)
-                        .with_persistence(config_arc.clone())
+                        .with_persistence_authority(authority.clone())
                         .with_workspace_dir(workspace_dir),
                 ))
             }
@@ -13307,7 +13362,7 @@ fn build_channel_by_id(
                     wc.cdn_base_url.clone(),
                     Some(WeChatChannel::resolve_state_dir(wc.state_dir.as_deref())),
                 )?
-                .with_persistence(config_arc.clone())
+                .with_persistence_authority(authority.clone())
                 .with_workspace_dir(workspace_dir),
             ))
         }
@@ -13620,7 +13675,7 @@ fn build_channel_by_id(
                 };
                 Ok(Arc::new(
                     LineChannel::from_config(ln, alias, peer_resolver, sender_name_resolver)
-                        .with_persistence(config_arc.clone()),
+                        .with_persistence_authority(authority.clone()),
                 ))
             }
             #[cfg(not(feature = "channel-line"))]
@@ -13655,9 +13710,10 @@ pub async fn send_channel_message(
     recipient: &str,
     message: &str,
 ) -> Result<()> {
-    // Wrap into the canonical shared handle for the builder; this is a
-    // one-shot path so the snapshot is dropped immediately after send.
-    let config_arc = Arc::new(RwLock::new(config.clone()));
+    // Wrap into a private one-shot storage for the builder; the snapshot
+    // is dropped immediately after send and never enters a supervised
+    // publication domain.
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     // The builder gets first refusal so families it already resolves natively
     // (notably `linq.<alias>`) keep their established route and their own
     // configuration errors. Only a dotted id the builder does not claim at all
@@ -13983,7 +14039,7 @@ impl ActiveChannelAliases {
 pub fn build_channel_map(
     config: &Config,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
-    let config_arc = Arc::new(RwLock::new(config.clone()));
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     let configured = collect_configured_channels(&config_arc, "", &[], None, None, None);
     configured_channel_map(&configured)
 }
@@ -14069,7 +14125,7 @@ pub fn live_channel_map() -> HashMap<String, Arc<dyn zeroclaw_api::channel::Chan
 /// Return the daemon-owned live channels visible to one trusted local RPC
 /// session. This clones channel `Arc`s and never constructs duplicate clients.
 pub fn build_local_rpc_session_channels(
-    config: Arc<RwLock<Config>>,
+    config: zeroclaw_config::live::LiveConfigHandle,
     agent_alias: String,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let snapshot = config.read().clone();
@@ -14084,7 +14140,7 @@ pub fn register_channels_for_tools(
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
-    let config_arc = Arc::new(RwLock::new(config.clone()));
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     let configured = collect_configured_channels(&config_arc, "", &[], None, None, None);
 
     let handles = [
@@ -14194,7 +14250,7 @@ fn configure_discord_transcription(
 
 #[cfg(feature = "channel-discord")]
 fn build_configured_discord_channel(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     config: &Config,
     alias: &str,
     dc: &zeroclaw_config::schema::DiscordConfig,
@@ -14264,7 +14320,7 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
 
 #[cfg(any(feature = "channel-bluesky", feature = "channel-reddit"))]
 fn live_external_peer_resolver(
-    config: Arc<RwLock<Config>>,
+    config: zeroclaw_config::live::LiveConfigHandle,
     channel_type: &'static str,
     alias: String,
 ) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
@@ -14284,7 +14340,7 @@ fn live_external_peer_resolver(
 /// credential pair; the caller logs and skips the alias on `Err`.
 #[cfg(feature = "channel-matrix")]
 pub(crate) fn build_configured_matrix_channel(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     config: &Config,
     alias: &str,
     mx: &zeroclaw_config::schema::MatrixConfig,
@@ -14296,9 +14352,9 @@ pub(crate) fn build_configured_matrix_channel(
         Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
     };
     let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
-    let transcription_config_arc = Arc::clone(config_arc);
+    let transcription_config_arc = config_arc.clone();
     let transcription_channel_key = format!("matrix.{alias}");
-    let tts_config_arc = Arc::clone(config_arc);
+    let tts_config_arc = config_arc.clone();
     let tts_channel_key = format!("matrix.{alias}");
     let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
         let cfg_arc = config_arc.clone();
@@ -14335,14 +14391,17 @@ pub(crate) fn build_configured_matrix_channel(
 }
 
 fn collect_configured_channels(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Vec<ConfiguredChannel> {
-    let authority = zeroclaw_runtime::LiveConfigAuthority::from_config(config_arc.clone());
+    // One-shot construction from a static snapshot: a private,
+    // unsupervised storage that never enters a supervised publication
+    // domain (no supervised storage is ever exposed as a raw Arc).
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config_arc.snapshot());
     collect_configured_channels_with_authority(
         config_arc,
         &authority,
@@ -14355,7 +14414,7 @@ fn collect_configured_channels(
 }
 
 fn collect_configured_channels_with_authority(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     authority: &zeroclaw_runtime::LiveConfigAuthority,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
@@ -14563,6 +14622,7 @@ fn collect_configured_channels_with_authority(
                     .with_strict_mention_in_thread(sl.strict_mention_in_thread)
                     .with_workspace_dir(config.channel_workspace_dir(&format!("slack.{alias}")))
                     .with_markdown_blocks(sl.use_markdown_blocks)
+                    .with_allow_bot_messages(sl.allow_bot_messages)
                     .with_proxy_url(sl.proxy_url.clone())
                     .with_transcription_manager(
                         config.transcription.clone(),
@@ -15754,7 +15814,7 @@ fn collect_configured_channels_with_authority(
             continue;
         }
         let peer_resolver =
-            live_external_peer_resolver(Arc::clone(config_arc), "reddit", alias.clone());
+            live_external_peer_resolver(config_arc.clone(), "reddit", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Reddit",
             alias: Some(alias.clone()),
@@ -15790,7 +15850,7 @@ fn collect_configured_channels_with_authority(
             continue;
         }
         let peer_resolver =
-            live_external_peer_resolver(Arc::clone(config_arc), "bluesky", alias.clone());
+            live_external_peer_resolver(config_arc.clone(), "bluesky", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Bluesky",
             alias: Some(alias.clone()),
@@ -15823,7 +15883,7 @@ fn collect_configured_channels_with_authority(
             continue;
         }
         let channel_key = format!("voice_wake.{alias}");
-        let transcription_config_arc = Arc::clone(config_arc);
+        let transcription_config_arc = config_arc.clone();
         let transcription_channel_key = channel_key.clone();
         channels.push(ConfiguredChannel {
             display_name: "VoiceWake",
@@ -15973,7 +16033,7 @@ fn peer_group_dangling_warning_lines(config: &Config) -> Vec<String> {
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let config_arc = Arc::new(RwLock::new(config));
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
     #[allow(unused_mut)]
     let mut channels =
         collect_configured_channels(&config_arc, "health check", &[], None, None, None);
@@ -15983,7 +16043,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     let plugin_config = Arc::new(config_arc.read().clone());
     let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
         plugin_config,
-        Some(Arc::clone(&config_arc)),
+        Some(config_arc.clone()),
     )
     .await;
     append_configured_plugin_channels(&mut channels, plugin_channels);
@@ -16640,7 +16700,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     let plugin_webhook_registry_lease = plugin_webhooks
         .as_ref()
         .map(|registry| registry.start_generation());
-    let config_arc = authority.config();
+    let config_arc = authority.live_handle();
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
         .agents
@@ -16819,7 +16879,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
-            Some(Arc::clone(&config_arc)),
+            Some(config_arc.clone()),
             Some(authority.execution_capability()),
         )?;
         // Route the per-agent tool registry through the one gated seam - see
@@ -17104,7 +17164,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             let plugin_channels =
                 zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
                     Arc::new(config.clone()),
-                    Some(Arc::clone(&config_arc)),
+                    Some(config_arc.clone()),
                     plugin_webhook_registry_lease.as_ref(),
                 )
                 .await;
@@ -17214,7 +17274,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             agent_alias: Arc::new(agent_alias.clone()),
             agent_cfg: Arc::new(agent.clone()),
             prompt_config: Arc::new(config.clone()),
-            live_config: Arc::clone(&config_arc),
+            live_config: config_arc.clone(),
             memory: Arc::clone(&mem),
             memory_strategy,
             tools_registry: Arc::clone(&tools_registry),
@@ -17419,7 +17479,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
 
     // Retirement holds this same lock while clearing the registry and draining
     // startup. Cancellation must release this wait to avoid a lock/drain cycle.
-    let config_write_lock = authority.config_write_lock();
+    let config_write_lock = zeroclaw_config::write_lock::shared_config_write_lock();
     #[cfg(test)]
     let _ = CHANNEL_STARTUP_PROBE.try_with(|probe| probe.publishing.notify_one());
     let publication_guard = tokio::select! {
@@ -17945,7 +18005,10 @@ fn concurrent_persist_lock_serialization() {
         provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-        live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+        live_config: zeroclaw_config::live::LiveConfig::new(
+            zeroclaw_config::schema::Config::default(),
+        )
+        .handle(),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         non_cli_excluded_tools: Arc::new(Vec::new()),
         autonomy_level: AutonomyLevel::default(),
@@ -18125,7 +18188,10 @@ fn test_channel_ctx_with_backend(
         provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-        live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+        live_config: zeroclaw_config::live::LiveConfig::new(
+            zeroclaw_config::schema::Config::default(),
+        )
+        .handle(),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         non_cli_excluded_tools: Arc::new(Vec::new()),
         autonomy_level: AutonomyLevel::default(),
@@ -18246,7 +18312,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         prompt_config: Arc::new(prompt_config.clone()),
-        live_config: Arc::new(RwLock::new(prompt_config)),
+        live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         non_cli_excluded_tools: Arc::new(Vec::new()),
         autonomy_level: AutonomyLevel::default(),
@@ -20016,8 +20082,11 @@ pub(crate) mod tests {
             "#,
         )
         .expect("peer-group config should parse");
-        let resolver =
-            live_external_peer_resolver(Arc::new(RwLock::new(config)), "reddit", "ops".to_string());
+        let resolver = live_external_peer_resolver(
+            zeroclaw_config::live::LiveConfig::new(config).handle(),
+            "reddit",
+            "ops".to_string(),
+        );
 
         assert_eq!(resolver(), vec!["authorized-redditor".to_string()]);
     }
@@ -20038,7 +20107,7 @@ pub(crate) mod tests {
         )
         .expect("peer-group config should parse");
         let resolver = live_external_peer_resolver(
-            Arc::new(RwLock::new(config)),
+            zeroclaw_config::live::LiveConfig::new(config).handle(),
             "bluesky",
             "work".to_string(),
         );
@@ -20226,16 +20295,77 @@ pub(crate) mod tests {
             actual_provider: "anthropic.backup".to_string(),
             actual_model: "model-b".to_string(),
         };
-        let delivered =
-            append_provider_fallback_footer("final response".to_string(), Some(&fallback), None);
+        let delivered = append_provider_fallback_footer(
+            "final response".to_string(),
+            Some(&fallback),
+            None,
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
+        );
         assert!(delivered.starts_with("final response\n\n---\n"));
         assert!(delivered.contains("openai.primary"));
         assert!(delivered.contains("anthropic.backup"));
         assert_eq!(delivered.matches("---").count(), 1);
         assert_eq!(
-            append_provider_fallback_footer("primary final".to_string(), None, None),
+            append_provider_fallback_footer(
+                "primary final".to_string(),
+                None,
+                None,
+                zeroclaw_config::schema::ModelFallbackNotice::Off
+            ),
             "primary final"
         );
+    }
+
+    #[test]
+    fn model_fallback_notice_modes_preserve_existing_delivery_contracts() {
+        use zeroclaw_config::schema::ModelFallbackNotice::{Detailed, Off, Redacted};
+
+        let mut fallback = ProviderFallbackInfo {
+            requested_provider: "custom.private".into(),
+            requested_model: "model-a".into(),
+            actual_provider: "custom.private".into(),
+            actual_model: "model-b".into(),
+        };
+        for requested_provider in ["custom.private", "custom"] {
+            fallback.requested_provider = requested_provider.into();
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, Off),
+                "answer"
+            );
+            let redacted =
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, Redacted);
+            assert!(redacted.contains("fallback model"));
+            for identifier in [requested_provider, "custom.private", "model-a", "model-b"] {
+                assert!(!redacted.contains(identifier));
+            }
+            let detailed =
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, Detailed);
+            assert!(detailed.contains("model-a"));
+            assert!(detailed.contains("model-b"));
+            assert!(detailed.contains("custom.private"));
+            assert_eq!(detailed.matches("---").count(), 1);
+        }
+        fallback.requested_model = "model-b".into();
+        for mode in [Off, Redacted, Detailed] {
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, mode),
+                "answer",
+                "same-model retry must stay silent"
+            );
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), None, None, mode),
+                "answer"
+            );
+        }
+        fallback.actual_provider = "anthropic.backup".into();
+        let existing = append_provider_fallback_footer("answer".into(), Some(&fallback), None, Off);
+        for mode in [Redacted, Detailed] {
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, mode),
+                existing,
+                "cross-family notices are independent of the new opt-in"
+            );
+        }
     }
 
     #[test]
@@ -20257,6 +20387,7 @@ pub(crate) mod tests {
             "accepted response".to_string(),
             Some(&fallback),
             Some(&safeguard),
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
         );
 
         assert_eq!(delivered.matches("---").count(), 1);
@@ -20289,6 +20420,7 @@ pub(crate) mod tests {
             "accepted response".to_string(),
             Some(&fallback),
             Some(&safeguard),
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
         );
 
         assert!(delivered.starts_with("accepted response\n\n---\n"));
@@ -20316,7 +20448,12 @@ pub(crate) mod tests {
 
         // Without a safeguard leg the same-family switch stays silent as before.
         assert_eq!(
-            append_provider_fallback_footer("accepted response".to_string(), Some(&fallback), None),
+            append_provider_fallback_footer(
+                "accepted response".to_string(),
+                Some(&fallback),
+                None,
+                zeroclaw_config::schema::ModelFallbackNotice::Off
+            ),
             "accepted response"
         );
 
@@ -20331,6 +20468,7 @@ pub(crate) mod tests {
             "accepted response".to_string(),
             Some(&retry),
             Some(&safeguard),
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
         );
         assert_eq!(delivered.matches("---").count(), 1, "{delivered}");
         assert_eq!(delivered.matches("🛡️").count(), 1);
@@ -20815,6 +20953,56 @@ pub(crate) mod tests {
             absent_required_tools.is_empty(),
             "required Matrix safe policy tools absent from the standard registry: {absent_required_tools:?}"
         );
+    }
+
+    #[test]
+    fn matrix_safe_policy_names_only_inventoried_tools() {
+        // First-party tools the built-in inventory deliberately leaves out that
+        // the Matrix safe policy still covers.
+        let outside_inventory = BTreeSet::from([
+            // Implemented, but the agent registry does not register them.
+            "sessions_reset",
+            "sessions_delete",
+            // Registered only by the opt-in background skill review.
+            "skills_list",
+            "skill_view",
+            "skill_manage",
+            // Peripheral tools, built by the hardware crate from configured boards.
+            "hardware_board_info",
+            "hardware_memory_map",
+            "hardware_memory_read",
+            // Withheld from the model-visible registry.
+            "vi_verify",
+        ]);
+        let policy_tools: BTreeSet<&str> = MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
+            .iter()
+            .chain(MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS)
+            .flat_map(|(tools, _)| tools.iter().copied())
+            .collect();
+
+        let uninventoried: Vec<&str> = policy_tools
+            .iter()
+            .copied()
+            .filter(|tool| {
+                !outside_inventory.contains(tool)
+                    && !zeroclaw_tools::inventory::is_builtin_tool_name(tool)
+            })
+            .collect();
+        assert!(
+            uninventoried.is_empty(),
+            "the Matrix safe policy names tools missing from the built-in inventory: {uninventoried:?}"
+        );
+
+        for tool in &outside_inventory {
+            assert!(
+                policy_tools.contains(tool),
+                "`{tool}` is no longer in the Matrix safe policy; drop it from this allowlist"
+            );
+            assert!(
+                !zeroclaw_tools::inventory::is_builtin_tool_name(tool),
+                "`{tool}` is now inventoried; drop it from this allowlist"
+            );
+        }
     }
 
     #[test]
@@ -21907,7 +22095,7 @@ temperature = 0.3
                 "{scenario}: listener started during preparation"
             );
             if scenario == "preparing" || scenario == "writer-wait" {
-                let lock = authority.config_write_lock();
+                let lock = zeroclaw_config::write_lock::shared_config_write_lock();
                 let guard = lock.lock().await;
                 if scenario == "writer-wait" {
                     probe.release.notify_one();
@@ -22136,7 +22324,10 @@ temperature = 0.3
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -22644,7 +22835,7 @@ temperature = 0.3
         let ctx = Arc::new(ChannelRuntimeContext {
             sop_driver_sink: None,
             prompt_config: Arc::new(cfg.clone()),
-            live_config: Arc::new(RwLock::new(cfg)),
+            live_config: zeroclaw_config::live::LiveConfig::new(cfg).handle(),
             security: Arc::new(SecurityPolicy::default()),
             ..base_ctx
         });
@@ -23113,7 +23304,10 @@ temperature = 0.3
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -23594,7 +23788,10 @@ api_key = "anthropic-key"
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -23700,7 +23897,10 @@ api_key = "anthropic-key"
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -23824,7 +24024,10 @@ api_key = "anthropic-key"
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -23952,7 +24155,10 @@ api_key = "anthropic-key"
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -25974,7 +26180,7 @@ api_key = "anthropic-key"
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(prompt_config.clone()),
-            live_config: Arc::new(RwLock::new(prompt_config)),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -26081,7 +26287,7 @@ api_key = "anthropic-key"
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(prompt_config.clone()),
-            live_config: Arc::new(RwLock::new(prompt_config)),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -27633,6 +27839,136 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    #[test]
+    fn process_channel_message_model_fallback_notices_are_live_and_delivery_only() {
+        run_channel_dispatch_test(|| async {
+            use zeroclaw_config::schema::ModelFallbackNotice::{Detailed, Off, Redacted};
+
+            #[derive(Default)]
+            struct PinnedFallbackProvider {
+                calls: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+            }
+
+            #[async_trait::async_trait]
+            impl ModelProvider for PinnedFallbackProvider {
+                async fn chat_with_system(
+                    &self,
+                    _system_prompt: Option<&str>,
+                    _message: &str,
+                    model: &str,
+                    _temperature: Option<f64>,
+                ) -> anyhow::Result<String> {
+                    if model == "model-a" {
+                        anyhow::bail!("primary model unavailable");
+                    }
+                    Ok("accepted answer".into())
+                }
+
+                async fn chat_with_history(
+                    &self,
+                    messages: &[ChatMessage],
+                    model: &str,
+                    temperature: Option<f64>,
+                ) -> anyhow::Result<String> {
+                    self.calls.lock().unwrap().push(messages.to_vec());
+                    self.chat_with_system(None, "", model, temperature).await
+                }
+            }
+            impl zeroclaw_api::attribution::Attributable for PinnedFallbackProvider {
+                fn role(&self) -> zeroclaw_api::attribution::Role {
+                    zeroclaw_api::attribution::Role::Provider(
+                        zeroclaw_api::attribution::ProviderKind::Model(
+                            zeroclaw_api::attribution::ModelProviderKind::Custom,
+                        ),
+                    )
+                }
+
+                fn alias(&self) -> &str {
+                    "notice"
+                }
+            }
+
+            let inner = Arc::new(PinnedFallbackProvider::default());
+            let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new_pinned_for_test(
+                "custom.notice",
+                vec![
+                    ("custom.notice", "notice", "model-a", inner.clone()),
+                    ("custom.notice", "notice", "model-b", inner.clone()),
+                ],
+                0,
+                1,
+            );
+            let temp = tempfile::tempdir().unwrap();
+            let backend: Arc<dyn SessionBackend> =
+                Arc::new(zeroclaw_infra::session_store::SessionStore::new(temp.path()).unwrap());
+            let channel = Arc::new(RecordingChannel::default());
+            let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel.clone(),
+                Arc::new(reliable),
+                Config::default(),
+                Default::default(),
+                "custom.notice",
+                None,
+            );
+            Arc::make_mut(&mut ctx).session_store = Some(backend.clone());
+            Arc::make_mut(&mut ctx).workspace_dir = Arc::new(temp.path().to_path_buf());
+            Arc::make_mut(&mut ctx).model = Arc::new("model-a".into());
+            let live_config = zeroclaw_config::live::LiveConfig::new(ctx.live_config.snapshot());
+            Arc::make_mut(&mut ctx).live_config = live_config.handle();
+            for (index, mode) in [Off, Redacted, Detailed, Off].into_iter().enumerate() {
+                if index != 0 {
+                    let mut config = live_config.snapshot();
+                    config.channels.model_fallback_notice = mode;
+                    let revision = live_config.next_revision().unwrap();
+                    live_config.publish(revision, config).unwrap();
+                }
+                let msg = ChannelMessage {
+                    id: format!("notice-{index}"),
+                    sender: "test-sender".into(),
+                    reply_target: "test-room".into(),
+                    content: "hello".into(),
+                    channel: "test-channel".into(),
+                    explicitly_addressed: true,
+                    ..Default::default()
+                };
+                let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+                process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+                let delivered = channel.sent_messages.lock().await.last().unwrap().clone();
+                match mode {
+                    Off => assert_eq!(delivered, "test-room:accepted answer"),
+                    Redacted => {
+                        assert!(delivered.contains("fallback model"));
+                        for identifier in ["custom.notice", "model-a", "model-b"] {
+                            assert!(!delivered.contains(identifier));
+                        }
+                    }
+                    Detailed => {
+                        assert!(delivered.contains("model-a"));
+                        assert!(delivered.contains("model-b"));
+                        assert_eq!(delivered.matches("---").count(), 1);
+                    }
+                }
+                let stored = backend.load(&history_key);
+                let assistant: Vec<_> = stored.iter().filter(|m| m.role == "assistant").collect();
+                assert_eq!(assistant.len(), index + 1);
+                assert!(assistant.iter().all(|m| m.content == "accepted answer"));
+            }
+            let calls = inner.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call.iter().any(|m| m.role == "assistant"))
+            );
+            assert!(
+                calls
+                    .iter()
+                    .flatten()
+                    .filter(|m| m.role == "assistant")
+                    .all(|m| m.content == "accepted answer")
+            );
+        });
+    }
+
     #[derive(Default)]
     struct HistoryCaptureModelProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
@@ -28921,7 +29257,8 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::clone(&prompt_config),
-            live_config: Arc::new(RwLock::new(prompt_config.as_ref().clone())),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config.as_ref().clone())
+                .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29102,7 +29439,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29204,7 +29544,6 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
-        use parking_lot::RwLock;
         use std::sync::Arc;
         use zeroclaw_config::schema::{Config, TelegramConfig};
 
@@ -29217,7 +29556,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..TelegramConfig::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(cfg));
+        let config_arc = zeroclaw_runtime::LiveConfigAuthority::new(cfg);
 
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
@@ -29226,7 +29565,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_persistence(config_arc)
+            .with_persistence_authority(config_arc)
             .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
@@ -29280,7 +29619,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29399,7 +29741,6 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
-        use parking_lot::RwLock;
         use std::sync::Arc;
         use zeroclaw_config::schema::{Config, TelegramConfig};
 
@@ -29412,7 +29753,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..TelegramConfig::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(cfg));
+        let config_arc = zeroclaw_runtime::LiveConfigAuthority::new(cfg);
 
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
@@ -29421,7 +29762,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_persistence(config_arc)
+            .with_persistence_authority(config_arc)
             .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
@@ -29487,7 +29828,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(prompt_config.clone()),
-            live_config: Arc::new(RwLock::new(prompt_config)),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29598,7 +29939,6 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
-        use parking_lot::RwLock;
         use std::sync::Arc;
         use zeroclaw_config::schema::{Config, TelegramConfig};
 
@@ -29611,7 +29951,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..TelegramConfig::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(cfg));
+        let config_arc = zeroclaw_runtime::LiveConfigAuthority::new(cfg);
 
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
@@ -29620,7 +29960,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_persistence(config_arc)
+            .with_persistence_authority(config_arc)
             .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
@@ -29677,7 +30017,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29794,7 +30137,6 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
-        use parking_lot::RwLock;
         use std::sync::Arc;
         use zeroclaw_config::schema::{Config, TelegramConfig};
 
@@ -29807,7 +30149,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..TelegramConfig::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(cfg));
+        let config_arc = zeroclaw_runtime::LiveConfigAuthority::new(cfg);
 
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
@@ -29816,7 +30158,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_persistence(config_arc)
+            .with_persistence_authority(config_arc)
             .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
@@ -29876,7 +30218,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -30368,7 +30713,6 @@ BTC is currently around $65,000 based on latest tool output."#
             .mount(&mock_server)
             .await;
 
-        use parking_lot::RwLock;
         use std::sync::Arc;
         use zeroclaw_config::schema::{Config, TelegramConfig};
 
@@ -30381,7 +30725,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..TelegramConfig::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(cfg));
+        let config_arc = zeroclaw_runtime::LiveConfigAuthority::new(cfg);
 
         let telegram: Arc<dyn Channel> = Arc::new(
             TelegramChannel::new(
@@ -30390,7 +30734,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["*".into()]),
                 false,
             )
-            .with_persistence(config_arc)
+            .with_persistence_authority(config_arc)
             .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
             .with_api_base(mock_server.uri())
             .with_approval_timeout_secs(0),
@@ -30449,7 +30793,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -30598,7 +30945,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -30723,7 +31073,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -31027,7 +31380,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -31161,7 +31517,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -31317,7 +31676,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -31456,7 +31818,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -31580,7 +31945,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -31722,7 +32090,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(prompt_config.clone()),
-            live_config: Arc::new(RwLock::new(prompt_config)),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -31888,7 +32256,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32092,7 +32463,8 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::clone(&prompt_config),
-            live_config: Arc::new(RwLock::new(prompt_config.as_ref().clone())),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config.as_ref().clone())
+                .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32612,7 +32984,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32731,7 +33106,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32860,7 +33238,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -34347,7 +34728,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -34554,7 +34938,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -34722,7 +35109,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -34887,11 +35277,12 @@ BTC is currently around $65,000 based on latest tool output."#
                 cfg.channels.debounce_ms = 120;
                 cfg
             }),
-            live_config: Arc::new(RwLock::new({
+            live_config: zeroclaw_config::live::LiveConfig::new({
                 let mut cfg = zeroclaw_config::schema::Config::default();
                 cfg.channels.debounce_ms = 120;
                 cfg
-            })),
+            })
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -35053,7 +35444,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -35269,7 +35663,8 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::clone(&prompt_config),
-            live_config: Arc::new(RwLock::new(prompt_config.as_ref().clone())),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config.as_ref().clone())
+                .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: interrupt_on_new_message_config(&channel_config),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -35501,7 +35896,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -35644,7 +36042,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -36324,7 +36725,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -36460,7 +36864,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -36600,7 +37007,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -36732,7 +37142,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -36864,7 +37277,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -37283,7 +37699,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -38812,7 +39231,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(prompt_config.clone()),
-            live_config: Arc::new(RwLock::new(prompt_config)),
+            live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -41600,7 +42019,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "config-default-model",
         );
         ctx.prompt_config = Arc::new(prompt_config.clone());
-        ctx.live_config = Arc::new(RwLock::new(prompt_config));
+        ctx.live_config = zeroclaw_config::live::LiveConfig::new(prompt_config).handle();
         ctx
     }
 
@@ -43851,7 +44270,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["123".into()]),
                 false,
             )
-            .with_persistence(Arc::new(RwLock::new(picker_config)))
+            .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(picker_config))
             .with_api_base(server.uri()),
         );
         let picker_request = zeroclaw_api::channel::ChannelModelPickerRequest {
@@ -44834,7 +45253,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -45022,7 +45444,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(config.data_dir.clone()),
             prompt_config: Arc::new(config.clone()),
-            live_config: Arc::new(RwLock::new(config.clone())),
+            live_config: zeroclaw_config::live::LiveConfig::new(config.clone()).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -45549,7 +45971,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -46044,7 +46469,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -46219,7 +46647,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -46305,7 +46736,74 @@ BTC is currently around $65,000 based on latest tool output."#
             calls[0][0].1.contains("For media attachments use markers:"),
             "telegram media marker guidance should live in the system prompt"
         );
+        assert!(
+            calls[0][0].1.contains(
+                "save the complete artifact at an absolute path inside the configured workspace"
+            ),
+            "generated artifact guidance should reach the provider's system message"
+        );
+        assert!(
+            calls[0][0].1.contains("using that same absolute path"),
+            "generated artifact markers must use absolute paths in the provider's system message"
+        );
+        assert!(
+            calls[0][0]
+                .1
+                .contains("If file-writing tools are unavailable or saving fails")
+                && calls[0][0]
+                    .1
+                    .contains("explain the limitation and provide the content in chat")
+                && calls[0][0]
+                    .1
+                    .contains("Do not emit a document marker for an unsaved file"),
+            "the no-tools provider request must include an honest inline fallback"
+        );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_guides_large_artifacts_only_for_document_channels() {
+        let base = "Base prompt with literal marker syntax: [DOCUMENT:example.txt]";
+        for channel_name in [
+            "matrix", "discord", "lark", "feishu", "telegram", "qq", "wechat",
+        ] {
+            let prompt = build_channel_system_prompt(base, channel_name, None);
+            assert!(
+                prompt.contains(base),
+                "{channel_name} must retain the base prompt"
+            );
+            assert!(
+                prompt.contains(
+                    "save the complete artifact at an absolute path inside the configured workspace"
+                ) && prompt.contains("instead of pasting it into chat")
+                    && prompt.contains("short summary plus the document marker")
+                    && prompt.contains("using that same absolute path")
+                    && prompt.contains("following this channel's path and URL restrictions")
+                    && prompt.contains("After saving successfully")
+                    && prompt.contains("If file-writing tools are unavailable or saving fails")
+                    && prompt.contains("explain the limitation and provide the content in chat")
+                    && prompt.contains("Do not emit a document marker for an unsaved file"),
+                "{channel_name} must guide large artifacts through its existing document route"
+            );
+            assert_eq!(
+                prompt,
+                build_channel_system_prompt(base, channel_name, None),
+                "{channel_name} artifact guidance must remain byte-stable"
+            );
+        }
+        for channel_name in [
+            "whatsapp",
+            "whatsapp-web",
+            "wecom_ws",
+            "mattermost",
+            "unknown",
+        ] {
+            let prompt = build_channel_system_prompt(base, channel_name, None);
+            assert!(
+                !prompt.contains("short summary plus the document marker"),
+                "{channel_name} must not advertise document delivery from base-prompt marker text"
+            );
+        }
     }
 
     #[test]
@@ -46998,7 +47496,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
@@ -47050,7 +47548,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
@@ -47086,7 +47584,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
@@ -47117,7 +47615,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
@@ -47167,7 +47665,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         let discord_channels: Vec<_> = channels
@@ -47224,7 +47722,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
         let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(
@@ -47302,7 +47800,7 @@ This is an example JSON object for profile settings."#;
             "a risk-profile approval route must activate its unowned alias"
         );
 
-        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
         let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(
@@ -47370,7 +47868,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(channel_map.contains_key("discord.ops"));
@@ -47534,7 +48032,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::scattered_types::EmailConfig::default(),
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
@@ -47551,7 +48049,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::scattered_types::VoiceCallConfig::default(),
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels
@@ -47580,7 +48078,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
@@ -47602,7 +48100,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels.iter().any(|entry| entry.display_name == "Signal"),
@@ -47625,7 +48123,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels
@@ -47650,7 +48148,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels
@@ -47739,7 +48237,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channel = {
             let config = config_arc.read();
             build_configured_discord_channel(
@@ -48134,7 +48632,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let entry = channels
             .iter()
@@ -48606,8 +49104,7 @@ This is an example JSON object for profile settings."#;
             ..Config::default()
         };
         let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
-        let config_write_lock = authority.config_write_lock();
-        let guard = config_write_lock.lock().await;
+        let guard = authority.begin_config_commit().await.unwrap();
         let channel = Arc::new(PersistingChannel {
             authority: authority.clone(),
             waiting: tokio::sync::Notify::new(),
@@ -48633,7 +49130,7 @@ This is an example JSON object for profile settings."#;
             .expect("listener must exit while the config write guard is still held")
             .expect("listener must join without panicking");
         assert!(channel.dropped.load(Ordering::SeqCst));
-        assert!(authority.config().read().peer_groups.is_empty());
+        assert!(authority.snapshot_config().peer_groups.is_empty());
         assert!(!tmp.path().join("config.toml").exists());
         drop(guard);
     }
@@ -50167,7 +50664,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -50301,7 +50801,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -50475,7 +50978,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -50603,7 +51109,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unknown_channel_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "nonexistent") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -50618,7 +51124,7 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn compiled_channel_keys_have_intentional_one_shot_builder_support() {
-        let config_arc = Arc::new(RwLock::new(Config::default()));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(Config::default()).handle();
         let intentionally_unsupported = HashSet::from([
             "nextcloud",
             "feishu",
@@ -50697,17 +51203,19 @@ This is an example JSON object for profile settings."#;
                 ..Default::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
-        let resolver = slack_thread_context_max_messages_resolver(&config_arc, "default");
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let resolver = slack_thread_context_max_messages_resolver(&live.handle(), "default");
 
         assert_eq!(resolver(), 3);
-        config_arc
-            .write()
+        let mut updated = live.snapshot();
+        updated
             .channels
             .slack
             .get_mut("default")
             .unwrap()
             .thread_context_max_messages = Some(8);
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
         assert_eq!(resolver(), 8);
     }
 
@@ -50789,7 +51297,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -50951,7 +51462,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -51105,7 +51619,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -51279,7 +51796,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -51372,7 +51892,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unconfigured_telegram_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "telegram") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -51411,7 +51931,7 @@ This is an example JSON object for profile settings."#;
                 debounce_ms: None,
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
@@ -51810,7 +52330,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unconfigured_voice_call_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "voice-call") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -51844,7 +52364,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "voice-call") {
             Ok(channel) => assert_eq!(channel.name(), "voice_call"),
             Err(e) => panic!("should succeed when voice-call is configured: {e}"),
@@ -52454,7 +52974,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: Arc::new(RwLock::new(zeroclaw_config::schema::Config::default())),
+            live_config: zeroclaw_config::live::LiveConfig::new(
+                zeroclaw_config::schema::Config::default(),
+            )
+            .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -56398,7 +56921,7 @@ mod omitted_feature_tests {
                 ..Default::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels.iter().all(|c| c.display_name != "Telegram"),
