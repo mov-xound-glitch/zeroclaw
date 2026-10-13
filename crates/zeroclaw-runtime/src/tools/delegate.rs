@@ -7896,7 +7896,23 @@ mod tests {
 
     struct LocalChatServer {
         uri: String,
+        /// Connections whose client hung up while their reply was held on
+        /// the gate: a caller that dropped its request mid-flight, which is
+        /// what a cancelled tool loop does. Always zero for an ungated server.
+        hung_up_before_release: Arc<std::sync::atomic::AtomicUsize>,
         _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl LocalChatServer {
+        /// A server with no gate, so nothing is ever held and nothing can
+        /// hang up while held.
+        fn ungated(uri: String, task: tokio::task::JoinHandle<()>) -> Self {
+            Self {
+                uri,
+                hung_up_before_release: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                _task: task,
+            }
+        }
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
@@ -7980,7 +7996,7 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_primary_failure_then_final_chat_server()
@@ -8014,7 +8030,7 @@ mod tests {
             .await;
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_tool_call_chat_server() -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>)
@@ -8038,7 +8054,7 @@ mod tests {
             .await;
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_text_tool_then_final_chat_server() -> (
@@ -8071,7 +8087,7 @@ mod tests {
         });
 
         (
-            LocalChatServer { uri, _task: task },
+            LocalChatServer::ungated(uri, task),
             requests,
             request_bodies,
         )
@@ -8091,7 +8107,7 @@ mod tests {
             tokio::time::sleep(delay).await;
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
@@ -8132,7 +8148,7 @@ mod tests {
             }
         });
 
-        LocalChatServer { uri, _task: task }
+        LocalChatServer::ungated(uri, task)
     }
 
     async fn start_final_chat_server(contents: Vec<&'static str>) -> LocalChatServer {
@@ -8162,7 +8178,7 @@ mod tests {
             }
         });
 
-        LocalChatServer { uri, _task: task }
+        LocalChatServer::ungated(uri, task)
     }
 
     async fn assert_stored_for_target_only(fixture: &DelegateMemoryFixture, key: &str) {
@@ -14708,6 +14724,24 @@ mod tests {
         }
 
         turn.cancel();
+
+        // Each worker's exit is observed, not inferred: a cancelled tool loop
+        // drops its in-flight model call, and the server sees that client
+        // hang up while its reply is still held on the gate.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let hung_up = server
+                .hung_up_before_release
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if hung_up >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {hung_up} of 2 parallel workers dropped its model call after the cancel"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         release.notify_one();
         release.notify_one();
 
@@ -14726,9 +14760,9 @@ mod tests {
             ),
         }
 
-        // A worker that survived the cancel would act on the released reply
-        // and make its second request. Give it the time to do so.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Both workers hung up before anything was released, so neither
+        // could have acted on a reply: the request log holds their two
+        // first requests and nothing else.
         let bodies = captured.lock().unwrap();
         assert_eq!(
             bodies.len(),
@@ -15090,6 +15124,8 @@ mod tests {
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_clone = Arc::clone(&captured);
         let scripted: Arc<Vec<serde_json::Value>> = Arc::new(responses.to_vec());
+        let hung_up = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hung_up_for_server = Arc::clone(&hung_up);
         let task = zeroclaw_spawn::spawn!(async move {
             let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             loop {
@@ -15099,6 +15135,7 @@ mod tests {
                 let captured = Arc::clone(&captured_clone);
                 let scripted = Arc::clone(&scripted);
                 let served = Arc::clone(&served);
+                let hung_up = Arc::clone(&hung_up_for_server);
                 let gated = release.is_some();
                 let release = release.clone();
                 let serve = async move {
@@ -15112,7 +15149,16 @@ mod tests {
                         serde_json::json!({"error": {"message": "unexpected extra provider request"}})
                     });
                     if let Some(release) = &release {
-                        release.notified().await;
+                        // A held reply waits for the gate, unless the client
+                        // hangs up first: that is the exit signal a cancelled
+                        // caller gives, and it is counted instead of served.
+                        tokio::select! {
+                            () = release.notified() => {}
+                            () = client_hung_up(&mut socket) => {
+                                hung_up.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+                        }
                     }
                     write_json_response(&mut socket, response).await;
                 };
@@ -15128,7 +15174,31 @@ mod tests {
             }
         });
 
-        (LocalChatServer { uri, _task: task }, captured)
+        (
+            LocalChatServer {
+                uri,
+                hung_up_before_release: hung_up,
+                _task: task,
+            },
+            captured,
+        )
+    }
+
+    /// Resolves once the peer closes `socket` (or it errors). Bytes the peer
+    /// sends while a reply is held are drained and ignored.
+    async fn client_hung_up(socket: &mut tokio::net::TcpStream) {
+        let mut scratch = [0u8; 64];
+        loop {
+            if socket.readable().await.is_err() {
+                return;
+            }
+            match socket.try_read(&mut scratch) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
     }
 
     async fn start_final_text_chat_server(
@@ -18494,7 +18564,7 @@ command = "rm independent-delegate-marker"
             }
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     /// Caller + agentic targets sharing one delegatable risk profile, with a
