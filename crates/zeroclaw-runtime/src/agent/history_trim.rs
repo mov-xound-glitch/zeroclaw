@@ -19,6 +19,32 @@ pub(crate) const RUNTIME_FEEDBACK_PREFIXES: &[&str] = &["[Tool call parse error]
 /// would resume without the tool results it still needs.
 pub(crate) const SOP_STEP_PROMPT_PREFIX: &str = "[SOP: ";
 
+/// Whether `content` is the prompt a live SOP step appends, judged by the
+/// whole header line the engine writes, `[SOP: <name> (run <id>) — Step <n>
+/// of <m>]`, not by its prefix alone: a user who types a message starting
+/// with `[SOP: ` still opens a turn of their own.
+fn is_sop_step_prompt(content: &str) -> bool {
+    let header = content.lines().next().unwrap_or_default();
+    let Some(rest) = header.strip_prefix(SOP_STEP_PROMPT_PREFIX) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(']') else {
+        return false;
+    };
+    let Some((_, after_run)) = rest.split_once(" (run ") else {
+        return false;
+    };
+    let Some((_, step)) = after_run.split_once(") — Step ") else {
+        return false;
+    };
+    matches!(
+        step.split_once(" of "),
+        Some((n, m)) if !n.is_empty() && !m.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && m.bytes().all(|b| b.is_ascii_digit())
+    )
+}
+
 /// A user row that opens a turn for tool-context retention: a turn boundary
 /// that is neither runtime feedback nor a live SOP step prompt. Whole-turn
 /// trimming keeps its own boundary rule; retention must not let a row the
@@ -29,7 +55,7 @@ fn opens_retention_turn(msg: &ChatMessage) -> bool {
         && !RUNTIME_FEEDBACK_PREFIXES
             .iter()
             .any(|prefix| msg.content.starts_with(prefix))
-        && !msg.content.starts_with(SOP_STEP_PROMPT_PREFIX)
+        && !is_sop_step_prompt(&msg.content)
 }
 
 /// Outcome of a trim pass. `trimmed` is true only when at least one whole turn
@@ -2079,6 +2105,38 @@ mod collapse_tests {
                 .iter()
                 .any(|m| m.role == "tool" && m.content.contains("result 2")),
             "the running turn keeps its own tool result across the step prompts"
+        );
+    }
+
+    #[test]
+    fn a_user_message_that_merely_starts_like_a_step_prompt_opens_a_turn() {
+        // Only the engine's full header marks a step prompt. A user who
+        // types `[SOP: ` opens a turn of their own, so neither their prompt
+        // nor the answer before it can be drained with a prior turn's tools.
+        assert!(!is_sop_step_prompt(
+            "[SOP: notes for today]\nplease summarise"
+        ));
+        assert!(!is_sop_step_prompt("[SOP: x (run 1) — Step one of 3]"));
+        assert!(is_sop_step_prompt(
+            "[SOP: Deploy (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n"
+        ));
+
+        let mut h = native_turn(1);
+        h.push(user("[SOP: notes for today] what did we decide?"));
+        h.push(asst("we decided X"));
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.role == "user" && m.content.starts_with("[SOP: notes")),
+            "the user's own prompt is kept: {:?}",
+            rows(&c.messages)
+        );
+        assert!(
+            c.messages.iter().any(|m| m.content == "answer 1"),
+            "the answer before it is kept as its turn's closing reply: {:?}",
+            rows(&c.messages)
         );
     }
 
