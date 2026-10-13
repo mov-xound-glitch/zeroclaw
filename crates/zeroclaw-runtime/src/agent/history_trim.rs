@@ -19,30 +19,30 @@ pub(crate) const RUNTIME_FEEDBACK_PREFIXES: &[&str] = &["[Tool call parse error]
 /// would resume without the tool results it still needs.
 pub(crate) const SOP_STEP_PROMPT_PREFIX: &str = "[SOP: ";
 
+/// The fixed last line of every step prompt the SOP engine writes.
+pub(crate) const SOP_STEP_PROMPT_TRAILER: &str = "When done, report your result.";
+
 /// Whether `content` is the prompt a live SOP step appends, judged by the
-/// whole header line the engine writes, `[SOP: <name> (run <id>) — Step <n>
-/// of <m>]`, not by its prefix alone: a user who types a message starting
-/// with `[SOP: ` still opens a turn of their own.
-fn is_sop_step_prompt(content: &str) -> bool {
-    let header = content.lines().next().unwrap_or_default();
-    let Some(rest) = header.strip_prefix(SOP_STEP_PROMPT_PREFIX) else {
+/// shape the engine writes around the SOP's name rather than by the prefix
+/// alone: the header `[SOP: <name> (run <id>) — Step <n> of <m>]` closing a
+/// line, and the fixed last line. The name is not parsed, since a SOP name
+/// is free text and may hold newlines or brackets of its own; the step
+/// numbers after it and the trailer are what a user message does not carry.
+pub(crate) fn is_sop_step_prompt(content: &str) -> bool {
+    let Some(after_prefix) = content.strip_prefix(SOP_STEP_PROMPT_PREFIX) else {
         return false;
     };
-    let Some(rest) = rest.strip_suffix(']') else {
+    let Some((_, after_step)) = after_prefix.split_once(") — Step ") else {
         return false;
     };
-    let Some((_, after_run)) = rest.split_once(" (run ") else {
+    let Some((n, after_n)) = after_step.split_once(" of ") else {
         return false;
     };
-    let Some((_, step)) = after_run.split_once(") — Step ") else {
+    let Some((m, _)) = after_n.split_once("]\n") else {
         return false;
     };
-    matches!(
-        step.split_once(" of "),
-        Some((n, m)) if !n.is_empty() && !m.is_empty()
-            && n.bytes().all(|b| b.is_ascii_digit())
-            && m.bytes().all(|b| b.is_ascii_digit())
-    )
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(n) && digits(m) && content.trim_end().ends_with(SOP_STEP_PROMPT_TRAILER)
 }
 
 /// A user row that opens a turn for tool-context retention: a turn boundary
@@ -2116,9 +2116,22 @@ mod collapse_tests {
         assert!(!is_sop_step_prompt(
             "[SOP: notes for today]\nplease summarise"
         ));
-        assert!(!is_sop_step_prompt("[SOP: x (run 1) — Step one of 3]"));
-        assert!(is_sop_step_prompt(
+        assert!(!is_sop_step_prompt(
+            "[SOP: x (run 1) — Step one of 3]\n\nWhen done, report your result.\n"
+        ));
+        assert!(!is_sop_step_prompt(
             "[SOP: Deploy (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n"
+        ));
+        assert!(is_sop_step_prompt(
+            "[SOP: Deploy (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n\nWhen done, report your result.\n"
+        ));
+        // A SOP name is free text: newlines and brackets inside it do not
+        // hide the step prompt, so the caller's turn is not aged by it.
+        assert!(is_sop_step_prompt(
+            "[SOP: Deploy\nproduction (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n\nWhen done, report your result.\n"
+        ));
+        assert!(is_sop_step_prompt(
+            "[SOP: Deploy [eu] (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n\nWhen done, report your result.\n"
         ));
 
         let mut h = native_turn(1);
