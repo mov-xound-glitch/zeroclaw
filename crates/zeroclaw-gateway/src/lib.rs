@@ -4110,8 +4110,9 @@ async fn run_gateway_chat_streaming_response(
             ),
         );
         if !viewer_attached {
-            // Nobody is listening: the turn's own persistence has already
-            // happened inside it, and there is no body to finish.
+            // Nobody is listening and there is no body to finish. The turn's
+            // memory writes, tool effects and usage records are done; the
+            // webhook path keeps no transcript, so its text has no reader.
             return;
         }
         match result {
@@ -4218,9 +4219,13 @@ async fn dispatch_gateway_turn_streaming(
         tokio::select! {
             result = call => {
                 let response = result?;
-                let _ = event_tx
-                    .send(zeroclaw_api::agent::TurnEvent::Chunk { delta: response.clone() })
-                    .await;
+                // One chunk per line, so a fixture can emit more events than
+                // the relay's queue holds and prove the relay keeps reading.
+                for delta in response.split_inclusive('\n') {
+                    let _ = event_tx
+                        .send(zeroclaw_api::agent::TurnEvent::Chunk { delta: delta.to_owned() })
+                        .await;
+                }
                 Ok(response)
             }
             _ = cancel_token.cancelled() => Err(anyhow::Error::msg(
@@ -8624,6 +8629,7 @@ data: [DONE]\n\n";
     struct GatedProvider {
         release: Arc<tokio::sync::Notify>,
         completed: Arc<std::sync::atomic::AtomicUsize>,
+        reply: String,
     }
 
     #[async_trait]
@@ -8638,7 +8644,7 @@ data: [DONE]\n\n";
             self.release.notified().await;
             self.completed
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("gated ok".into())
+            Ok(self.reply.clone())
         }
     }
 
@@ -9106,6 +9112,7 @@ data: [DONE]\n\n";
         let state = sse_test_state(Arc::new(GatedProvider {
             release: Arc::clone(&release),
             completed: Arc::clone(&completed),
+            reply: "gated ok".into(),
         }));
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -9170,6 +9177,65 @@ data: [DONE]\n\n";
             1,
             "the turn ran to completion with nobody listening"
         );
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_detached_turn_drains_events_past_the_queue() {
+        // Once the viewer is gone the relay must keep reading the turn's
+        // events: the event queue holds 64, so a turn that emits more than
+        // that would block on a relay that stopped after the first failed
+        // frame, and never finish.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = sse_test_state(Arc::new(GatedProvider {
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+            reply: "line\n".repeat(200),
+        }));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-flood"));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+            })),
+        )
+        .await;
+        let token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-flood")
+            .cloned()
+            .expect("streamed turn must register its cancellation token");
+
+        drop(response);
+        release.notify_one();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .contains_key("gw_sse-flood")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "a detached turn emitting more events than the queue holds must still finish"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!token.is_cancelled());
     }
 
