@@ -1683,6 +1683,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // hook-selected model, schemas, or prepared messages.
     let mut pending_reported_usage: Option<ReportedRequestUsage> = None;
 
+    // The tools this loop can execute tell a call row apart from an ordinary
+    // reply whose JSON merely contains a `tool_calls` array when a request is
+    // collapsed: the registry, not an iteration's offered subset, since a
+    // carrier in an older turn may name a tool excluded since.
+    let known_tool_names: std::collections::HashSet<String> = tools_registry
+        .iter()
+        .map(|tool| tool.name().to_ascii_lowercase())
+        .collect();
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
         // Re-resolved every iteration, against the tools callable *right now*.
@@ -1892,6 +1900,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_state.history,
             keep_tool_context_turns,
             turn_state.crumb_present,
+            &known_tool_names,
         );
         if iteration == 0 && collapsed.dropped_messages > 0 {
             record_tool_context_collapse(&collapsed, keep_tool_context_turns, turn_id);
@@ -7233,6 +7242,7 @@ mod sop_step_reassembly_tests {
             budget,
             cancellation_token,
             max_tool_iterations,
+            2,
             None,
             None,
             None,
@@ -7240,6 +7250,7 @@ mod sop_step_reassembly_tests {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_budgeted_test_loop_with_hooks(
         provider: &dyn ModelProvider,
         history: &mut Vec<ChatMessage>,
@@ -7247,6 +7258,7 @@ mod sop_step_reassembly_tests {
         budget: ExecutionTreeBudget,
         cancellation_token: CancellationToken,
         max_tool_iterations: usize,
+        keep_tool_context_turns: usize,
         security: Option<&crate::security::SecurityPolicy>,
         hooks: Option<&crate::hooks::HookRunner>,
         image_cache: Option<ToolLoopImageState<'_>>,
@@ -7294,7 +7306,7 @@ mod sop_step_reassembly_tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 30_000,
-                    keep_tool_context_turns: 2,
+                    keep_tool_context_turns,
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
                         100_000,
                     ),
@@ -7324,6 +7336,93 @@ mod sop_step_reassembly_tests {
             turn_id: &turn_id,
         })
         .await
+    }
+
+    /// The first parent request after a live SOP step: the step's prompt
+    /// rows sit on the parent's history, retention is at its smallest and
+    /// trimming is off. The tool round that opened the parent's turn must
+    /// still be in the request, and a plain user row in the same place must
+    /// still age it, so the step prompt's marker is what keeps the turn whole.
+    #[tokio::test]
+    async fn resumed_parent_request_keeps_its_tool_round_across_sop_step_prompts() {
+        struct NamedEchoTool;
+        impl zeroclaw_api::attribution::Attributable for NamedEchoTool {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+            }
+            fn alias(&self) -> &str {
+                "echo"
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for NamedEchoTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echoes its arguments"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                args: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: args.to_string().into(),
+                    error: None,
+                })
+            }
+        }
+        let carrier = r#"{"content":null,"tool_calls":[{"id":"call_parent","name":"echo","arguments":"{\"text\":\"hi\"}"}]}"#;
+        let result = r#"{"tool_call_id":"call_parent","content":"echo: hi"}"#;
+        let step_prompt = "[SOP: Deploy (run r1) — Step 1 of 1]\n\nCurrent step: **report**\nWhen done, report your result.\n";
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            NamedEchoTool,
+        )]);
+        for (interrupting_row, must_keep) in [(step_prompt, true), ("another user message", false)]
+        {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = CaptureProvider {
+                requests: Arc::clone(&requests),
+            };
+            let mut history = vec![
+                ChatMessage::user("parent request"),
+                ChatMessage::assistant(carrier),
+                ChatMessage::tool(result),
+                ChatMessage::user(interrupting_row),
+                ChatMessage::assistant("step done"),
+                ChatMessage::user("[Tool call parse error]\nresume"),
+            ];
+            run_budgeted_test_loop_with_hooks(
+                &provider,
+                &mut history,
+                &tools,
+                ExecutionTreeBudget::root(8),
+                CancellationToken::new(),
+                3,
+                0,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the resumed parent completes");
+            let captured = requests.lock().expect("capture lock");
+            let sent = &captured[0].0;
+            let has_call = sent.iter().any(|m| m.content == carrier);
+            let has_result = sent.iter().any(|m| m.role == "tool" && m.content == result);
+            assert_eq!(
+                (has_call, has_result),
+                (must_keep, must_keep),
+                "after {interrupting_row:?} the request was: {:?}",
+                sent.iter()
+                    .map(|m| (&m.role, &m.content))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[tokio::test]
@@ -7480,6 +7579,7 @@ mod sop_step_reassembly_tests {
                 budget.clone(),
                 CancellationToken::new(),
                 10,
+                2,
                 None,
                 Some(&hooks),
                 Some(image_state),
@@ -7516,6 +7616,7 @@ mod sop_step_reassembly_tests {
             ExecutionTreeBudget::root(1),
             CancellationToken::new(),
             10,
+            2,
             Some(&security),
             None,
             None,
