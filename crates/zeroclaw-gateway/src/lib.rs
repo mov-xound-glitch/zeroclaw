@@ -3792,14 +3792,27 @@ fn reconcile_sse_final_response(cumulative: &mut String, final_response: &str) -
 
 type SseFrame = Result<SseWireEvent, std::convert::Infallible>;
 
-async fn send_sse_frame_or_cancel(
+/// Why a frame did not reach the SSE body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseSend {
+    Sent,
+    /// The turn was cancelled while the frame waited for queue space.
+    Cancelled,
+    /// The client dropped the response body: there is no viewer any more.
+    ViewerGone,
+}
+
+async fn send_sse_frame(
     frame_tx: &tokio::sync::mpsc::Sender<SseFrame>,
     frame: SseFrame,
     cancel_token: &tokio_util::sync::CancellationToken,
-) -> bool {
+) -> SseSend {
     tokio::select! {
-        result = frame_tx.send(frame) => result.is_ok(),
-        _ = cancel_token.cancelled() => false,
+        result = frame_tx.send(frame) => match result {
+            Ok(()) => SseSend::Sent,
+            Err(_) => SseSend::ViewerGone,
+        },
+        _ = cancel_token.cancelled() => SseSend::Cancelled,
     }
 }
 
@@ -3845,10 +3858,10 @@ pub(crate) fn remove_cancel_token_if_current(
     }
 }
 
-struct SseClientStream {
-    receiver: tokio::sync::mpsc::Receiver<SseFrame>,
-    terminal_receiver: Option<tokio::sync::oneshot::Receiver<SseFrame>>,
-    terminal_delivered: bool,
+/// The cancellation a body holds when it owns its turn: an anonymous
+/// streamed turn, which no client could abort or read back once the body is
+/// gone, so leaving cancels it at once rather than at the next chunk.
+struct OwnedTurnCancel {
     cancel_token: Arc<tokio_util::sync::CancellationToken>,
     cancel_tokens: Arc<
         std::sync::Mutex<
@@ -3856,6 +3869,31 @@ struct SseClientStream {
         >,
     >,
     cancel_key: String,
+}
+
+/// The response body of a streamed webhook turn. For a session-bound turn it
+/// is a viewer, not the owner: dropping it (the client went away) closes the
+/// frame queue, which the relay task reads as the viewer leaving, and the
+/// turn runs on. An anonymous turn's body owns the turn and cancels it when
+/// dropped.
+struct SseClientStream {
+    receiver: tokio::sync::mpsc::Receiver<SseFrame>,
+    terminal_receiver: Option<tokio::sync::oneshot::Receiver<SseFrame>>,
+    terminal_delivered: bool,
+    owned_turn: Option<OwnedTurnCancel>,
+}
+
+impl Drop for SseClientStream {
+    fn drop(&mut self) {
+        if let Some(owned) = &self.owned_turn {
+            owned.cancel_token.cancel();
+            remove_cancel_token_if_current(
+                &owned.cancel_tokens,
+                &owned.cancel_key,
+                &owned.cancel_token,
+            );
+        }
+    }
 }
 
 impl futures_util::Stream for SseClientStream {
@@ -3896,13 +3934,6 @@ impl futures_util::Stream for SseClientStream {
     }
 }
 
-impl Drop for SseClientStream {
-    fn drop(&mut self) {
-        self.cancel_token.cancel();
-        remove_cancel_token_if_current(&self.cancel_tokens, &self.cancel_key, &self.cancel_token);
-    }
-}
-
 /// Stream one gateway chat turn over Server-Sent Events.
 ///
 /// Drives the turn with the same streamed agent API the `/ws/chat` path uses
@@ -3910,7 +3941,14 @@ impl Drop for SseClientStream {
 /// `TurnEvent::Chunk` text as `event: token` frames. The turn's cancellation
 /// token is registered under the same `gw_{session}` key the abort endpoint
 /// uses, so an in-flight streamed turn is cancellable exactly like a
-/// WebSocket turn; a client disconnect cancels the token too.
+/// WebSocket turn. Like the WebSocket, a session-bound stream is a viewer of
+/// the turn, not its owner: a client that disconnects mid-turn detaches, the
+/// turn runs to completion unattended and the token stays registered until it
+/// ends, so only `POST /api/sessions/{id}/abort`, or a newer turn on the same
+/// session, cancels it. A request without `X-Session-Id` runs under a
+/// generated key the client never learns and sets no memory session, so
+/// nobody could abort or read back a detached turn: that stream still owns
+/// its turn, and dropping it cancels.
 async fn run_gateway_chat_streaming_response(
     state: &AppState,
     message: &str,
@@ -3975,38 +4013,69 @@ async fn run_gateway_chat_streaming_response(
 
     let state_for_frames = state.clone();
     let cancel_key_for_frames = cancel_key.clone();
-    let token_for_stream = Arc::clone(&cancel_token);
+    let session_key_for_frames = session_key.clone();
+    // A session-bound turn can be aborted and read back after the client is
+    // gone; an anonymous one cannot, so its viewer is its owner.
+    let viewer_owns_turn = session_id.is_none();
+    let token_for_body = Arc::clone(&cancel_token);
     zeroclaw_spawn::spawn!(async move {
         let mut terminal_tx = Some(terminal_tx);
         let mut cumulative = String::new();
+        // A session-bound body is a viewer of the turn, not its owner. Once
+        // the client is gone (the frame queue's receiver dropped) this task
+        // stops sending frames but keeps draining `event_rx`, so the agent
+        // runs to completion and persists its real response. Only the
+        // explicit abort path (`cancel_token`, reached through
+        // `POST /api/sessions/{id}/abort`) or a newer turn on the session
+        // cancels it. An anonymous body owns its turn: its leaving cancels.
+        let mut viewer_attached = true;
+        let interrupted = || {
+            zeroclaw_providers::sanitize_api_error(
+                &zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user"),
+            )
+        };
+        let detach = |viewer_attached: &mut bool| {
+            if *viewer_attached {
+                *viewer_attached = false;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key_for_frames,
+                            "transport": "sse",
+                        })),
+                    "SSE client detached mid-turn; turn continues unattended"
+                );
+            }
+        };
         loop {
             tokio::select! {
                 maybe = event_rx.recv() => match maybe {
                     Some(zeroclaw_api::agent::TurnEvent::Chunk { delta }) => {
                         cumulative.push_str(&delta);
-                        if !send_sse_frame_or_cancel(
-                            &frame_tx,
-                            sse_token_frame(&cumulative),
-                            &cancel_token,
-                        )
-                        .await
+                        if !viewer_attached {
+                            continue;
+                        }
+                        match send_sse_frame(&frame_tx, sse_token_frame(&cumulative), &cancel_token)
+                            .await
                         {
-                            // The bounded token queue may be full, so a
-                            // cancellation-aware send can return without
-                            // delivering the terminal frame through it.
-                            cancel_token.cancel();
-                            let message = zeroclaw_providers::sanitize_api_error(
-                                &zeroclaw_runtime::i18n::get_required_cli_string(
-                                    "turn-interrupted-by-user",
-                                ),
-                            );
-                            send_sse_terminal_error(&mut terminal_tx, &message);
-                            remove_cancel_token_if_current(
-                                &state_for_frames.cancel_tokens,
-                                &cancel_key_for_frames,
-                                &cancel_token,
-                            );
-                            return;
+                            SseSend::Sent => {}
+                            SseSend::ViewerGone if !viewer_owns_turn => detach(&mut viewer_attached),
+                            SseSend::ViewerGone | SseSend::Cancelled => {
+                                if viewer_owns_turn {
+                                    cancel_token.cancel();
+                                }
+                                // The bounded token queue may be full, so a
+                                // cancellation-aware send can return without
+                                // delivering the terminal frame through it.
+                                send_sse_terminal_error(&mut terminal_tx, &interrupted());
+                                remove_cancel_token_if_current(
+                                    &state_for_frames.cancel_tokens,
+                                    &cancel_key_for_frames,
+                                    &cancel_token,
+                                );
+                                return;
+                            }
                         }
                     }
                     Some(_) => {}
@@ -4015,14 +4084,9 @@ async fn run_gateway_chat_streaming_response(
                 _ = cancel_token.cancelled() => {
                     // A server-side abort can leave the HTTP connection open.
                     // Emit one sanitized terminal frame before ending the
-                    // stream; a disconnected client makes this send fail and
-                    // is handled by the same path without additional work.
-                    let message = zeroclaw_providers::sanitize_api_error(
-                        &zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        ),
-                    );
-                    send_sse_terminal_error(&mut terminal_tx, &message);
+                    // stream; a client that is already gone makes this send
+                    // fail and is handled by the same path without more work.
+                    send_sse_terminal_error(&mut terminal_tx, &interrupted());
                     remove_cancel_token_if_current(
                         &state_for_frames.cancel_tokens,
                         &cancel_key_for_frames,
@@ -4045,74 +4109,58 @@ async fn run_gateway_chat_streaming_response(
                 started_at.elapsed(),
             ),
         );
+        if !viewer_attached {
+            // Nobody is listening: the turn's own persistence has already
+            // happened inside it, and there is no body to finish.
+            return;
+        }
         match result {
             Ok(final_response) => {
                 if let Some(frame) = reconcile_sse_final_response(&mut cumulative, &final_response)
+                    && send_sse_frame(&frame_tx, frame, &cancel_token).await != SseSend::Sent
                 {
-                    if !send_sse_frame_or_cancel(&frame_tx, frame, &cancel_token).await {
-                        cancel_token.cancel();
-                        let message = zeroclaw_providers::sanitize_api_error(
-                            &zeroclaw_runtime::i18n::get_required_cli_string(
-                                "turn-interrupted-by-user",
-                            ),
-                        );
-                        send_sse_terminal_error(&mut terminal_tx, &message);
-                        return;
-                    }
+                    // Cancelled or gone during the final frame: the turn is
+                    // over either way, so a terminal frame is all that is
+                    // left to offer, and a gone client simply never reads it.
+                    send_sse_terminal_error(&mut terminal_tx, &interrupted());
+                    return;
                 }
-                if !send_sse_frame_or_cancel(
+                if send_sse_frame(
                     &frame_tx,
                     Ok(SseWireEvent::default().event("done").data("{}")),
                     &cancel_token,
                 )
                 .await
+                    != SseSend::Sent
                 {
-                    cancel_token.cancel();
-                    let message = zeroclaw_providers::sanitize_api_error(
-                        &zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        ),
-                    );
-                    send_sse_terminal_error(&mut terminal_tx, &message);
+                    send_sse_terminal_error(&mut terminal_tx, &interrupted());
                 }
             }
             Err(e) => {
                 if cancel_token.is_cancelled() {
-                    let message = zeroclaw_providers::sanitize_api_error(
-                        &zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        ),
-                    );
-                    send_sse_terminal_error(&mut terminal_tx, &message);
+                    send_sse_terminal_error(&mut terminal_tx, &interrupted());
                 } else {
                     let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
-                    if !send_sse_frame_or_cancel(
-                        &frame_tx,
-                        sse_error_frame(&sanitized),
-                        &cancel_token,
-                    )
-                    .await
+                    if send_sse_frame(&frame_tx, sse_error_frame(&sanitized), &cancel_token).await
+                        != SseSend::Sent
                     {
-                        cancel_token.cancel();
-                        let message = zeroclaw_providers::sanitize_api_error(
-                            &zeroclaw_runtime::i18n::get_required_cli_string(
-                                "turn-interrupted-by-user",
-                            ),
-                        );
-                        send_sse_terminal_error(&mut terminal_tx, &message);
+                        send_sse_terminal_error(&mut terminal_tx, &interrupted());
                     }
                 }
             }
         }
     });
 
+    let owned_turn = viewer_owns_turn.then(|| OwnedTurnCancel {
+        cancel_token: token_for_body,
+        cancel_tokens: Arc::clone(&state.cancel_tokens),
+        cancel_key: cancel_key.clone(),
+    });
     let body = SseBody::new(SseClientStream {
         receiver: frame_rx,
         terminal_receiver: Some(terminal_rx),
         terminal_delivered: false,
-        cancel_token: token_for_stream,
-        cancel_tokens: Arc::clone(&state.cancel_tokens),
-        cancel_key,
+        owned_turn,
     })
     .keep_alive(SseKeepAlive::default());
     (
@@ -8571,6 +8619,43 @@ data: [DONE]\n\n";
 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
 
+    /// Answers once the test releases it, and records that it did: a turn
+    /// that outlives its viewer can be shown to run to completion.
+    struct GatedProvider {
+        release: Arc<tokio::sync::Notify>,
+        completed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for GatedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.release.notified().await;
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("gated ok".into())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GatedProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "GatedProvider"
+        }
+    }
+
     struct HangingProvider;
 
     #[async_trait]
@@ -8961,8 +9046,67 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
-    async fn webhook_sse_body_drop_cancels_turn() {
+    async fn webhook_sse_anonymous_body_drop_cancels_turn() {
+        // Without `X-Session-Id` the turn runs under a key the client never
+        // learns and sets no memory session, so nobody could abort it or read
+        // its result: the body owns it, and dropping the body cancels at once.
         let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+            })),
+        )
+        .await;
+        let token = {
+            let tokens = state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned");
+            assert_eq!(tokens.len(), 1, "one generated key: {:?}", tokens.keys());
+            tokens.values().next().cloned().expect("registered token")
+        };
+
+        drop(response);
+
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .expect("dropping an anonymous SSE body must cancel its turn");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .is_empty()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the cancelled anonymous turn must release its token"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_body_drop_detaches_turn_which_runs_to_completion() {
+        // The body is a viewer of the turn, not its owner: dropping it must
+        // not cancel the turn, and the token must stay registered so the
+        // abort endpoint still reaches the detached turn until it ends.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = sse_test_state(Arc::new(GatedProvider {
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+        }));
         let mut headers = HeaderMap::new();
         headers.insert(
             header::ACCEPT,
@@ -8991,17 +9135,92 @@ data: [DONE]\n\n";
 
         drop(response);
 
-        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
-            .await
-            .expect("dropping the SSE body must cancel the in-flight turn");
         assert!(
-            !state
+            tokio::time::timeout(Duration::from_millis(300), token.cancelled())
+                .await
+                .is_err(),
+            "dropping the SSE body must not cancel the in-flight turn"
+        );
+        assert!(
+            state
                 .cancel_tokens
                 .lock()
                 .expect("cancel_tokens lock poisoned")
                 .contains_key("gw_sse-drop"),
-            "dropping the SSE body must remove its cancellation token"
+            "the detached turn stays abortable while it runs"
         );
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        release.notify_one();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .contains_key("gw_sse-drop")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the detached turn must finish and release its token"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the turn ran to completion with nobody listening"
+        );
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_detached_turn_still_stops_on_abort() {
+        // After the viewer is gone, the explicit abort path is the one way
+        // to end the turn, exactly as for a detached WebSocket.
+        let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-abort"));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+            })),
+        )
+        .await;
+        let token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-abort")
+            .cloned()
+            .expect("streamed turn must register its cancellation token");
+        drop(response);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!token.is_cancelled(), "a dropped body does not cancel");
+
+        token.cancel();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .contains_key("gw_sse-abort")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "an aborted detached turn must release its token"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
