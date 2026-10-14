@@ -3711,6 +3711,68 @@ mod embedded_protocol_detection_tests {
     }
 
     #[test]
+    fn detection_follows_the_executable_alias_table() {
+        // `names_known_tool` reuses `map_tool_name_alias`, so which generic
+        // names count as naming an active tool is decided by that table,
+        // not here. Pinned so a table change shows up in the detector's own
+        // tests: shell keeps its command aliases, `web_search` maps to
+        // `web_search_tool`, and browser or search names never reach
+        // `shell`, so a tutorial quoting a made-up `web_search` call is not
+        // read as a leaked shell call.
+        let shell = HashSet::from(["shell".to_string()]);
+        for name in [
+            "shell",
+            "bash",
+            "BASH",
+            "sh",
+            "exec",
+            "command",
+            "cmd",
+            "default_api.bash",
+        ] {
+            assert!(names_known_tool(name, &shell), "{name} must name shell");
+        }
+        for name in [
+            "web_search",
+            "web_search_tool",
+            "browser",
+            "browser_open",
+            "fetch",
+            "curl",
+            "http",
+            "file",
+            "store",
+            "",
+        ] {
+            assert!(
+                !names_known_tool(name, &shell),
+                "{name:?} must not name shell"
+            );
+        }
+
+        let search = HashSet::from(["web_search_tool".to_string()]);
+        assert!(names_known_tool("web_search", &search));
+        assert!(names_known_tool("web_search_tool", &search));
+        assert!(!names_known_tool("browser", &search));
+
+        let http = HashSet::from(["http_request".to_string()]);
+        for name in ["http_request", "http", "fetch", "curl", "wget"] {
+            assert!(
+                names_known_tool(name, &http),
+                "{name} must name http_request"
+            );
+        }
+
+        // Generic file and memory names name only their own tools.
+        let file = HashSet::from(["file_read".to_string()]);
+        assert!(names_known_tool("file", &file));
+        assert!(names_known_tool("readfile", &file));
+        let memory = HashSet::from(["memory_store".to_string()]);
+        assert!(names_known_tool("store", &memory));
+        assert!(!names_known_tool("store", &file));
+    }
+
+    #[test]
     fn a_python_stub_naming_a_tool_alias_is_detected() {
         // The stub path must normalize names exactly as the envelope path
         // does: a stub naming `bash` or `readfile` leaks a call to the
