@@ -56,7 +56,10 @@ pub(crate) struct StreamedChatOutcome {
     pub(crate) saw_pre_executed_tool_activity: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Request exposure and protocol recognition need distinct tool projections"
+)]
 pub(crate) async fn consume_provider_streaming_response(
     model_provider: &dyn ModelProvider,
     messages: &[ChatMessage],
@@ -69,6 +72,7 @@ pub(crate) async fn consume_provider_streaming_response(
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     strict_tool_parsing: bool,
     draft_reasoning: StreamReasoningMode,
+    guard_tools: Option<&[crate::tools::ToolSpec]>,
 ) -> Result<StreamedChatOutcome> {
     let mut provider_stream = ProviderDispatch::from_ref(model_provider).stream_chat(
         ChatRequest {
@@ -87,10 +91,12 @@ pub(crate) async fn consume_provider_streaming_response(
     let mut delta_sender = on_delta;
     let mut think_stripper = StreamThinkTagStripper::default();
     let mut marker_stripper = StreamTerminalMarkerStripper::new();
-    // The guard needs the active tool names even when the provider request
-    // carries no native tool specs (text-tool mode): the final response
-    // check knows them, and streaming must refuse the same leaks it does.
-    let mut text_guard = StreamTextGuard::new(request_tools, known_tool_names);
+    // The guard recognises every active tool, not only the ones the request
+    // exposes natively: `guard_tools` carries the iteration's specs when
+    // native tools are in use, and `known_tool_names` the names the loop can
+    // execute even in text-tool mode, so streaming refuses the same leaks
+    // the final response check does.
+    let mut text_guard = StreamTextGuard::new(guard_tools, known_tool_names);
     // Correlates PreExecutedToolCall events with their later results so both
     // TurnEvents share a stable id (FIFO per tool name).
     let mut pre_executed_ids: std::collections::HashMap<
@@ -804,6 +810,7 @@ mod tests {
             Some(&event_tx),
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -837,6 +844,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect_err("a semantically empty stream must not complete successfully");
@@ -867,6 +875,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect_err("cancellation must interrupt the stream");
@@ -909,6 +918,7 @@ mod tests {
             Some(&event_tx),
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect_err("cancellation must interrupt the stream");
@@ -944,6 +954,7 @@ mod tests {
             Some(&event_tx),
             false,
             StreamReasoningMode::Full,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -991,6 +1002,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Full,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1014,6 +1026,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1041,6 +1054,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1070,6 +1084,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Full,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1104,6 +1119,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Off,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1119,12 +1135,14 @@ mod tests {
 
     struct MarkerTestProvider {
         text_sequence: Vec<&'static str>,
+        captured_tool_names: std::sync::Mutex<Vec<String>>,
     }
 
     impl MarkerTestProvider {
         fn with_text_sequence(texts: Vec<&'static str>) -> Self {
             Self {
                 text_sequence: texts,
+                captured_tool_names: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -1182,11 +1200,17 @@ mod tests {
 
         fn stream_chat(
             &self,
-            _request: ChatRequest<'_>,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            *self.captured_tool_names.lock().unwrap() = request
+                .tools
+                .unwrap_or(&[])
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect();
             let events: Vec<StreamResult<StreamEvent>> = self
                 .text_sequence
                 .iter()
@@ -1195,6 +1219,61 @@ mod tests {
                 .collect();
             Box::pin(futures_util::stream::iter(events))
         }
+    }
+
+    #[tokio::test]
+    async fn deferred_builtin_streaming_call_is_suppressed_without_exposing_its_schema() {
+        let provider = MarkerTestProvider::with_text_sequence(vec![
+            "{\"name\":\"cal",
+            "endar\",\"arguments\":{}}",
+        ]);
+        let exposed = vec![crate::tools::ToolSpec::new(
+            "tool_search",
+            "search",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut callable = exposed.clone();
+        callable.push(crate::tools::ToolSpec::new(
+            "calendar",
+            "events",
+            serde_json::json!({"type": "object"}),
+        ));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(16);
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            Some(&exposed),
+            &std::collections::HashSet::new(),
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&delta_tx),
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+            Some(&callable),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *provider.captured_tool_names.lock().unwrap(),
+            vec!["tool_search"]
+        );
+        assert!(outcome.suppressed_protocol);
+        assert_eq!(
+            outcome.response_text,
+            "{\"name\":\"calendar\",\"arguments\":{}}"
+        );
+        assert!(outcome.forwarded_visible_text.is_empty());
+        assert!(
+            !std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(event, TurnEvent::Chunk { .. }))
+        );
+        assert!(
+            !std::iter::from_fn(|| delta_rx.try_recv().ok())
+                .any(|delta| matches!(delta, StreamDelta::Text(_)))
+        );
     }
 
     #[tokio::test]
@@ -1213,6 +1292,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1240,6 +1320,7 @@ mod tests {
             None,
             true, // strict_tool_parsing = true
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1350,6 +1431,7 @@ mod tests {
             Some(&tx), // event_tx
             true,      // strict_tool_parsing = true
             StreamReasoningMode::Status,
+            None,
         )
         .await;
 
@@ -1398,6 +1480,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1424,6 +1507,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1450,6 +1534,7 @@ mod tests {
             None,
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("stream consume should succeed");
@@ -1563,6 +1648,7 @@ mod tests {
                 Some(&event_tx),
                 false,
                 StreamReasoningMode::Status,
+                None,
             )
             .await
         });
@@ -1686,6 +1772,7 @@ mod tests {
             Some(&event_tx),
             false,
             StreamReasoningMode::Status,
+            None,
         )
         .await;
 
