@@ -3075,6 +3075,34 @@ struct GatewayChatDispatchCapture {
 static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Events the test-only streamed dispatch delivered into the relay, per
+/// session id, so a test can tell a relay that drained everything from one
+/// that closed its receiver early.
+#[cfg(test)]
+static SSE_TEST_EVENTS_DELIVERED: std::sync::Mutex<Vec<(String, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn sse_test_record_event_delivered(session_id: &str) {
+    let mut delivered = SSE_TEST_EVENTS_DELIVERED
+        .lock()
+        .expect("sse delivery counter mutex poisoned");
+    match delivered.iter_mut().find(|(key, _)| key == session_id) {
+        Some((_, count)) => *count += 1,
+        None => delivered.push((session_id.to_owned(), 1)),
+    }
+}
+
+#[cfg(test)]
+fn sse_test_events_delivered(session_id: &str) -> usize {
+    SSE_TEST_EVENTS_DELIVERED
+        .lock()
+        .expect("sse delivery counter mutex poisoned")
+        .iter()
+        .find(|(key, _)| key == session_id)
+        .map_or(0, |(_, count)| *count)
+}
+
 // Tests that read or clear the shared capture buffer hold this lock so
 // parallel webhook tests cannot invalidate one another's evidence.
 #[cfg(test)]
@@ -3268,6 +3296,14 @@ pub struct WebhookBody {
     /// send an `Accept: text/event-stream` header.
     #[serde(default)]
     pub stream: bool,
+    /// Keep a streamed turn running after this response body is dropped,
+    /// instead of cancelling it. Requires `X-Session-Id`, so the turn stays
+    /// addressable through `POST /api/sessions/{id}/abort`. The webhook keeps
+    /// no transcript, so a detached turn's text has no reader: what it
+    /// leaves behind is its memory writes, tool effects and usage records.
+    /// Only meaningful with `stream: true`.
+    #[serde(default)]
+    pub continue_on_disconnect: bool,
 }
 
 /// Webhook query parameters
@@ -3678,11 +3714,20 @@ async fn handle_webhook(
     // client disconnects through the shared cancellation registry. Every
     // other combination keeps the JSON `{ response }` path below untouched.
     if webhook_body.stream && accepts_sse(&headers) {
+        if webhook_body.continue_on_disconnect && session_id.is_none() {
+            // Without a session nobody could abort the detached turn, so the
+            // request is refused rather than silently kept cancel-on-drop.
+            let err = serde_json::json!({
+                "error": "continue_on_disconnect requires an X-Session-Id header"
+            });
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        }
         return run_gateway_chat_streaming_response(
             &state,
             message,
             session_id.as_deref(),
             agent_override,
+            webhook_body.continue_on_disconnect,
             started_at,
         )
         .await;
@@ -3858,9 +3903,9 @@ pub(crate) fn remove_cancel_token_if_current(
     }
 }
 
-/// The cancellation a body holds when it owns its turn: an anonymous
-/// streamed turn, which no client could abort or read back once the body is
-/// gone, so leaving cancels it at once rather than at the next chunk.
+/// The cancellation a body holds when it owns its turn, which is every
+/// streamed turn that did not opt into `continue_on_disconnect`: leaving
+/// cancels it at once rather than at the next chunk.
 struct OwnedTurnCancel {
     cancel_token: Arc<tokio_util::sync::CancellationToken>,
     cancel_tokens: Arc<
@@ -3871,11 +3916,11 @@ struct OwnedTurnCancel {
     cancel_key: String,
 }
 
-/// The response body of a streamed webhook turn. For a session-bound turn it
-/// is a viewer, not the owner: dropping it (the client went away) closes the
-/// frame queue, which the relay task reads as the viewer leaving, and the
-/// turn runs on. An anonymous turn's body owns the turn and cancels it when
-/// dropped.
+/// The streamed response body. By default it owns its turn and cancels it
+/// when dropped. A turn that opted into `continue_on_disconnect` (with an
+/// `X-Session-Id`) is only viewed by its body: dropping it closes the frame
+/// queue, which the relay task reads as the viewer leaving, and the turn
+/// runs on until it ends or `POST /api/sessions/{id}/abort` cancels it.
 struct SseClientStream {
     receiver: tokio::sync::mpsc::Receiver<SseFrame>,
     terminal_receiver: Option<tokio::sync::oneshot::Receiver<SseFrame>>,
@@ -3941,19 +3986,20 @@ impl futures_util::Stream for SseClientStream {
 /// `TurnEvent::Chunk` text as `event: token` frames. The turn's cancellation
 /// token is registered under the same `gw_{session}` key the abort endpoint
 /// uses, so an in-flight streamed turn is cancellable exactly like a
-/// WebSocket turn. Like the WebSocket, a session-bound stream is a viewer of
-/// the turn, not its owner: a client that disconnects mid-turn detaches, the
-/// turn runs to completion unattended and the token stays registered until it
-/// ends, so only `POST /api/sessions/{id}/abort`, or a newer turn on the same
-/// session, cancels it. A request without `X-Session-Id` runs under a
-/// generated key the client never learns and sets no memory session, so
-/// nobody could abort or read back a detached turn: that stream still owns
-/// its turn, and dropping it cancels.
+/// WebSocket turn. By default the stream owns its turn and dropping it
+/// cancels, the contract streamed webhook callers have always had. A caller
+/// that sends `continue_on_disconnect: true` with its `X-Session-Id` makes
+/// the stream a viewer instead, like a WebSocket: a disconnect mid-turn
+/// detaches, the turn runs to completion unattended and the token stays
+/// registered until it ends, so only `POST /api/sessions/{id}/abort`, or a
+/// newer turn on the same session, cancels it. The handler refuses the opt-in
+/// without a session, since nobody could abort such a turn.
 async fn run_gateway_chat_streaming_response(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
     agent_override: Option<&str>,
+    continue_on_disconnect: bool,
     started_at: Instant,
 ) -> Response {
     if let Some(err) = needs_quickstart_for(&state.model) {
@@ -4014,20 +4060,22 @@ async fn run_gateway_chat_streaming_response(
     let state_for_frames = state.clone();
     let cancel_key_for_frames = cancel_key.clone();
     let session_key_for_frames = session_key.clone();
-    // A session-bound turn can be aborted and read back after the client is
-    // gone; an anonymous one cannot, so its viewer is its owner.
-    let viewer_owns_turn = session_id.is_none();
+    // Only an opted-in turn with a session outlives its body: it stays
+    // abortable through the registered token. Every other stream owns its
+    // turn, so dropping it cancels.
+    let viewer_owns_turn = session_id.is_none() || !continue_on_disconnect;
     let token_for_body = Arc::clone(&cancel_token);
     zeroclaw_spawn::spawn!(async move {
         let mut terminal_tx = Some(terminal_tx);
         let mut cumulative = String::new();
-        // A session-bound body is a viewer of the turn, not its owner. Once
-        // the client is gone (the frame queue's receiver dropped) this task
-        // stops sending frames but keeps draining `event_rx`, so the agent
-        // runs to completion and persists its real response. Only the
-        // explicit abort path (`cancel_token`, reached through
+        // An opted-in body is a viewer of the turn, not its owner. Once the
+        // client is gone (the frame queue's receiver dropped) this task stops
+        // sending frames but keeps draining `event_rx`, so the agent runs to
+        // completion: its memory writes, tool effects and usage records
+        // happen, although the webhook keeps no transcript of its text. Only
+        // the explicit abort path (`cancel_token`, reached through
         // `POST /api/sessions/{id}/abort`) or a newer turn on the session
-        // cancels it. An anonymous body owns its turn: its leaving cancels.
+        // cancels it. Any other body owns its turn: its leaving cancels.
         let mut viewer_attached = true;
         let interrupted = || {
             zeroclaw_providers::sanitize_api_error(
@@ -4221,10 +4269,17 @@ async fn dispatch_gateway_turn_streaming(
                 let response = result?;
                 // One chunk per line, so a fixture can emit more events than
                 // the relay's queue holds and prove the relay keeps reading.
+                // Delivered events are counted per session, so a test can
+                // tell a relay that closed its receiver early from one that
+                // drained everything.
                 for delta in response.split_inclusive('\n') {
-                    let _ = event_tx
+                    if event_tx
                         .send(zeroclaw_api::agent::TurnEvent::Chunk { delta: delta.to_owned() })
-                        .await;
+                        .await
+                        .is_ok()
+                    {
+                        sse_test_record_event_delivered(session_id.unwrap_or("anonymous"));
+                    }
                 }
                 Ok(response)
             }
@@ -8483,6 +8538,7 @@ path = "{trigger_path}"
             Ok(Json(WebhookBody {
                 message: "transport overlap".to_string(),
                 stream: true,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -8598,6 +8654,7 @@ path = "{trigger_path}"
             Ok(Json(WebhookBody {
                 message: message.to_string(),
                 stream: true,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -8877,6 +8934,7 @@ data: [DONE]\n\n";
         let body = Ok(Json(WebhookBody {
             message: "sse cumulative hello".into(),
             stream: true,
+            continue_on_disconnect: false,
         }));
 
         let response = handle_webhook(
@@ -8926,6 +8984,7 @@ data: [DONE]\n\n";
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
             stream: true,
+            continue_on_disconnect: false,
         }));
 
         let response = handle_webhook(
@@ -8956,6 +9015,7 @@ data: [DONE]\n\n";
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
             stream: true,
+            continue_on_disconnect: false,
         }));
 
         let state_for_task = state.clone();
@@ -9070,6 +9130,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: true,
+                continue_on_disconnect: false,
             })),
         )
         .await;
@@ -9103,6 +9164,89 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
+    async fn webhook_sse_body_drop_cancels_turn() {
+        // The contract streamed webhook callers have always had: a named
+        // session alone does not opt into unattended execution, so dropping
+        // the body cancels the turn and releases its token.
+        let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-drop-default"));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+                continue_on_disconnect: false,
+            })),
+        )
+        .await;
+        let token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-drop-default")
+            .cloned()
+            .expect("streamed turn must register its cancellation token");
+
+        drop(response);
+
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .expect("dropping the SSE body must cancel the in-flight turn");
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned")
+                .contains_key("gw_sse-drop-default"),
+            "dropping the SSE body must remove its cancellation token"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_continue_on_disconnect_requires_session_id() {
+        // Nobody could abort a detached turn without a session, so the opt-in
+        // is refused up front instead of being silently ignored.
+        let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+                continue_on_disconnect: true,
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned")
+                .is_empty(),
+            "a refused request must not start a turn"
+        );
+    }
+
+    #[tokio::test]
     async fn webhook_sse_body_drop_detaches_turn_which_runs_to_completion() {
         // The body is a viewer of the turn, not its owner: dropping it must
         // not cancel the turn, and the token must stay registered so the
@@ -9129,6 +9273,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: true,
+                continue_on_disconnect: true,
             })),
         )
         .await;
@@ -9208,6 +9353,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: true,
+                continue_on_disconnect: true,
             })),
         )
         .await;
@@ -9237,6 +9383,11 @@ data: [DONE]\n\n";
         }
         assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!token.is_cancelled());
+        assert_eq!(
+            sse_test_events_delivered("sse-flood"),
+            200,
+            "every event must reach the relay: a receiver closed early fails sends"
+        );
     }
 
     #[tokio::test]
@@ -9259,6 +9410,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: true,
+                continue_on_disconnect: true,
             })),
         )
         .await;
@@ -9304,6 +9456,7 @@ data: [DONE]\n\n";
                 Ok(Json(WebhookBody {
                     message: "hello".into(),
                     stream: true,
+                    continue_on_disconnect: false,
                 })),
             )
         };
@@ -9923,6 +10076,7 @@ data: [DONE]\n\n";
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
             stream: false,
+            continue_on_disconnect: false,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -9938,6 +10092,7 @@ data: [DONE]\n\n";
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
             stream: false,
+            continue_on_disconnect: false,
         }));
         let second = handle_webhook(
             State(state),
@@ -10135,6 +10290,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -10155,6 +10311,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "chat instead".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -10189,6 +10346,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "chat".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -10402,6 +10560,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -10546,6 +10705,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -10692,6 +10852,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -10754,6 +10915,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -10853,6 +11015,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -10973,6 +11136,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -11071,6 +11235,7 @@ data: [DONE]\n\n";
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
             stream: false,
+            continue_on_disconnect: false,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -11086,6 +11251,7 @@ data: [DONE]\n\n";
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
             stream: false,
+            continue_on_disconnect: false,
         }));
         let second = handle_webhook(
             State(state),
@@ -11283,6 +11449,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -11379,6 +11546,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -11471,6 +11639,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
