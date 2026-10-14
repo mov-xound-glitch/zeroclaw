@@ -3663,6 +3663,22 @@ async fn handle_webhook(
         }
     }
 
+    // A streamed turn may only outlive its body when it stays abortable, so
+    // `continue_on_disconnect` needs an `X-Session-Id`. Refused here, before
+    // idempotency and autosave, so the rejected attempt neither consumes the
+    // caller's idempotency key (a corrected retry must run) nor saves its
+    // message.
+    if webhook_body.stream
+        && webhook_body.continue_on_disconnect
+        && accepts_sse(&headers)
+        && webhook_session_id(&headers).is_none()
+    {
+        let err = serde_json::json!({
+            "error": "continue_on_disconnect requires an X-Session-Id header"
+        });
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+
     if !has_matching_sop && let Some(response) = check_webhook_idempotency(&state, &headers, None) {
         return response.into_response();
     }
@@ -3714,14 +3730,6 @@ async fn handle_webhook(
     // client disconnects through the shared cancellation registry. Every
     // other combination keeps the JSON `{ response }` path below untouched.
     if webhook_body.stream && accepts_sse(&headers) {
-        if webhook_body.continue_on_disconnect && session_id.is_none() {
-            // Without a session nobody could abort the detached turn, so the
-            // request is refused rather than silently kept cancel-on-drop.
-            let err = serde_json::json!({
-                "error": "continue_on_disconnect requires an X-Session-Id header"
-            });
-            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
-        }
         return run_gateway_chat_streaming_response(
             &state,
             message,
@@ -9221,6 +9229,7 @@ data: [DONE]\n\n";
             header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
         );
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("retry-key"));
 
         let response = handle_webhook(
             State(state.clone()),
@@ -9243,6 +9252,38 @@ data: [DONE]\n\n";
                 .expect("cancel_tokens lock poisoned")
                 .is_empty(),
             "a refused request must not start a turn"
+        );
+
+        // The refusal happens before the idempotency key is reserved, so a
+        // corrected retry under the same key runs instead of being answered
+        // as a duplicate.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("retry-key"));
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-retry"));
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+                continue_on_disconnect: true,
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned")
+                .contains_key("gw_sse-retry"),
+            "the corrected retry must start a streamed turn"
         );
     }
 
