@@ -673,6 +673,24 @@ connection is an invalid request. The properties a profile references are
 host-only: `secrets.get` returns `access-denied` for them, so the plugin never
 holds the private key it authenticates with.
 
+The host builds each connection's TLS configuration when that connection
+opens, from the configuration revision of the service frame that opens it, and
+the connection owns it. The frame's transient material is paired only with an
+authorization derived from matching canonical configuration inputs. If policy,
+profile references, or material changes between those views (including while
+DNS is pending), opening the connection fails closed rather than combining
+revisions. The comparison covers the instance's whole configuration entry (its
+grants, its TLS profiles, and every config value) and the deployment's NAT64
+prefixes and connection limit, so any such edit made while a frame runs fails
+that frame's later connections that use a custom CA or client identity. A
+later frame resolves rotated material; already-open connections are unchanged. Egress grants remain checked on each request, so a removed
+profile or grant refuses the next connection. System roots are the exception: a profile that keeps them,
+and a connection without a profile, use the roots plugin HTTPS trusts, which
+are read once per process. A connection that is already open keeps the
+identity it presented in its handshake until it is dropped or closed. Dropping
+it, or cancelling the call that is still opening it, releases the
+configuration together with the connection lease.
+
 ### Per-plugin config (`__config` and `config.get`)
 
 **Permission:** `config_read`
@@ -778,6 +796,15 @@ exists: an upgrade whose declaration grew prints the difference plus the exact
 list` reports the same gap as a standing diagnostic. Declare the destinations
 your code actually contacts, and treat a growing declaration as something every
 operator has to approve on every upgrade.
+
+A channel instance's row is created when an operator binds its alias, with
+`zeroclaw plugin bind <package> --channel-alias <alias>` or with
+`zeroclaw plugin install <source> --channel-alias <alias>`, and the declaration
+is seeded into it only on an explicit `--egress declared`. `--egress none`
+binds with an empty grant instead, and a bind that would create the row with
+neither flag refuses and lists your declared hosts. For a channel instance the
+declaration counts with `websocket_client` or `socket_client` as well as
+`http_client`.
 
 If reinstall finds an unsupported pre-typed-config row keyed by the package
 name, install refuses before creating the derived `zpi1_…` row and prints the
@@ -944,23 +971,26 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 ## Configuration
 
 Operator values currently enter through generic string-map storage: edit
-`[[plugins.entries]]` in TOML, or use `zeroclaw config set` after a tool install
-has seeded its default-binding entry. `zeroclaw plugin info <package>` prints
-the same tool key for migration and later edits. These automatic print and seed
-surfaces are tool-only. A channel key depends on its configured alias, which
-install and info do not own. The alias-aware construction that resolves a
-channel's typed config from that configured alias landed in
-[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146); automatic
-display and install-time seeding of the channel key remain manual until the
-grant ceremony in
-[#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584), so a channel-only
-package still cannot complete this migration through install and info alone.
+`[[plugins.entries]]` in TOML, or use `zeroclaw config set` once the instance's
+entry exists. A tool install seeds its default-binding entry. A channel key
+depends on its configured alias, so a channel instance's entry is seeded when
+that alias is bound, by `zeroclaw plugin bind <package> --channel-alias <alias>`
+or by `zeroclaw plugin install <source> --channel-alias <alias>`. The
+alias-aware construction that resolves a channel's typed config from that
+configured alias landed in
+[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146).
+`zeroclaw plugin info <package>` prints every key the package owns, for
+migration and later edits: the tool binding's, and one per bound alias when the
+installed version owns instance state and an instance can be named by that
+alias. Each such bound alias also gets that instance's readiness, with or
+without a key line: required keys set or missing, the config and egress
+verdicts, and whether the runtime will admit it.
 Schema-driven forms and inline field help are not
 implemented yet. The current surfaces are:
 
 - **The CLI** handles plugin lifecycle with `list`, `search`, `install`,
-  `remove`, `info`, and `migrate`. `zeroclaw config set` writes individual raw
-  plugin values; it does not interpret the plugin's schema.
+  `bind`, `remove`, `info`, and `migrate`. `zeroclaw config set` writes
+  individual raw plugin values; it does not interpret the plugin's schema.
 - **zerocode** can edit ZeroClaw's static plugin-host settings, but does not yet
   generate per-plugin fields from `config_schema`.
 - **The web gateway** is read-only for plugins: `GET /api/plugins` reports the
