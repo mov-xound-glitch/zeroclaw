@@ -858,12 +858,17 @@ The five bounds are operator-tunable and every value is validated as non-zero:
 only be built with explicit limits, so no load path can construct an
 unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
 cannot extend the host deadline. An interrupted warm store is never resumed,
-and a channel never reuses a store whose call trapped: channels recreate the
-instance from host-owned inputs on the next call, waiting when traps and
-missed deadlines, other than in approval and choice prompts, outrun a rebuild
-budget of three at once and one per five minutes after that, while memory
-instances remain unavailable until their owner rebuilds them. The canonical
-fields and defaults live in the
+and neither a channel nor a memory backend reuses a store whose call failed
+inside Wasmtime: after a guest trap, exhausted fuel, or a failed host import,
+Wasmtime refuses every later call into the store, and a result it could not
+lift skips the export's post-return cleanup. Channels recreate the instance
+from host-owned inputs on the next call, waiting when traps and missed
+deadlines, other than in approval and choice prompts, outrun a rebuild budget
+of three at once and one per five minutes after that. Memory instances remain
+unavailable until their owner rebuilds them, and later calls that reach the
+plugin fail with the error a missed deadline leaves. A rebuilt memory instance
+starts empty, because the memory world gives a plugin no storage outside its
+own instance. The canonical fields and defaults live in the
 [Config reference](../reference/index.md).
 
 ### 32-bit address space (wasip2 is wasm32)
@@ -1038,3 +1043,47 @@ These delegate to the `zeroclaw-plugins` crate features
 up `wasmtime`. The load path keys off whether the Cranelift compiler is in the
 build, as described under WASI Component Host. Read the feature comments in the
 workspace `Cargo.toml` for the authoritative descriptions.
+
+### Interrupted installation recovery
+
+`zeroclaw plugin remove <name>` can recover an unloaded, empty or structurally
+incomplete package directory that holds only what an install writes: a
+manifest naming that package, the component file at `wasm_path` with the
+folders on its way, and, for a skill plugin, a `skills/` tree of folders and
+files. Signature-policy refusals, healthy packages, loaded aliases, symlinks,
+uninspectable contents, and directories holding anything else remain
+protected. Recovery claims a single directory generation before admission and
+deletion; it never uses a stale verdict to recursively delete a replacement at
+the package name.
+
+Install and recovery coordinate through a persistent hidden OS lock under the
+plugins root. Only install, update, remove, and listing what an interrupted
+update displaced open that root and its lock, so a host that only discovers
+plugins, such as one the daemon keeps, holds nothing in the plugins directory. On Windows an open root pins the plugins directory and
+its ancestors against rename until its host drops. A process that cannot take
+the lock within 60 seconds gives up and names the lock file. Any account that
+can read that file can hold the lock, and where the operating system or
+filesystem offers no file locking, install, update and remove refuse. New
+staging directories use unique generations and an OS-held lease, rather than a
+PID as ownership evidence. Recovery cleans an abandoned protocol stage only
+while recovering an actual final package, or while finishing the delete of one
+an earlier remove had judged. Legacy PID-only stages without proof of
+abandonment are retained and their paths are printed; they do not prevent a new
+install from using fresh staging.
+
+A refused claimed package is restored without overwriting a concurrent
+occupant. If restoration cannot complete, the error names its retained hidden
+transaction location. Preserve that directory, resolve the reported conflict,
+and retry `plugin remove`: retry restores the package before applying normal
+admission policy. A claim whose delete had begun is marked, and a retry
+finishes that delete instead of restoring it. A hidden transaction is never, by its name alone, evidence
+that a healthy package can be deleted. Filesystem namespace changes and
+unsupported locking refuse recovery safely. Package moves require an atomic
+rename that refuses every existing destination, including an empty directory.
+Where the platform or filesystem cannot provide it (other Unix platforms such
+as FreeBSD, an NFS mount without no-replace support, or Linux before 3.15),
+installation and recovery refuse the move. A failed claim leaves the final
+entry unmoved. An install refused this way removes the copy it staged and
+says the move is unsupported; any other failed publication, and a failed
+restoration, retains the package in its hidden transaction and reports that
+path. No plain replacing rename is used.
