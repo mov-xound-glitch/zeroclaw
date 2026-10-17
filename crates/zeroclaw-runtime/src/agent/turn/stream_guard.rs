@@ -44,6 +44,12 @@ pub(crate) struct StreamTextGuard {
     /// introduced in an earlier delta must not be suppressed here and
     /// rejected later for no reason.
     recent_prose: String,
+    /// Where `recent_prose` begins relative to JSON structure. Its window is
+    /// cut by byte count, so the kept tail can start inside a quoted value
+    /// whose opener was dropped; the wording of that value would then read
+    /// as prose. Framing is judged only on the prose after the value closes,
+    /// as the completed check, which sees the whole reply, judges it.
+    recent_prose_start: JsonValueState,
     /// Whether any prose released so far carried the loose example wording
     /// the completed-response check judges a tagged or fenced example by,
     /// over the whole reply. Kept apart from `recent_prose`, whose window
@@ -317,6 +323,72 @@ fn quoted_result_fence_end(candidate: &str, finalizing: bool) -> Option<(usize, 
     Some((end, body.trim()))
 }
 
+/// Position within JSON structure after scanning some text: the nesting
+/// depth of values left open, and whether a string literal is open.
+/// Mirrors the parser's unclosed-value scan: an object opener counts when
+/// a quoted key follows it, an array opener when a value follows, closers
+/// inside string literals do not count, and a line break ends a string.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct JsonValueState {
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl JsonValueState {
+    fn is_outside(self) -> bool {
+        self.depth == 0 && !self.in_string
+    }
+}
+
+/// Advance `state` over `text`, calling `at` with the byte offset just
+/// past each character and the state after it. `lookahead` is the text
+/// that follows `text`, consulted for the byte after an opener at the very
+/// end; with nothing to consult, the opener is taken as opening a value,
+/// which errs towards holding.
+fn scan_json_value_state(
+    mut state: JsonValueState,
+    text: &str,
+    lookahead: &str,
+    mut at: impl FnMut(usize, JsonValueState),
+) -> JsonValueState {
+    let bytes = text.as_bytes();
+    for (offset, ch) in text.char_indices() {
+        if state.in_string {
+            if state.escaped {
+                state.escaped = false;
+            } else if ch == '\\' {
+                state.escaped = true;
+            } else if ch == '"' || ch == '\n' {
+                state.in_string = false;
+            }
+        } else {
+            match ch {
+                '"' => state.in_string = true,
+                '{' | '[' => {
+                    let next = bytes[offset + 1..]
+                        .iter()
+                        .chain(lookahead.as_bytes())
+                        .copied()
+                        .find(|b| !b.is_ascii_whitespace());
+                    let opens_value = match (ch, next) {
+                        (_, None) => true,
+                        ('{', Some(b)) => b == b'"',
+                        (_, Some(b)) => matches!(b, b'"' | b'{' | b'['),
+                    };
+                    if opens_value {
+                        state.depth += 1;
+                    }
+                }
+                '}' | ']' => state.depth = state.depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        at(offset + ch.len_utf8(), state);
+    }
+    state
+}
+
 impl StreamTextGuard {
     /// `available_tools` are the specs sent with the request (absent in
     /// text-tool mode); `known_tool_names` are the tools active for the turn
@@ -342,6 +414,28 @@ impl StreamTextGuard {
         }
     }
 
+    /// The retained prose a candidate is framed by. When the window begins
+    /// inside a quoted value, only the prose after that value closes counts:
+    /// wording quoted inside a value is not the model introducing an
+    /// example, and the dropped opener is what told that apart.
+    fn framing_prose(&self) -> &str {
+        if self.recent_prose_start.is_outside() {
+            return &self.recent_prose;
+        }
+        let mut closes_at = None;
+        scan_json_value_state(
+            self.recent_prose_start,
+            &self.recent_prose,
+            "",
+            |end, state| {
+                if closes_at.is_none() && state.is_outside() {
+                    closes_at = Some(end);
+                }
+            },
+        );
+        closes_at.map_or("", |end| &self.recent_prose[end..])
+    }
+
     /// Prose immediately before the current candidate: what was already
     /// forwarded plus the held prefix of this chunk.
     fn prose_before_candidate(&self) -> String {
@@ -349,7 +443,7 @@ impl StreamTextGuard {
             .pending_candidate_start
             .and_then(|start| self.pending.get(..start))
             .unwrap_or("");
-        format!("{}{}", self.recent_prose, prefix)
+        format!("{}{}", self.framing_prose(), prefix)
     }
 
     /// The parser's teaching-example exemption, judged the way the
@@ -402,13 +496,10 @@ impl StreamTextGuard {
         {
             return false;
         }
+        let framing = self.framing_prose();
         !(looks_like_tool_protocol_example(text)
-            || looks_like_tool_protocol_example(&format!("{}{}", self.recent_prose, text)))
-            || unframed_embedded_protocol_mentions_known_tool(
-                &self.recent_prose,
-                text,
-                &self.known_tool_names,
-            )
+            || looks_like_tool_protocol_example(&format!("{framing}{text}")))
+            || unframed_embedded_protocol_mentions_known_tool(framing, text, &self.known_tool_names)
     }
 
     pub(crate) fn push(&mut self, chunk: &str) -> Option<String> {
@@ -637,6 +728,9 @@ impl StreamTextGuard {
             while !self.recent_prose.is_char_boundary(cut) {
                 cut += 1;
             }
+            let (head, tail) = self.recent_prose.split_at(cut);
+            self.recent_prose_start =
+                scan_json_value_state(self.recent_prose_start, head, tail, |_, _| {});
             self.recent_prose.drain(..cut);
         }
     }
@@ -1258,6 +1352,36 @@ mod embedded_protocol_stream_tests {
         );
         assert!(guard.suppressed_protocol, "{forwarded:?}");
         assert!(!forwarded.contains("tool_calls"));
+    }
+
+    #[test]
+    fn quoted_example_wording_past_the_window_does_not_release_a_stub() {
+        // A quoted value long enough to push its opener out of the retained
+        // prose window must not leave its wording reading as example framing
+        // for a stub that follows: the completed check sees the whole record,
+        // excludes the quoted words and rejects the reply, so the guard must
+        // withhold the stub rather than stream it first.
+        let record = format!(
+            "Record: {{\"note\":\"{} for example, the format looks like this:\"}}",
+            "x".repeat(500)
+        );
+        assert!(record.len() > zeroclaw_tool_call_parser::EXAMPLE_FRAMING_WINDOW * 2);
+        let stub = r#"{"content":"One moment.","tool_code":"print(shell())","tool_name":"shell"}"#;
+        let mut guard = shell_guard();
+        let forwarded = drive(&mut guard, &[&record, " Now run: ", stub]);
+        assert!(guard.suppressed_protocol, "{forwarded:?}");
+        assert!(!forwarded.contains("tool_code"));
+        assert!(
+            forwarded.starts_with("Record: "),
+            "the record itself streams: {forwarded:?}"
+        );
+
+        // Prose after the value closes still frames what follows it.
+        let intro = " For example, a stub looks like this: ";
+        let mut guard = shell_guard();
+        let forwarded = drive(&mut guard, &[&record, intro, stub]);
+        assert!(!guard.suppressed_protocol, "{forwarded:?}");
+        assert_eq!(forwarded, format!("{record}{intro}{stub}"));
     }
 
     #[test]
