@@ -328,6 +328,9 @@ fn quoted_result_fence_end(candidate: &str, finalizing: bool) -> Option<(usize, 
 /// Mirrors the parser's unclosed-value scan: an object opener counts when
 /// a quoted key follows it, an array opener when a value follows, closers
 /// inside string literals do not count, and a line break ends a string.
+/// Only the depth decides whether a value is open: a lone quote in prose
+/// (an inch mark, an unpaired quotation) opens no value, exactly as the
+/// completed check reads it, so it cannot cost a real example its framing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct JsonValueState {
     depth: usize,
@@ -337,7 +340,7 @@ struct JsonValueState {
 
 impl JsonValueState {
     fn is_outside(self) -> bool {
-        self.depth == 0 && !self.in_string
+        self.depth == 0
     }
 }
 
@@ -1382,6 +1385,16 @@ mod embedded_protocol_stream_tests {
         let forwarded = drive(&mut guard, &[&record, intro, stub]);
         assert!(!guard.suppressed_protocol, "{forwarded:?}");
         assert_eq!(forwarded, format!("{record}{intro}{stub}"));
+
+        // A lone quote in prose opens no value: an example introduced long
+        // after an inch mark keeps its framing, as the completed check
+        // would read it, so the guard does not suppress a reply the
+        // completed check accepts.
+        let prose = format!("Use a 6\" pipe {}{intro}", "y".repeat(500));
+        let mut guard = shell_guard();
+        let forwarded = drive(&mut guard, &[&prose, stub]);
+        assert!(!guard.suppressed_protocol, "{forwarded:?}");
+        assert_eq!(forwarded, format!("{prose}{stub}"));
     }
 
     #[test]
