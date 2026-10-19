@@ -551,7 +551,12 @@ pub(crate) fn collapse_tool_context_older_than(
             let drained = &history[span_start..drain_end];
             out.dropped_messages += drained.len();
             out.collapsed_turns += 1;
-            if history[span_start].role == "assistant" {
+            // A turn with a closing reply is sent as prompt and reply alone:
+            // user and assistant rows that alternate on every provider. The
+            // summary stands in only where no reply closed the turn, so the
+            // model still sees that calls were made and the prompt is not
+            // left answered by nothing.
+            if closing.is_none() && history[span_start].role == "assistant" {
                 out.keep(
                     span_start,
                     ChatMessage::assistant(ChatMessage::pruned_tool_exchange_summary(
@@ -1890,13 +1895,13 @@ mod collapse_tests {
         assert_eq!(rows(&h), before, "input history is never modified");
         assert_eq!(c.collapsed_turns, 2);
         assert_eq!(c.dropped_messages, 4);
+        // A closed turn is sent as its prompt and its reply: no summary row,
+        // so roles alternate on every provider.
         let expected: Vec<(String, String)> = [
             ("system", "s"),
             ("user", "request 1"),
-            ("assistant", summary(1).as_str()),
             ("assistant", "answer 1"),
             ("user", "request 2"),
-            ("assistant", summary(1).as_str()),
             ("assistant", "answer 2"),
         ]
         .iter()
@@ -1905,12 +1910,22 @@ mod collapse_tests {
         .chain(rows(&native_turn(4)))
         .collect();
         assert_eq!(rows(&c.messages), expected);
-        assert!(c.messages[2].is_pruned_tool_exchange_summary());
-        // Every request row maps to the history row it stands for; the summary
-        // stands for the carrier it replaced.
+        assert!(
+            c.messages
+                .iter()
+                .all(|m| !m.is_pruned_tool_exchange_summary())
+        );
+        assert!(
+            c.messages
+                .windows(2)
+                .all(|pair| pair[0].role != pair[1].role || pair[0].role == "system"),
+            "roles alternate: {:?}",
+            rows(&c.messages)
+        );
+        // Every request row maps to the history row it stands for.
         assert_eq!(
             c.source_rows,
-            vec![0, 1, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![0, 1, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         assert_eq!(c.source_rows.len(), c.messages.len());
     }
@@ -1935,7 +1950,7 @@ mod collapse_tests {
                 .iter()
                 .any(|m| m.content == "[Tool results]\nresult 3")
         );
-        assert_eq!(c.messages[2].content, summary(1));
+        assert_eq!(c.messages[2].content, "answer 1");
     }
 
     #[test]
@@ -1946,7 +1961,6 @@ mod collapse_tests {
         assert_eq!(c.collapsed_turns, 1);
         let mut expected = vec![
             ("user".to_string(), "request 1".to_string()),
-            ("assistant".to_string(), summary(1)),
             ("assistant".to_string(), "answer 1".to_string()),
         ];
         expected.extend(rows(&native_turn(2)));
@@ -1962,9 +1976,8 @@ mod collapse_tests {
         assert_eq!(c.collapsed_turns, 1);
         assert_eq!(rows(&c.messages[..3]), rows(&h[..3]));
         assert_eq!(c.messages[3].content, "request 1");
-        assert_eq!(c.messages[4].content, summary(1));
-        assert_eq!(c.messages[5].content, "answer 1");
-        assert_eq!(&c.source_rows[..6], &[0, 1, 2, 3, 4, 6]);
+        assert_eq!(c.messages[4].content, "answer 1");
+        assert_eq!(&c.source_rows[..5], &[0, 1, 2, 3, 6]);
     }
 
     #[test]
@@ -2004,7 +2017,6 @@ mod collapse_tests {
         assert_eq!(c.collapsed_turns, 1, "only the prior turn collapses");
         let mut expected = vec![
             ("user".to_string(), "request 1".to_string()),
-            ("assistant".to_string(), summary(1)),
             ("assistant".to_string(), "answer 1".to_string()),
         ];
         expected.extend(rows(&h[4..]));
@@ -2043,7 +2055,6 @@ mod collapse_tests {
         let c = collapse_tool_context_older_than(&h, 0, false, &known());
         let mut expected = vec![
             ("user".to_string(), "request 1".to_string()),
-            ("assistant".to_string(), summary(1)),
             ("assistant".to_string(), json_reply.to_string()),
         ];
         expected.extend(rows(&native_turn(2)));
@@ -2095,7 +2106,6 @@ mod collapse_tests {
         assert_eq!(c.collapsed_turns, 1, "only the prior turn collapses");
         let mut expected = vec![
             ("user".to_string(), "request 1".to_string()),
-            ("assistant".to_string(), summary(1)),
             ("assistant".to_string(), "answer 1".to_string()),
         ];
         expected.extend(rows(&h[4..]));

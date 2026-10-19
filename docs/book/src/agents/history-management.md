@@ -129,21 +129,23 @@ and SOP callers.
 
 `keep_tool_context_turns` (runtime profile, default `2`) is the number of
 completed turns before the running one whose tool-call and tool-result rows are
-still sent to the model. Every older turn is sent as its user prompt, one
-`[Tool exchange: N tool call(s) — results collapsed]` summary row in place of the
-assistant row that issued the calls, and the closing assistant reply, so the
-model still sees what was asked and what was answered without the raw tool
-output. The running turn is always sent whole because the model needs its own
-results, so `0` keeps tool context for the running turn only; the local-model
-preset's `1` keeps it for one prior turn as well, and case-style presets use `8`.
+still sent to the model. Every older turn is sent as its user prompt and its
+closing assistant reply, so the model still sees what was asked and what was
+answered without the raw tool output, and user and assistant rows keep
+alternating on every provider. A turn that no reply closed (it ended on a call
+or a result) is sent as its prompt and one
+`[Tool exchange: N tool call(s) — results collapsed]` summary row, so the model
+sees that calls were made rather than a prompt answered by nothing. The running
+turn is always sent whole because the model needs its own results, so `0` keeps
+tool context for the running turn only; the local-model preset's `1` keeps it
+for one prior turn as well, and the `unbounded` preset uses `8`.
 
 This is a request-time bound, not a transcript edit. The tool loop builds each
 provider request from a collapsed copy; the working history and every store an
 owner persists from it (channel sender cache, ACP transcript, CLI session file)
 keep all their rows, so raising the value later shows older tool rows again. The
-summary row is the marker the providers already recognise: those that reject
-consecutive assistant rows skip it before dispatch, so on those routes the older
-turn is sent as prompt and reply only.
+summary row is the pruning marker the providers already recognise, and it only
+ever follows a user prompt, so no route sees two assistant rows in a row.
 
 A turn collapses as a unit, in both native (`role=tool`) and prompt-mode
 (`[Tool results]` carrier) shapes, so no orphan call or result is created. A
