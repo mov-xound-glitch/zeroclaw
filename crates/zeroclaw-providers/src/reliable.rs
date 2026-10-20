@@ -977,15 +977,19 @@ fn parse_stated_reset_ms(err: &anyhow::Error) -> Option<u64> {
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
         digits.parse::<u64>().ok()
     };
-    if let Some(secs) = number_after("\"resets_in_seconds\"") {
-        return Some(secs.saturating_mul(1000));
-    }
-    let resets_at = number_after("\"resets_at\"")?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(resets_at.saturating_sub(now).saturating_mul(1000))
+    let ms = if let Some(secs) = number_after("\"resets_in_seconds\"") {
+        secs.saturating_mul(1000)
+    } else {
+        let resets_at = number_after("\"resets_at\"")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        resets_at.saturating_sub(now).saturating_mul(1000)
+    };
+    // A reset that is already due says nothing about how long to wait, so
+    // leave the choice to Retry-After or the default cooldown.
+    (ms > 0).then_some(ms)
 }
 
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
@@ -9408,6 +9412,11 @@ mod tests {
 
         let plain = anyhow::Error::msg("429 Too Many Requests, Retry-After: 30");
         assert_eq!(parse_stated_reset_ms(&plain), None);
+
+        let due_now = anyhow::Error::msg("429: {\"resets_in_seconds\":0}");
+        assert_eq!(parse_stated_reset_ms(&due_now), None);
+        let in_the_past = anyhow::Error::msg("429: {\"resets_at\":1000}");
+        assert_eq!(parse_stated_reset_ms(&in_the_past), None);
     }
 
     #[test]
@@ -9437,6 +9446,13 @@ mod tests {
         assert_eq!(
             model_provider.set_rate_limit_cooldown("primary", &days),
             ReliableModelProvider::STATED_RESET_COOLDOWN_CAP
+        );
+
+        // A reset already in the past leaves Retry-After in charge.
+        let stale = anyhow::Error::msg("429: {\"resets_at\":1000}, Retry-After: 30");
+        assert_eq!(
+            model_provider.set_rate_limit_cooldown("primary", &stale),
+            Duration::from_secs(30)
         );
 
         // Retry-After keeps its own, shorter cap.
