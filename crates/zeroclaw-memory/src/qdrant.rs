@@ -1281,14 +1281,14 @@ mod tests {
         }
     }
 
-    /// Records the texts it embeds and returns no vector, so recall stops
-    /// right after the query embedding without needing a Qdrant server.
-    struct RecordingEmptyEmbedding {
+    /// Records the texts it is asked to embed and then fails, so recall
+    /// returns right after the query embedding and never reaches the network.
+    struct RecordingFailingEmbedding {
         texts: Arc<parking_lot::Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
-    impl EmbeddingProvider for RecordingEmptyEmbedding {
+    impl EmbeddingProvider for RecordingFailingEmbedding {
         fn name(&self) -> &str {
             "recording"
         }
@@ -1301,31 +1301,33 @@ mod tests {
             self.texts
                 .lock()
                 .extend(texts.iter().map(|text| (*text).to_string()));
-            Ok(vec![Vec::new()])
+            anyhow::bail!("recording only")
         }
     }
 
     #[tokio::test]
     async fn both_recall_paths_embed_the_query_with_its_prefix() {
         let texts = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        // Nothing listens on the discard port: the listing fallback after the
-        // empty vector fails, which is fine, the embedded text is the subject.
+        // The embedder fails after recording, so each recall ends at the query
+        // embedding; the URL is never contacted.
         let mem = QdrantMemory::new_lazy(
             "qdrant",
             "http://127.0.0.1:9",
             "memories",
             None,
-            Arc::new(RecordingEmptyEmbedding {
+            Arc::new(RecordingFailingEmbedding {
                 texts: Arc::clone(&texts),
             }),
         )
         .with_query_prefix(Some("query: ".to_string()));
         mem.initialized.set(()).unwrap();
 
-        let _ = mem.recall("red car", 5, None, None, None).await;
-        let _ = mem
-            .recall_for_agents(&["alpha"], "blue bike", 5, None, None, None)
-            .await;
+        assert!(mem.recall("red car", 5, None, None, None).await.is_err());
+        assert!(
+            mem.recall_for_agents(&["alpha"], "blue bike", 5, None, None, None)
+                .await
+                .is_err()
+        );
 
         assert_eq!(
             *texts.lock(),
