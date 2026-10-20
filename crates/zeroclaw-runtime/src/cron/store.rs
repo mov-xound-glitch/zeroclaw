@@ -7459,11 +7459,12 @@ schedule = { kind = "every", every_ms = 300000 }
 
         let started = std::time::Instant::now();
         let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok");
+        let waited = started.elapsed();
         release.join().unwrap();
         let job = job.expect("a fresh database must wait out a competing writer");
         assert!(
-            started.elapsed() >= std::time::Duration::from_millis(250),
-            "the open should have waited for the writer"
+            waited >= std::time::Duration::from_millis(250),
+            "the open should have waited for the writer, returned after {waited:?}"
         );
         assert_eq!(get_job(&config, &job.id).unwrap().id, job.id);
     }
