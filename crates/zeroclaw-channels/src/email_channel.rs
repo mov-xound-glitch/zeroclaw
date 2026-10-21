@@ -915,16 +915,19 @@ impl EmailChannel {
         self.recent_inbound.lock().ok()?.get(reply_id).cloned()
     }
 
-    /// The plain-text and HTML bodies of an outbound message: the agent's
-    /// text, followed by the quoted original when there is one.
-    fn compose_bodies(body: &str, original: Option<&QuotedOriginal>) -> (String, String) {
-        let html_body = markdown_to_html(body);
-        let Some(original) = original else {
-            return (body.to_string(), html_body);
-        };
-        let attribution = match &original.date {
+    /// The attribution line that introduces a quoted original.
+    fn attribution(original: &QuotedOriginal) -> String {
+        match &original.date {
             Some(date) => format!("On {date}, {} wrote:", original.sender),
             None => format!("{} wrote:", original.sender),
+        }
+    }
+
+    /// The plain-text body of an outbound message: the agent's text,
+    /// followed by the quoted original when there is one.
+    fn compose_plain(body: &str, original: Option<&QuotedOriginal>) -> String {
+        let Some(original) = original else {
+            return body.to_string();
         };
         let quoted_lines: String = original
             .text
@@ -937,14 +940,35 @@ impl EmailChannel {
                 }
             })
             .collect();
-        let plain = format!("{}\n\n{attribution}\n{quoted_lines}", body.trim_end());
-        let html = format!(
+        format!(
+            "{}\n\n{}\n{quoted_lines}",
+            body.trim_end(),
+            Self::attribution(original)
+        )
+    }
+
+    /// The HTML body of an outbound message: the rendered agent text,
+    /// followed by the quoted original when there is one. Only built when
+    /// the channel sends an HTML part.
+    fn compose_html(body: &str, original: Option<&QuotedOriginal>) -> String {
+        let html_body = markdown_to_html(body);
+        let Some(original) = original else {
+            return html_body;
+        };
+        format!(
             "{html_body}<br>\n<div>{}</div>\n<blockquote style=\"margin:0 0 0 .8ex;\
              border-left:1px solid #ccc;padding-left:1ex\">{}</blockquote>\n",
-            escape_html(&attribution),
+            escape_html(&Self::attribution(original)),
             escape_html(&original.text).replace('\n', "<br>\n"),
-        );
-        (plain, html)
+        )
+    }
+
+    #[cfg(test)]
+    fn compose_bodies(body: &str, original: Option<&QuotedOriginal>) -> (String, String) {
+        (
+            Self::compose_plain(body, original),
+            Self::compose_html(body, original),
+        )
     }
 
     /// Build the outbound `lettre` message for a `SendMessage`, including
@@ -988,9 +1012,10 @@ impl EmailChannel {
         }
         let att_parts = build_attachment_parts(&message.attachments);
         let original = self.original_for(message);
-        let (plain_body, html_body) = Self::compose_bodies(body, original.as_ref());
+        let plain_body = Self::compose_plain(body, original.as_ref());
 
         let email = if self.config.html_body {
+            let html_body = Self::compose_html(body, original.as_ref());
             let alt = MultiPart::alternative()
                 .singlepart(SinglePart::plain(plain_body))
                 .singlepart(SinglePart::html(html_body));
