@@ -16396,6 +16396,88 @@ impl ChannelsConfig {
         ]
     }
 
+    /// Tools the operator excluded on a channel instance (`excluded_tools`
+    /// under `[channels.<type>.<alias>]`), for a turn arriving through it.
+    ///
+    /// `channel` is the runtime kind (`voice-call`) or the config key
+    /// (`voice_call`). Without an alias, every instance of that type
+    /// contributes, so a message that does not say which instance it came
+    /// through is never less restricted than the strictest one. Returns
+    /// `None` for an unknown channel type.
+    pub fn excluded_tools_for(&self, channel: &str, alias: Option<&str>) -> Option<Vec<String>> {
+        fn collect<C>(
+            instances: &HashMap<String, C>,
+            alias: Option<&str>,
+            excluded: impl Fn(&C) -> &[String],
+        ) -> Vec<String> {
+            let mut tools: Vec<String> = match alias {
+                Some(alias) => instances
+                    .get(alias)
+                    .map(|config| excluded(config).to_vec())
+                    .unwrap_or_default(),
+                None => instances
+                    .values()
+                    .flat_map(|config| excluded(config).iter().cloned())
+                    .collect(),
+            };
+            tools.sort();
+            tools.dedup();
+            tools
+        }
+        macro_rules! excluded {
+            ($field:ident) => {
+                collect(&self.$field, alias, |config| {
+                    config.excluded_tools.as_slice()
+                })
+            };
+        }
+
+        let config_key = self
+            .channels()
+            .into_iter()
+            .find(|info| info.kind == channel || info.config_key == channel)
+            .map_or(channel, |info| info.config_key);
+        Some(match config_key {
+            "telegram" => excluded!(telegram),
+            "discord" => excluded!(discord),
+            "slack" => excluded!(slack),
+            "mattermost" => excluded!(mattermost),
+            "webhook" => excluded!(webhook),
+            "imessage" => excluded!(imessage),
+            "matrix" => excluded!(matrix),
+            "signal" => excluded!(signal),
+            "whatsapp" => excluded!(whatsapp),
+            "linq" => excluded!(linq),
+            "nextcloud_talk" => excluded!(nextcloud_talk),
+            "email" => excluded!(email),
+            "gmail_push" => excluded!(gmail_push),
+            "irc" => excluded!(irc),
+            "lark" => excluded!(lark),
+            "line" => excluded!(line),
+            "dingtalk" => excluded!(dingtalk),
+            "wecom" => excluded!(wecom),
+            "wecom_ws" => excluded!(wecom_ws),
+            "wechat" => excluded!(wechat),
+            "qq" => excluded!(qq),
+            "twitter" => excluded!(twitter),
+            "mochat" => excluded!(mochat),
+            "nostr" => excluded!(nostr),
+            "clawdtalk" => excluded!(clawdtalk),
+            "reddit" => excluded!(reddit),
+            "bluesky" => excluded!(bluesky),
+            "git" => excluded!(git),
+            "voice_call" => excluded!(voice_call),
+            "voice_wake" => excluded!(voice_wake),
+            "voice_duplex" => excluded!(voice_duplex),
+            "mqtt" => excluded!(mqtt),
+            "amqp" => excluded!(amqp),
+            "filesystem" => excluded!(filesystem),
+            // These channel types have no `excluded_tools` setting.
+            "twitch" | "plugin" => Vec::new(),
+            _ => return None,
+        })
+    }
+
     /// Returns `true` when at least one channel entry across all channel types
     /// has `enabled = true`. Used by the daemon to decide whether the channels
     /// supervisor should be started — a config with only `enabled = false`
@@ -51739,5 +51821,54 @@ model_provider = \"ollama.default\"
         duplicate_route
             .validate()
             .expect("legacy duplicate route hints remain valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn every_listed_channel_type_answers_excluded_tools() {
+        let channels = ChannelsConfig::default();
+        for info in channels.channels() {
+            assert!(
+                channels.excluded_tools_for(info.kind, None).is_some(),
+                "{} has no excluded_tools arm",
+                info.kind
+            );
+            assert!(channels.excluded_tools_for(info.config_key, None).is_some());
+        }
+        assert!(
+            channels
+                .excluded_tools_for("no-such-channel", None)
+                .is_none()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_excluded_tools_are_read_per_instance() {
+        let mut channels = ChannelsConfig::default();
+        channels.voice_call.insert(
+            "desk".into(),
+            crate::scattered_types::VoiceCallConfig {
+                excluded_tools: vec!["shell".into(), "http_request".into()],
+                ..Default::default()
+            },
+        );
+        channels
+            .voice_call
+            .insert("lobby".into(), Default::default());
+        assert_eq!(
+            channels.excluded_tools_for("voice-call", Some("desk")),
+            Some(vec!["http_request".to_string(), "shell".to_string()])
+        );
+        assert_eq!(
+            channels.excluded_tools_for("voice_call", Some("lobby")),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            channels.excluded_tools_for("voice-call", Some("unknown")),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            channels.excluded_tools_for("voice-call", None),
+            Some(vec!["http_request".to_string(), "shell".to_string()])
+        );
     }
 }

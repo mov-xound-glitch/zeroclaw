@@ -3851,6 +3851,33 @@ fn refresh_channel_history_skills(
     );
 }
 
+/// Tools a channel turn may not use: the risk profile's exclusions (lifted
+/// for CLI turns and `Full` autonomy, as before) plus the `excluded_tools`
+/// set on the channel instance the message arrived through. The channel's
+/// own list applies at every autonomy level: it is an explicit restriction
+/// on that channel, not part of the risk profile.
+fn channel_turn_excluded_tools(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Vec<String> {
+    let mut excluded: Vec<String> =
+        if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
+            Vec::new()
+        } else {
+            ctx.non_cli_excluded_tools.as_ref().clone()
+        };
+    if let Some(channel_excluded) = ctx
+        .prompt_config
+        .channels
+        .excluded_tools_for(msg.channel.as_str(), msg.channel_alias.as_deref())
+    {
+        excluded.extend(channel_excluded);
+    }
+    excluded.sort();
+    excluded.dedup();
+    excluded
+}
+
 fn effective_non_cli_tool_names<'a>(
     tools_registry: &'a [Box<dyn Tool>],
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
@@ -9533,12 +9560,8 @@ async fn process_channel_message_body(
         memory_sessions.push(Some(history_key.clone()));
     }
 
-    let per_turn_excluded_tools: &[String] =
-        if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-            &[]
-        } else {
-            ctx.non_cli_excluded_tools.as_ref()
-        };
+    let per_turn_excluded = channel_turn_excluded_tools(ctx.as_ref(), &msg);
+    let per_turn_excluded_tools: &[String] = per_turn_excluded.as_slice();
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
@@ -10224,12 +10247,7 @@ async fn process_channel_message_body(
                 .clone()
                 .or_else(|| msg.thread_ts.clone())
                 .or_else(|| Some(msg.id.clone()));
-            let excluded_tools: &[String] =
-                if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                };
+            let excluded_tools: &[String] = per_turn_excluded_tools;
             loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
@@ -42157,6 +42175,95 @@ BTC is currently around $65,000 based on latest tool output."#
             content: "/model --agent gpt-4o".into(),
             ..Default::default()
         }
+    }
+
+    fn excluded_tools_ctx(
+        zeroclaw_dir: &std::path::Path,
+        email_excluded: &[&str],
+        profile_excluded: &[&str],
+        level: AutonomyLevel,
+    ) -> ChannelRuntimeContext {
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        let email = zeroclaw_config::scattered_types::EmailConfig {
+            excluded_tools: email_excluded.iter().map(|t| t.to_string()).collect(),
+            ..Default::default()
+        };
+        prompt_config
+            .channels
+            .email
+            .insert("assistant".into(), email);
+        prompt_config
+            .channels
+            .email
+            .insert("other".into(), Default::default());
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            zeroclaw_dir,
+            "agentX",
+            "openrouter.default",
+            "config-default-model",
+        );
+        ctx.prompt_config = Arc::new(prompt_config);
+        ctx.non_cli_excluded_tools =
+            Arc::new(profile_excluded.iter().map(|t| t.to_string()).collect());
+        ctx.autonomy_level = level;
+        ctx
+    }
+
+    fn turn_from(channel: &str, alias: Option<&str>) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: "someone@example.invalid".into(),
+            reply_target: "someone@example.invalid".into(),
+            channel: channel.into(),
+            channel_alias: alias.map(str::to_string),
+            content: "hello".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_channel_turn_drops_the_tools_its_channel_excludes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = excluded_tools_ctx(
+            tmp.path(),
+            &["http_request", "shell"],
+            &["browser"],
+            AutonomyLevel::Supervised,
+        );
+        assert_eq!(
+            channel_turn_excluded_tools(&ctx, &turn_from("email", Some("assistant"))),
+            vec!["browser", "http_request", "shell"],
+        );
+        // Another instance of the same channel type keeps only the profile's list.
+        assert_eq!(
+            channel_turn_excluded_tools(&ctx, &turn_from("email", Some("other"))),
+            vec!["browser"],
+        );
+        // A different channel type is not affected by email's setting.
+        assert_eq!(
+            channel_turn_excluded_tools(&ctx, &turn_from("telegram", Some("assistant"))),
+            vec!["browser"],
+        );
+    }
+
+    #[test]
+    fn a_channel_exclusion_holds_at_full_autonomy_and_without_an_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = excluded_tools_ctx(
+            tmp.path(),
+            &["http_request"],
+            &["browser"],
+            AutonomyLevel::Full,
+        );
+        // Full autonomy lifts the risk profile's list, not the channel's own.
+        assert_eq!(
+            channel_turn_excluded_tools(&ctx, &turn_from("email", Some("assistant"))),
+            vec!["http_request"],
+        );
+        // A message that does not name its instance gets every instance's exclusions.
+        assert_eq!(
+            channel_turn_excluded_tools(&ctx, &turn_from("email", None)),
+            vec!["http_request"],
+        );
     }
 
     fn user_scope_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
