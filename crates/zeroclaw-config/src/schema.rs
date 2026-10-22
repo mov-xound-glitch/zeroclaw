@@ -16128,6 +16128,13 @@ pub struct ChannelsConfig {
     /// as a single concatenated message. `0` disables debouncing. Default: `0`.
     #[serde(default)]
     pub debounce_ms: u64,
+    /// When false (the default), a channel instance that sets `excluded_tools`
+    /// also refuses the tools that start work its restriction cannot follow:
+    /// scheduled and cron jobs, SOP steps, peer and A2A messages, external
+    /// agent CLIs and `execute_pipeline`. Set true to allow them on restricted
+    /// channels.
+    #[serde(default)]
+    pub restricted_channels_allow_detached_work: bool,
 }
 
 impl ChannelsConfig {
@@ -16662,6 +16669,7 @@ impl Default for ChannelsConfig {
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            restricted_channels_allow_detached_work: false,
         }
     }
 }
@@ -33882,6 +33890,7 @@ auto_save = true
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
                 debounce_ms: 0,
+                restricted_channels_allow_detached_work: false,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -36305,6 +36314,7 @@ allowed_users = ["@u:matrix.org"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            restricted_channels_allow_detached_work: false,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -36924,6 +36934,7 @@ allowed_numbers = ["+1", "+2"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            restricted_channels_allow_detached_work: false,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
