@@ -240,7 +240,10 @@ fn is_inert_result_fragment(text: &str) -> bool {
 /// a value names something the parser might execute, so a result shape
 /// carrying one is withheld like a call, not quoted like a result.
 /// Top level only — a quoted result whose nested content mentions a
-/// name field is still a result.
+/// name field is still a result. The list matches the one
+/// `open_prefix_is_result_shape` applies to a still-open object, so a
+/// python tool stub is judged the same way whether it arrives whole or
+/// after its preamble has already streamed.
 fn has_call_shaped_top_level_key(value: &serde_json::Value) -> bool {
     let keys = [
         "tool_calls",
@@ -251,6 +254,8 @@ fn has_call_shaped_top_level_key(value: &serde_json::Value) -> bool {
         "name",
         "function",
         "call_id",
+        "tool_code",
+        "tool_name",
     ];
     let object_has_key = |object: &serde_json::Map<String, serde_json::Value>| {
         keys.iter().any(|key| object.contains_key(*key))
@@ -1474,6 +1479,18 @@ mod embedded_protocol_stream_tests {
         let text = "Creating now. {\"tool_call_id\":\"call_1\",\"content\":\"Status {placeholder} is ready\",\"tool_code\":\"print(shell())\",\"tool_name\":\"shell\"}";
         let forwarded = drive(&mut guard, &[text]);
         assert!(guard.suppressed_protocol);
+        assert_eq!(forwarded, "Creating now. ", "{forwarded:?}");
+    }
+
+    #[test]
+    fn a_stub_arriving_after_its_preamble_is_withheld() {
+        // The preamble streams on its own delta, so the stub arrives as a
+        // candidate with a prose prefix already forwarded. Its result key
+        // must not turn a python tool stub into a releasable quotation.
+        let mut guard = shell_guard();
+        let stub = "{\"tool_call_id\":\"c1\",\"content\":\"One moment.\",\"tool_code\":\"print(shell())\",\"tool_name\":\"shell\"}";
+        let forwarded = drive(&mut guard, &["Creating now. ", stub]);
+        assert!(guard.suppressed_protocol, "{forwarded:?}");
         assert_eq!(forwarded, "Creating now. ", "{forwarded:?}");
     }
 
