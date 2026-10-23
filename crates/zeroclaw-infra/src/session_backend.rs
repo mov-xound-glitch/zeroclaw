@@ -123,6 +123,14 @@ pub trait SessionBackend: Send + Sync {
         Ok(())
     }
 
+    /// Whether `append_exchange` lands an exchange whole or not at all.
+    /// Returning `true` is a promise: when `append_exchange` returns `Err`,
+    /// nothing of the exchange was written, so a caller may skip reading the
+    /// transcript back to find out what stayed. The default is `false`.
+    fn append_exchange_is_atomic(&self) -> bool {
+        false
+    }
+
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 

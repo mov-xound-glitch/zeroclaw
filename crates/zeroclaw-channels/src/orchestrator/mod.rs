@@ -4146,8 +4146,10 @@ fn channel_history_cap(ctx: &ChannelRuntimeContext) -> usize {
 /// Unlike [`append_sender_turn`], a failed durable write is an error: the
 /// caller records whether the exchange was persisted. The store is asked to
 /// land the exchange whole or not at all (`append_exchange`: one transaction
-/// on SQLite, best effort elsewhere). When it reports a failure, the durable
-/// transcript is read back and its growth since the read taken just before
+/// on SQLite, best effort elsewhere). A store that declares the write atomic
+/// (`append_exchange_is_atomic`) kept nothing when it reports a failure, so
+/// nothing is read and nothing is mirrored. Otherwise the durable transcript
+/// is read back on a failure, and its growth since the read taken just before
 /// the write says how much of the exchange landed; the cache mirrors exactly
 /// that. A transcript that cannot be read back is evicted from the cache, so
 /// the next turn rehydrates instead of building on a guess.
@@ -4168,22 +4170,27 @@ fn append_bound_exchange(
     // the transcript, and a cron exchange can repeat an earlier one word for
     // word, so neither the cache's length nor the transcript's tail can say
     // what this write added. The persist lock is held from here to the end,
-    // so no other writer moves the baseline.
+    // so no other writer moves the baseline. An atomic store needs none.
+    let atomic = ctx
+        .session_store
+        .as_ref()
+        .is_some_and(|store| store.append_exchange_is_atomic());
     let durable_before = match ctx.session_store {
-        None => 0,
-        Some(ref store) => store
+        Some(ref store) if !atomic => store
             .try_load(sender_key)
             .map_err(|error| {
                 anyhow::Error::new(error)
                     .context("conversation history could not be read before the write")
             })?
             .len(),
+        _ => 0,
     };
 
     let (kept, failure) = match ctx.session_store {
         None => (messages.len(), None),
         Some(ref store) => match store.append_exchange(sender_key, messages) {
             Ok(()) => (messages.len(), None),
+            Err(error) if atomic => (0, Some(anyhow::Error::new(error))),
             Err(error) => match store.try_load(sender_key) {
                 Ok(durable) => (
                     durable
@@ -20168,6 +20175,129 @@ fn bound_exchange_reconciles_a_failure_after_mutation() {
         .cloned()
         .unwrap_or_default();
     assert_eq!(cached.len(), 1, "nothing landed, so nothing is mirrored");
+}
+
+/// A store that declares its exchange write atomic is never read around it:
+/// success mirrors the whole exchange, and a failure means nothing landed, so
+/// nothing is mirrored and the error says so.
+#[cfg(test)]
+#[test]
+fn bound_exchange_on_an_atomic_store_skips_the_read_back() {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    /// Lands an exchange whole, or refuses it before writing anything, and
+    /// counts every read of the transcript.
+    struct AtomicStore {
+        messages: StdMutex<Vec<ChatMessage>>,
+        reads: AtomicUsize,
+        refuse: AtomicBool,
+    }
+    impl SessionBackend for AtomicStore {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.messages.lock().unwrap().clone()
+        }
+        fn try_load(&self, _key: &str) -> std::io::Result<Vec<ChatMessage>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.messages.lock().unwrap().clone())
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.messages.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+        fn append_exchange(&self, _key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("transaction rolled back"));
+            }
+            self.messages.lock().unwrap().extend_from_slice(messages);
+            Ok(())
+        }
+        fn append_exchange_is_atomic(&self) -> bool {
+            true
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Ok(Some(false))
+        }
+    }
+
+    let backend = Arc::new(AtomicStore {
+        messages: StdMutex::new(vec![
+            ChatMessage::user("older"),
+            ChatMessage::assistant("older reply"),
+            ChatMessage::user("recent"),
+        ]),
+        reads: AtomicUsize::new(0),
+        refuse: AtomicBool::new(false),
+    });
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    let sender = "bound_exchange_atomic_store_key";
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender.to_string(), vec![ChatMessage::user("recent")]);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender.to_string(), false);
+    let durable_len = || backend.messages.lock().unwrap().len();
+    let cached = || {
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender)
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    append_bound_exchange(
+        ctx.as_ref(),
+        sender,
+        &[
+            ChatMessage::user("[cron:job-1 reminder] Remind me"),
+            ChatMessage::assistant("Reminder sent."),
+        ],
+    )
+    .expect("the exchange lands");
+    assert_eq!(backend.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(durable_len(), 5);
+    let mirrored = cached();
+    assert_eq!(mirrored.len(), 3, "the cache mirrors the whole exchange");
+    assert_eq!(mirrored[1].content, "[cron:job-1 reminder] Remind me");
+    assert_eq!(mirrored[2].content, "Reminder sent.");
+
+    backend.refuse.store(true, Ordering::SeqCst);
+    let error = append_bound_exchange(
+        ctx.as_ref(),
+        sender,
+        &[
+            ChatMessage::user("[cron:job-2 reminder] Remind me"),
+            ChatMessage::assistant("Reminder sent."),
+        ],
+    )
+    .expect_err("the failure must be reported");
+    assert!(error.to_string().contains("nothing kept"), "{error:#}");
+    assert_eq!(backend.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(durable_len(), 5);
+    let contents = |messages: &[ChatMessage]| {
+        messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        contents(&cached()),
+        contents(&mirrored),
+        "nothing landed, so nothing is mirrored"
+    );
 }
 
 /// An exchange lands whole or not at all. When the store rejects its second

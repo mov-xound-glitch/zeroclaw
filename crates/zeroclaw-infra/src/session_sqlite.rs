@@ -963,6 +963,12 @@ impl SessionBackend for SqliteSessionBackend {
         tx.commit().map_err(std::io::Error::other)
     }
 
+    /// `append_exchange` runs in one transaction: a failed statement or
+    /// `COMMIT` drops it, and the drop rolls everything back.
+    fn append_exchange_is_atomic(&self) -> bool {
+        true
+    }
+
     /// Strict read: a query that fails is an error, never an empty transcript.
     fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
         let conn = self.conn.lock();
@@ -1798,6 +1804,13 @@ mod tests {
         let loaded = backend.try_load("s1").unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(backend.get_session_metadata("s1").unwrap().message_count, 1);
+    }
+
+    #[test]
+    fn append_exchange_is_declared_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(backend.append_exchange_is_atomic());
     }
 
     #[test]
