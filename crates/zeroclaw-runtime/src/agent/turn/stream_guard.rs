@@ -1552,9 +1552,10 @@ mod embedded_protocol_stream_tests {
 
     #[test]
     fn deep_nesting_ahead_of_an_unfinished_object_does_not_spend_the_scan() {
-        // A hundred nested arrays around a 4 KiB string close as one value
-        // and are stepped over once, so the unfinished object after them is
-        // still found and the delta is held from its opener.
+        // A hundred nested arrays around a 4 KiB string exhaust the scan
+        // budget before the unfinished object behind them. The delta is
+        // then held from where the scan stopped, which is at or before
+        // that object, so nothing of the stub streams.
         let nested = format!(
             "{}\"{}\"{}",
             "[".repeat(100),
@@ -1563,10 +1564,12 @@ mod embedded_protocol_stream_tests {
         );
         let first =
             format!("Here is the data: {nested} Creating now. {{\"content\":\"One moment.\",");
-        let expected = first.rfind('{').unwrap();
-        assert_eq!(
-            super::super::protocol_detect::find_incomplete_protocol_candidate_start(&first),
-            Some(expected)
+        let stub_open = first.rfind('{').unwrap();
+        let held_from =
+            super::super::protocol_detect::find_incomplete_protocol_candidate_start(&first);
+        assert!(
+            held_from.is_some_and(|start| start <= stub_open),
+            "{held_from:?}"
         );
 
         let mut guard = shell_guard();
@@ -1592,6 +1595,33 @@ mod embedded_protocol_stream_tests {
             super::super::protocol_detect::find_incomplete_protocol_candidate_start(&huge),
             Some(0)
         );
+    }
+
+    #[test]
+    fn an_unfinished_object_inside_malformed_outer_text_is_held() {
+        // Quote parity ahead of the inner object is wrong, so a scan from
+        // the outer bracket takes the `]` inside the string for its closer.
+        // Each opener is scanned on its own terms, so the inner object is
+        // still seen as unfinished and held from its own opener.
+        let first = "Data: [\"prefix {\"content\":\"Done ] now\",";
+        let inner = first.rfind('{').unwrap();
+        assert_eq!(
+            super::super::protocol_detect::find_incomplete_protocol_candidate_start(first),
+            Some(inner)
+        );
+
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &[
+                first,
+                "\"tool_code\":\"print(shell())\",\"tool_name\":\"shell\"}",
+            ],
+        );
+        assert!(guard.suppressed_protocol, "{forwarded:?}");
+        assert!(!forwarded.contains("tool_code"), "{forwarded:?}");
+        assert!(!forwarded.contains("Done"), "{forwarded:?}");
+        assert!(forwarded.starts_with("Data: "), "{forwarded:?}");
     }
 
     #[test]

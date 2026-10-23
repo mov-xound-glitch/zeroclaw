@@ -91,47 +91,46 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
     // tail qualifies, so a stray bracket in prose (`[0, 1)`) does not hold
     // the rest of the reply. Brackets inside strings do not count toward
     // whether a value closed, and a value that has closed is left to the
-    // rule above. A closed value is examined once and stepped over whole,
-    // so its nested openers are never rescanned and the budget counts each
-    // byte once; when the budget still runs out, the chunk is held from
-    // the opener where the scan stopped, so unexamined text cannot stream.
+    // rule above. Every opener is scanned on its own terms, with string
+    // state starting fresh at that opener: malformed text ahead of it can
+    // leave quote parity wrong, and a scan that trusted it would take an
+    // unfinished inner object for part of a value that closed. The budget
+    // bounds the bytes examined; when it runs out, the chunk is held from
+    // the opener where the scan stopped, so text the scan did not examine
+    // never streams.
     let mut scanned = 0usize;
-    let mut idx = 0usize;
-    while let Some(offset) = text[idx..].find(['{', '[']) {
-        let open = idx + offset;
-        let tail_raw = &text[open..];
-        match json_like_value_span(tail_raw) {
-            Some(closed_len) => {
-                scanned += closed_len;
-                if scanned > MAX_CANDIDATE_SCAN_BYTES {
-                    earliest = Some(earliest.map_or(open, |current| current.min(open)));
-                    break;
-                }
-                idx = open + closed_len;
-            }
-            None => {
-                scanned += tail_raw.len();
-                let tail = &lower[open..];
-                let rest = tail[1..].trim_start();
-                let json_like_start =
-                    rest.starts_with('"') || rest.starts_with('{') || rest.starts_with('[');
-                if json_like_start || tail.len() <= 16 || scanned > MAX_CANDIDATE_SCAN_BYTES {
-                    earliest = Some(earliest.map_or(open, |current| current.min(open)));
-                    break;
-                }
-                idx = open + 1;
-            }
+    for (idx, ch) in text.char_indices() {
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+        let tail_raw = &text[idx..];
+        let span = json_like_value_span(tail_raw);
+        scanned += span.unwrap_or(tail_raw.len());
+        if scanned > MAX_CANDIDATE_SCAN_BYTES {
+            earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
+            break;
+        }
+        if span.is_some() {
+            continue;
+        }
+        let tail = &lower[idx..];
+        let rest = tail[ch.len_utf8()..].trim_start();
+        let json_like_start =
+            rest.starts_with('"') || rest.starts_with('{') || rest.starts_with('[');
+        if json_like_start || tail.len() <= 16 {
+            earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
+            break;
         }
     }
 
     earliest
 }
 
-/// How many bytes one chunk may spend looking for an unfinished value. Each
-/// byte is examined once, because a closed value is stepped over whole, so
-/// deep nesting cannot spend the budget before a later candidate; a chunk
-/// that still exceeds it is held from where the scan stopped rather than
-/// streamed unexamined.
+/// How many bytes one chunk may spend looking for an unfinished value, so
+/// an adversarial chunk cannot make the scan quadratic. A chunk that
+/// exceeds it is held from the opener where the scan stopped, never
+/// streamed unexamined: deep nesting can cost the sender its streaming,
+/// not the reader a pasted tool call.
 const MAX_CANDIDATE_SCAN_BYTES: usize = 256 * 1024;
 
 /// The byte length of the bracketed value starting at `text[0]`, or `None`
