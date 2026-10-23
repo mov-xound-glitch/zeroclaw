@@ -240,10 +240,7 @@ fn is_inert_result_fragment(text: &str) -> bool {
 /// a value names something the parser might execute, so a result shape
 /// carrying one is withheld like a call, not quoted like a result.
 /// Top level only — a quoted result whose nested content mentions a
-/// name field is still a result. The list matches the one
-/// `open_prefix_is_result_shape` applies to a still-open object, so a
-/// python tool stub is judged the same way whether it arrives whole or
-/// after its preamble has already streamed.
+/// name field is still a result.
 fn has_call_shaped_top_level_key(value: &serde_json::Value) -> bool {
     let keys = [
         "tool_calls",
@@ -254,8 +251,6 @@ fn has_call_shaped_top_level_key(value: &serde_json::Value) -> bool {
         "name",
         "function",
         "call_id",
-        "tool_code",
-        "tool_name",
     ];
     let object_has_key = |object: &serde_json::Map<String, serde_json::Value>| {
         keys.iter().any(|key| object.contains_key(*key))
@@ -288,6 +283,45 @@ fn is_releasable_result(text: &str) -> bool {
         return false;
     };
     !has_call_shaped_top_level_key(&value)
+}
+
+/// A result-shaped value that is also a python tool stub for a tool
+/// active this turn: `tool_name` and `tool_code` both carried, with the
+/// name resolving to an active tool. The classifier calls such a stub a
+/// result on its correlation key, while the completed-response detector
+/// rejects it as a stub; the guard must not release what the detector
+/// would reject. A stub naming a tool that is not active, or a result
+/// carrying only one of the two fields, is judged as the detector judges
+/// it: a quotation.
+fn result_is_active_tool_stub(text: &str, known_tool_names: &HashSet<String>) -> bool {
+    let trimmed = text.trim();
+    let body = json_fence_body(trimmed).unwrap_or(trimmed);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let is_active_stub = |object: &serde_json::Map<String, serde_json::Value>| {
+        object
+            .get("tool_code")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|code| !code.trim().is_empty())
+            && object
+                .get("tool_name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| names_known_tool(name, known_tool_names))
+    };
+    match &value {
+        serde_json::Value::Object(object) => is_active_stub(object),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| item.as_object().is_some_and(is_active_stub)),
+        _ => false,
+    }
+}
+
+/// The release predicate every quoted-result path applies: a releasable
+/// result that is not a python tool stub for an active tool.
+fn is_releasable_result_for(text: &str, known_tool_names: &HashSet<String>) -> bool {
+    is_releasable_result(text) && !result_is_active_tool_stub(text, known_tool_names)
 }
 
 /// The end of a json-labelled fence opening the candidate, as a byte
@@ -499,7 +533,7 @@ impl StreamTextGuard {
             return false;
         }
         if self.candidate_has_prose_prefix()
-            && is_releasable_result(text)
+            && is_releasable_result_for(text, &self.known_tool_names)
             && !nested_values_embed_protocol(text, &self.known_tool_names)
         {
             return false;
@@ -773,7 +807,7 @@ impl StreamTextGuard {
                 return false;
             }
         }
-        is_releasable_result(span) || is_inert_result_fragment(span)
+        is_releasable_result_for(span, &self.known_tool_names) || is_inert_result_fragment(span)
     }
 
     /// Release through `boundary`, a byte offset into `pending` just past
@@ -1024,7 +1058,7 @@ impl StreamTextGuard {
                 // buffering); one whose top level carries a call-shaped
                 // key names something the parser might execute, so it is
                 // withheld like the call it also shapes.
-                if is_releasable_result(text) {
+                if is_releasable_result_for(text, &self.known_tool_names) {
                     return None;
                 }
                 return Some("tool_result");
@@ -1492,6 +1526,28 @@ mod embedded_protocol_stream_tests {
         let forwarded = drive(&mut guard, &["Creating now. ", stub]);
         assert!(guard.suppressed_protocol, "{forwarded:?}");
         assert_eq!(forwarded, "Creating now. ", "{forwarded:?}");
+    }
+
+    #[test]
+    fn a_quoted_result_naming_an_inactive_tool_streams() {
+        // Carrying a tool_name does not make a quotation a stub: with only
+        // shell active, a result naming another tool is what the detector
+        // accepts, so the guard delivers it whole, in one delta or two.
+        let mut guard = shell_guard();
+        let quoted = "{\"tool_call_id\":\"c1\",\"content\":\"42\",\"tool_name\":\"weather\"}";
+        let forwarded = drive(&mut guard, &["The API returned: ", quoted]);
+        assert!(!guard.suppressed_protocol, "{forwarded:?}");
+        assert_eq!(
+            forwarded,
+            format!("The API returned: {quoted}"),
+            "{forwarded:?}"
+        );
+
+        let mut guard = shell_guard();
+        let stub_for_other_tool = "{\"tool_call_id\":\"c1\",\"content\":\"42\",\"tool_code\":\"print(weather())\",\"tool_name\":\"weather\"}";
+        let forwarded = drive(&mut guard, &["The API returned: ", stub_for_other_tool]);
+        assert!(!guard.suppressed_protocol, "{forwarded:?}");
+        assert!(forwarded.ends_with(stub_for_other_tool), "{forwarded:?}");
     }
 
     #[test]
