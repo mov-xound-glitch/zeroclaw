@@ -408,29 +408,33 @@ pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Re
 /// Raw DB row for a job, with no config overlay applied. `shell_output_format`
 /// on the returned job is exactly what's stored in the `cron_jobs` column —
 /// for a declarative job that is a stale/default value, not the canonical
-/// one from `config.cron`. Used by [`update_job`] so unrelated patches don't
-/// re-persist a config-resolved snapshot into a column declarative jobs
-/// don't own; every other caller should use [`get_job`] instead.
+/// one from `config.cron`. Used by [`update_job`] (through [`select_job_raw`])
+/// so unrelated patches don't re-persist a config-resolved snapshot into a
+/// column declarative jobs don't own; every other caller should use
+/// [`get_job`] instead.
 fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
-    let Some(job) = with_read_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
-             FROM cron_jobs WHERE id = ?1",
-        )?;
-
-        let mut rows = stmt.query(params![job_id])?;
-        if let Some(row) = rows.next()? {
-            map_cron_job_row(row).map_err(Into::into)
-        } else {
-            Err(job_not_found(job_id))
-        }
-    })?
-    else {
+    let Some(job) = with_read_connection(config, |conn| select_job_raw(conn, job_id))? else {
         return Err(job_not_found(job_id));
     };
     Ok(job)
+}
+
+/// The SELECT behind [`get_job_raw`], on a connection the caller holds, so
+/// [`update_job`] can read the row inside the transaction that writes it.
+fn select_job_raw(conn: &Connection, job_id: &str) -> Result<CronJob> {
+    let mut stmt = conn.prepare(
+        "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                 enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                 allowed_tools, source, uses_memory, agent_alias, shell_output_format
+         FROM cron_jobs WHERE id = ?1",
+    )?;
+
+    let mut rows = stmt.query(params![job_id])?;
+    if let Some(row) = rows.next()? {
+        map_cron_job_row(row).map_err(Into::into)
+    } else {
+        Err(job_not_found(job_id))
+    }
 }
 
 pub fn resolve_job_id_or_name(
@@ -834,120 +838,127 @@ fn update_job_inner(
     owner: Option<&str>,
     patch: CronJobPatch,
 ) -> Result<CronJob> {
-    // Start from the raw DB row, not the config-resolved `get_job()` view:
-    // for a declarative job, `shell_output_format` isn't DB-owned, so an
-    // unrelated patch (e.g. toggling `enabled`) must not re-persist the
-    // resolved config value into the column and recreate a second owner.
-    let mut job = get_job_raw(config, job_id)?;
-    let mut schedule_changed = false;
-    // Whether this patch changes what a run is told, what it may use, or
-    // where its output goes. See the binding rule at the write below.
-    let mut redirects_run = false;
+    // Read the row and write it back in one IMMEDIATE transaction: the write
+    // lock is held from before the read, so the patch is applied to the row
+    // as it stands and no concurrent write is overwritten with stale values.
+    // An existing connection only, so an update on an empty workspace does
+    // not create the database.
+    let written = with_existing_initialized_connection(config, |conn| {
+        let tx = begin_immediate(conn, "job update")?;
+        // Start from the raw DB row, not the config-resolved `get_job()` view:
+        // for a declarative job, `shell_output_format` isn't DB-owned, so an
+        // unrelated patch (e.g. toggling `enabled`) must not re-persist the
+        // resolved config value into the column and recreate a second owner.
+        let mut job = select_job_raw(&tx, job_id)?;
+        let mut schedule_changed = false;
+        // Whether this patch changes what a run is told, what it may use, or
+        // where its output goes. See the binding rule at the write below.
+        let mut redirects_run = false;
 
-    if let Some(schedule) = patch.schedule {
-        validate_schedule(&schedule, Utc::now())?;
-        job.schedule = schedule;
-        job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
-        schedule_changed = true;
-    }
-    if let Some(command) = patch.command {
-        redirects_run |= job.command != command;
-        job.command = command;
-    }
-    if let Some(prompt) = patch.prompt {
-        redirects_run |= job.prompt.as_deref() != Some(prompt.as_str());
-        job.prompt = Some(prompt);
-    }
-    if let Some(name) = patch.name {
-        redirects_run |= job.name.as_deref() != Some(name.as_str());
-        job.name = Some(name);
-    }
-    if let Some(enabled) = patch.enabled {
-        job.enabled = enabled;
-    }
-    if let Some(delivery) = patch.delivery {
-        // A declarative job's delivery is owned by `[cron.<id>].delivery` in
-        // config.toml. Writing it here would appear to succeed and then be
-        // silently reverted by `sync_declarative_jobs` on the next daemon
-        // start, which rewrites every declarative column from the config.
-        // Reject at this boundary rather than persist a value the next sync
-        // discards, matching how `shell_output_format` is handled below.
-        //
-        // Ownership is checked before shape: a declarative job rejects any
-        // delivery patch, so reporting a missing recipient first would imply
-        // that correcting it would let the write through.
-        if job.source == "declarative" {
-            anyhow::bail!(
-                "Cron job '{job_id}': delivery is owned by [cron.{job_id}].delivery in \
-                 config.toml for a declarative job, not the database. Edit the config \
-                 and restart the daemon."
-            );
+        if let Some(schedule) = patch.schedule {
+            validate_schedule(&schedule, Utc::now())?;
+            job.schedule = schedule;
+            job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
+            schedule_changed = true;
         }
-        // Match add_*_job: announce delivery must include channel + to.
-        validate_delivery_config(Some(&delivery))?;
-        redirects_run |= job.delivery != delivery;
-        job.delivery = delivery;
-    }
-    if let Some(model) = patch.model {
-        redirects_run |= job.model.as_deref() != Some(model.as_str());
-        job.model = Some(model);
-    }
-    if let Some(target) = patch.session_target {
-        redirects_run |= job.session_target != target;
-        job.session_target = target;
-    }
-    if let Some(delete_after_run) = patch.delete_after_run {
-        job.delete_after_run = delete_after_run;
-    }
-    if let Some(allowed_tools) = patch.allowed_tools {
-        // Empty list means "clear the allowlist" (all tools available),
-        // not "allow zero tools".
-        let allowed_tools = (!allowed_tools.is_empty()).then_some(allowed_tools);
-        redirects_run |= job.allowed_tools != allowed_tools;
-        job.allowed_tools = allowed_tools;
-    }
-    if let Some(uses_memory) = patch.uses_memory {
-        redirects_run |= job.uses_memory != uses_memory;
-        job.uses_memory = uses_memory;
-    }
-    if let Some(shell_output_format) = patch.shell_output_format {
-        // Config-owned (declarative) and non-shell (agent) jobs never store
-        // this field: the gateway API already rejects both cases, but this
-        // is the core boundary every caller of `update_job` goes through,
-        // so it must reject them too rather than silently ignoring or
-        // persisting a value execution never consumes.
-        if job.source == "declarative" {
-            anyhow::bail!(
-                "Cron job '{job_id}': shell_output_format is owned by config.toml for a \
-                 declarative job, not the database"
-            );
+        if let Some(command) = patch.command {
+            redirects_run |= job.command != command;
+            job.command = command;
         }
-        if job.job_type != JobType::Shell {
-            let job_type: &str = job.job_type.into();
-            anyhow::bail!(
-                "Cron job '{job_id}': shell_output_format is shell-only and cannot be set on a '{job_type}' job"
-            );
+        if let Some(prompt) = patch.prompt {
+            redirects_run |= job.prompt.as_deref() != Some(prompt.as_str());
+            job.prompt = Some(prompt);
         }
-        job.shell_output_format = shell_output_format;
-    }
+        if let Some(name) = patch.name {
+            redirects_run |= job.name.as_deref() != Some(name.as_str());
+            job.name = Some(name);
+        }
+        if let Some(enabled) = patch.enabled {
+            job.enabled = enabled;
+        }
+        if let Some(delivery) = patch.delivery {
+            // A declarative job's delivery is owned by `[cron.<id>].delivery` in
+            // config.toml. Writing it here would appear to succeed and then be
+            // silently reverted by `sync_declarative_jobs` on the next daemon
+            // start, which rewrites every declarative column from the config.
+            // Reject at this boundary rather than persist a value the next sync
+            // discards, matching how `shell_output_format` is handled below.
+            //
+            // Ownership is checked before shape: a declarative job rejects any
+            // delivery patch, so reporting a missing recipient first would imply
+            // that correcting it would let the write through.
+            if job.source == "declarative" {
+                anyhow::bail!(
+                    "Cron job '{job_id}': delivery is owned by [cron.{job_id}].delivery in \
+                     config.toml for a declarative job, not the database. Edit the config \
+                     and restart the daemon."
+                );
+            }
+            // Match add_*_job: announce delivery must include channel + to.
+            validate_delivery_config(Some(&delivery))?;
+            redirects_run |= job.delivery != delivery;
+            job.delivery = delivery;
+        }
+        if let Some(model) = patch.model {
+            redirects_run |= job.model.as_deref() != Some(model.as_str());
+            job.model = Some(model);
+        }
+        if let Some(target) = patch.session_target {
+            redirects_run |= job.session_target != target;
+            job.session_target = target;
+        }
+        if let Some(delete_after_run) = patch.delete_after_run {
+            job.delete_after_run = delete_after_run;
+        }
+        if let Some(allowed_tools) = patch.allowed_tools {
+            // Empty list means "clear the allowlist" (all tools available),
+            // not "allow zero tools".
+            let allowed_tools = (!allowed_tools.is_empty()).then_some(allowed_tools);
+            redirects_run |= job.allowed_tools != allowed_tools;
+            job.allowed_tools = allowed_tools;
+        }
+        if let Some(uses_memory) = patch.uses_memory {
+            redirects_run |= job.uses_memory != uses_memory;
+            job.uses_memory = uses_memory;
+        }
+        if let Some(shell_output_format) = patch.shell_output_format {
+            // Config-owned (declarative) and non-shell (agent) jobs never store
+            // this field: the gateway API already rejects both cases, but this
+            // is the core boundary every caller of `update_job` goes through,
+            // so it must reject them too rather than silently ignoring or
+            // persisting a value execution never consumes.
+            if job.source == "declarative" {
+                anyhow::bail!(
+                    "Cron job '{job_id}': shell_output_format is owned by config.toml for a \
+                     declarative job, not the database"
+                );
+            }
+            if job.job_type != JobType::Shell {
+                let job_type: &str = job.job_type.into();
+                anyhow::bail!(
+                    "Cron job '{job_id}': shell_output_format is shell-only and cannot be set on a '{job_type}' job"
+                );
+            }
+            job.shell_output_format = shell_output_format;
+        }
 
-    if schedule_changed {
-        job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
-    }
+        if schedule_changed {
+            job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
+        }
 
-    // A recorded conversation stays with a job only while the job still does
-    // what that conversation set up. A patch that redirects the run drops the
-    // record unless it is made from within that same conversation, so one
-    // conversation can never repoint a job at another's history. The test is
-    // part of the UPDATE itself: there is no window in which the redirected
-    // job still carries the record.
-    let editing_from = patch
-        .edited_from
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
+        // A recorded conversation stays with a job only while the job still does
+        // what that conversation set up. A patch that redirects the run drops the
+        // record unless it is made from within that same conversation, so one
+        // conversation can never repoint a job at another's history. The test is
+        // part of the UPDATE itself, and whether the patch redirects the run is
+        // judged against the row read in the same transaction, so no other write
+        // can land in between: the redirected job never carries the record.
+        let editing_from = patch
+            .edited_from
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
 
-    with_initialized_connection(config, |conn| {
         // Declarative jobs don't own `shell_output_format` — the config is the
         // canonical source, and `resolve_declarative_shell_output_format()` overlays
         // it on every read. Writing the synthesized (Wrapped) value back into the
@@ -956,7 +967,7 @@ fn update_job_inner(
         // own. Omit the column from the UPDATE for declarative rows so the
         // non-owned shadow stays untouched.
         let changed = if job.source == "declarative" {
-            conn.execute(
+            tx.execute(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
@@ -987,7 +998,7 @@ fn update_job_inner(
                 ],
             )
         } else {
-            conn.execute(
+            tx.execute(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
@@ -1025,12 +1036,16 @@ fn update_job_inner(
         .context("Failed to update cron job")?;
 
         // Zero rows means the guard matched nothing: the job moved to another
-        // owner between the read above and this write.
+        // owner after the caller checked ownership.
         if changed == 0 {
             anyhow::bail!("Cron job '{job_id}' not found");
         }
+        tx.commit().context("Failed to commit cron job update")?;
         Ok(())
     })?;
+    if written.is_none() {
+        return Err(job_not_found(job_id));
+    }
 
     get_job(config, job_id)
 }
@@ -2562,10 +2577,11 @@ const MIGRATION_CONTENTION_CONTEXT: &str = concat!(
     "incomplete; the operation was not started and can be retried"
 );
 
-/// Begin an IMMEDIATE transaction for a recovery or migration write: the
-/// write lock is taken up front, so the busy timeout applies to acquiring
-/// it — unlike a deferred transaction's read-to-write upgrade, which SQLite
-/// fails immediately without consulting the busy handler.
+/// Begin an IMMEDIATE transaction for a recovery or migration write, or for
+/// a job update that reads the row it writes: the write lock is taken up
+/// front, so the busy timeout applies to acquiring it — unlike a deferred
+/// transaction's read-to-write upgrade, which SQLite fails immediately
+/// without consulting the busy handler.
 fn begin_immediate<'c>(conn: &'c Connection, phase: &str) -> Result<Transaction<'c>> {
     Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .with_context(|| format!("Failed to begin cron {phase} transaction"))
@@ -6055,6 +6071,65 @@ mod tests {
         assert_eq!(
             get_job(&config, &job.id).unwrap().prompt.as_deref(),
             Some("Remind me to call Sam at six")
+        );
+    }
+
+    /// An update reads the row inside the transaction that writes it back. A
+    /// write that commits while the update waits for the lock is the row the
+    /// patch applies to: a field the patch leaves alone keeps that write's
+    /// value, and whether the patch redirects the run is judged against it.
+    #[test]
+    fn update_applies_its_patch_to_a_write_committed_while_it_waited() {
+        let tmp = TempDir::new().unwrap();
+        let config = std::sync::Arc::new(test_config(&tmp));
+        let job = bound_agent_job(&config, "telegram_42_42");
+        let original_prompt = job.prompt.clone().unwrap();
+
+        let holder = hold_write_lock(&config);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let update_config = config.clone();
+        let update_job_id = job.id.clone();
+        let update_prompt = original_prompt.clone();
+        let update_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            // A caller re-sending the prompt it last saw, as a dashboard does.
+            update_job(
+                &update_config,
+                &update_job_id,
+                CronJobPatch {
+                    prompt: Some(update_prompt),
+                    enabled: Some(false),
+                    ..CronJobPatch::default()
+                },
+            )
+        });
+        started_rx.recv().unwrap();
+        // Let the update reach the lock. It waits there for the busy timeout,
+        // far longer than this; if it has not got there yet, it reads the
+        // committed row anyway.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        holder
+            .execute(
+                "UPDATE cron_jobs SET prompt = 'Remind me to call Ann', model = 'other-model'
+                 WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+        holder.execute_batch("COMMIT").unwrap();
+        drop(holder);
+
+        let updated = update_thread.join().unwrap().unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.prompt.as_deref(), Some(original_prompt.as_str()));
+        assert_eq!(
+            updated.model.as_deref(),
+            Some("other-model"),
+            "a field the patch leaves alone keeps the other writer's value"
+        );
+        assert_eq!(
+            job_conversation_binding(&config, &job.id).unwrap(),
+            None,
+            "against the committed row the patch changes the prompt, so the job is unbound"
         );
     }
 
