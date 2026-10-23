@@ -1551,6 +1551,50 @@ mod embedded_protocol_stream_tests {
     }
 
     #[test]
+    fn deep_nesting_ahead_of_an_unfinished_object_does_not_spend_the_scan() {
+        // A hundred nested arrays around a 4 KiB string close as one value
+        // and are stepped over once, so the unfinished object after them is
+        // still found and the delta is held from its opener.
+        let nested = format!(
+            "{}\"{}\"{}",
+            "[".repeat(100),
+            "x".repeat(4096),
+            "]".repeat(100)
+        );
+        let first =
+            format!("Here is the data: {nested} Creating now. {{\"content\":\"One moment.\",");
+        let expected = first.rfind('{').unwrap();
+        assert_eq!(
+            super::super::protocol_detect::find_incomplete_protocol_candidate_start(&first),
+            Some(expected)
+        );
+
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &[
+                &first,
+                "\"tool_code\":\"print(shell())\",\"tool_name\":\"shell\"}",
+            ],
+        );
+        assert!(guard.suppressed_protocol, "{forwarded:?}");
+        assert!(!forwarded.contains("tool_code"), "{forwarded:?}");
+        assert!(!forwarded.contains("One moment"), "{forwarded:?}");
+        assert!(forwarded.starts_with("Here is the data: "), "{forwarded:?}");
+    }
+
+    #[test]
+    fn a_chunk_past_the_scan_budget_is_held_not_streamed() {
+        // When even a single-pass scan exceeds the budget, the chunk is held
+        // from where the scan stopped instead of streaming unexamined.
+        let huge = format!("[\"{}\"]", "x".repeat(300 * 1024));
+        assert_eq!(
+            super::super::protocol_detect::find_incomplete_protocol_candidate_start(&huge),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn a_quoted_result_whose_content_carries_a_call_envelope_is_withheld() {
         // The quotation rule covers a result; a call envelope for an active
         // tool riding inside the result's content is still a leak, as the
