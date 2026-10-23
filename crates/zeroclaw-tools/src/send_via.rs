@@ -21,6 +21,11 @@ pub type PerToolChannelHandle = Arc<parking_lot::RwLock<HashMap<String, Arc<dyn 
 /// `output_modality`) takes effect without rebuilding the tool registry.
 pub type AgentPeerGroupResolver = Arc<dyn Fn() -> HashMap<String, PeerGroupConfig> + Send + Sync>;
 
+/// Resolves the attachment count and size limits, read live from config at
+/// call time so a config reload takes effect on the next send and in the
+/// advertised schema without rebuilding the tool registry.
+pub type SendViaLimitsResolver = Arc<dyn Fn() -> SendViaToolConfig + Send + Sync>;
+
 tokio::task_local! {
     pub static TURN_ROUTING: Option<TurnRoutingHandle>;
 }
@@ -113,8 +118,9 @@ pub struct SendViaTool {
     channel_map: PerToolChannelHandle,
     /// Resolves the active agent's peer groups live from config at call time.
     agent_peer_groups: AgentPeerGroupResolver,
-    /// Count and size limits for files attached to an immediate send.
-    attachment_limits: SendViaToolConfig,
+    /// Resolves the count and size limits for files attached to an immediate
+    /// send live from config at call time.
+    attachment_limits: SendViaLimitsResolver,
 }
 
 impl SendViaTool {
@@ -127,12 +133,13 @@ impl SendViaTool {
             security,
             channel_map,
             agent_peer_groups,
-            attachment_limits: SendViaToolConfig::default(),
+            attachment_limits: Arc::new(SendViaToolConfig::default),
         }
     }
 
-    /// Replace the default attachment limits with the configured ones.
-    pub fn with_attachment_limits(mut self, limits: SendViaToolConfig) -> Self {
+    /// Replace the default attachment limits with a resolver over the
+    /// configured ones.
+    pub fn with_attachment_limits(mut self, limits: SendViaLimitsResolver) -> Self {
         self.attachment_limits = limits;
         self
     }
@@ -269,7 +276,7 @@ impl SendViaTool {
             ));
         }
 
-        let limits = &self.attachment_limits;
+        let limits = (self.attachment_limits)();
         let max_attachments = usize::try_from(limits.max_attachments).unwrap_or(usize::MAX);
         if paths.len() > max_attachments {
             return Err(crate::i18n::get_required_tool_string_with_args(
@@ -429,6 +436,7 @@ impl Tool for SendViaTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let limits = (self.attachment_limits)();
         json!({
             "type": "object",
             "properties": {
@@ -455,15 +463,15 @@ impl Tool for SendViaTool {
                         &[
                             (
                                 "max_attachments",
-                                &self.attachment_limits.max_attachments.to_string(),
+                                &limits.max_attachments.to_string(),
                             ),
                             (
                                 "max_attachment_bytes",
-                                &self.attachment_limits.max_attachment_bytes.to_string(),
+                                &limits.max_attachment_bytes.to_string(),
                             ),
                             (
                                 "max_total_attachment_bytes",
-                                &self.attachment_limits.max_total_attachment_bytes.to_string(),
+                                &limits.max_total_attachment_bytes.to_string(),
                             ),
                         ],
                     )
@@ -1597,6 +1605,20 @@ mod tests {
         peer_groups: HashMap<String, PeerGroupConfig>,
         limits: SendViaToolConfig,
     ) -> (TestTool, TurnRoutingHandle) {
+        attachment_tool_with_limits(
+            security,
+            channel,
+            peer_groups,
+            Arc::new(move || limits.clone()),
+        )
+    }
+
+    fn attachment_tool_with_limits(
+        security: SecurityPolicy,
+        channel: Arc<StubChannel>,
+        peer_groups: HashMap<String, PeerGroupConfig>,
+        limits: SendViaLimitsResolver,
+    ) -> (TestTool, TurnRoutingHandle) {
         let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         map.write()
             .insert("email.default".to_string(), channel as Arc<dyn Channel>);
@@ -2007,5 +2029,73 @@ mod tests {
         let description = attachments["description"].as_str().unwrap();
         assert!(description.contains("At most 3 files, 100 bytes per file, 200 bytes"));
         assert!(description.contains("file_read"));
+    }
+
+    /// The same long-lived tool applies limits changed in the live config on
+    /// its next send and advertises them in its schema, without a rebuild.
+    #[tokio::test]
+    async fn attachment_limits_follow_live_config_changes() {
+        let fx = AttachmentFixture::new();
+        fx.write("ten-a.txt", &[b'a'; 10]);
+        fx.write("ten-b.txt", &[b'b'; 10]);
+        let live = Arc::new(parking_lot::RwLock::new(SendViaToolConfig::default()));
+        let resolver: SendViaLimitsResolver = {
+            let live = Arc::clone(&live);
+            Arc::new(move || live.read().clone())
+        };
+        let ch = Arc::new(StubChannel::with_attachments("email"));
+        let sent = Arc::clone(&ch.sent);
+        let (tool, _routing) =
+            attachment_tool_with_limits(fx.security(), ch, mail_group(true), resolver);
+        let advertised = |tool: &TestTool| {
+            tool.inner.parameters_schema()["properties"]["attachments"]["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let defaults = SendViaToolConfig::default();
+        assert!(advertised(&tool).contains(&format!(
+            "At most {} files, {} bytes per file, {} bytes in total",
+            defaults.max_attachments,
+            defaults.max_attachment_bytes,
+            defaults.max_total_attachment_bytes
+        )));
+        let result = tool
+            .execute(send_with(json!(["ten-a.txt", "ten-b.txt"])))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        sent.write().clear();
+
+        // Reload: a lower count limit refuses the same call.
+        live.write().max_attachments = 1;
+        let result = tool
+            .execute(send_with(json!(["ten-a.txt", "ten-b.txt"])))
+            .await
+            .unwrap();
+        assert_refused(
+            &result,
+            &sent,
+            "Too many attachments: 2 (limit: 1 per call)",
+        );
+
+        // Reload: lower byte limits refuse a single file and show in the schema.
+        *live.write() = SendViaToolConfig {
+            max_attachments: 1,
+            max_attachment_bytes: 5,
+            max_total_attachment_bytes: 5,
+        };
+        let result = tool.execute(send_with(json!(["ten-a.txt"]))).await.unwrap();
+        assert_refused(
+            &result,
+            &sent,
+            "attachment 'ten-a.txt' is too large: 10 bytes (limit: 5 bytes per file)",
+        );
+        assert!(
+            advertised(&tool).contains("At most 1 files, 5 bytes per file, 5 bytes in total"),
+            "the schema must advertise the reloaded limits: {}",
+            advertised(&tool)
+        );
     }
 }

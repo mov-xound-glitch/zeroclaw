@@ -1146,17 +1146,19 @@ impl SlackChannel {
     /// text delivered on its own.
     fn ensure_outbound_attachment_uploadable(attachment: &MediaAttachment) -> anyhow::Result<()> {
         if attachment.data.len() > SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES {
-            anyhow::bail!(
-                "Slack outbound attachment exceeds {} bytes: {}",
-                SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES,
-                attachment.file_name
-            );
+            anyhow::bail!(i18n::get_required_cli_string_with_args(
+                "channel-slack-error-attachment-too-large",
+                &[
+                    ("limit", &SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES.to_string()),
+                    ("file", &attachment.file_name),
+                ],
+            ));
         }
         if attachment.data.is_empty() {
-            anyhow::bail!(
-                "Slack outbound attachment is empty: {}",
-                attachment.file_name
-            );
+            anyhow::bail!(i18n::get_required_cli_string_with_args(
+                "channel-slack-error-attachment-empty",
+                &[("file", &attachment.file_name)],
+            ));
         }
         Ok(())
     }
@@ -5315,11 +5317,13 @@ impl Channel for SlackChannel {
         // so the per-message cap in `upload_outbound_attachments` can only
         // drop marker-derived files after them.
         if message.attachments.len() > SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE {
-            anyhow::bail!(
-                "Slack accepts at most {SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE} attachments \
-                 per message; got {}",
-                message.attachments.len()
-            );
+            anyhow::bail!(i18n::get_required_cli_string_with_args(
+                "channel-slack-error-too-many-attachments",
+                &[
+                    ("limit", &SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE.to_string()),
+                    ("count", &message.attachments.len().to_string()),
+                ],
+            ));
         }
         let mut outbound_attachments = message.attachments.clone();
 
@@ -7922,25 +7926,31 @@ mod tests {
         let too_many: Vec<MediaAttachment> = (0..=SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE)
             .map(|i| attachment(&format!("f{i}.txt"), b"bytes".to_vec()))
             .collect();
+        // The English rendering of each refusal, as the agent and user see it.
         let cases = [
-            (too_many, "at most 8 attachments"),
+            (
+                too_many,
+                "Slack accepts at most 8 attachments per message; got 9".to_string(),
+            ),
             (
                 vec![
                     attachment("ok.txt", b"bytes".to_vec()),
                     attachment("empty.txt", Vec::new()),
                 ],
-                "is empty: empty.txt",
+                "Slack outbound attachment is empty: empty.txt".to_string(),
             ),
             (
                 vec![attachment(
                     "big.bin",
                     vec![0; SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES + 1],
                 )],
-                "exceeds",
+                format!(
+                    "Slack outbound attachment exceeds {SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES} bytes: big.bin"
+                ),
             ),
         ];
 
-        for (attachments, needle) in cases {
+        for (attachments, expected) in cases {
             let server = MockServer::start().await;
             let tmp = tempfile::tempdir().unwrap();
             let ch = test_slack_channel(&server, tmp.path());
@@ -7949,7 +7959,7 @@ mod tests {
             let err = SlackChannel::send(&ch, &msg)
                 .await
                 .expect_err("an undeliverable attachment list must fail the send");
-            assert!(err.to_string().contains(needle), "unexpected error: {err}");
+            assert_eq!(err.to_string(), expected);
             let requests = server.received_requests().await.unwrap();
             assert!(
                 requests.is_empty(),

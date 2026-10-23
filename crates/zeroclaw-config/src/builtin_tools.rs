@@ -34,7 +34,8 @@ pub const EXTERNAL_TOOL_NAMES: &[&str] = &[
 ];
 
 /// Model-visible built-in selection (`[tools]`), plus per-tool limits in its
-/// subsections. Rebuild the registry after edits.
+/// subsections. Rebuild the registry after editing `optional`; the limits are
+/// read live on each call.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, deny_unknown_fields)]

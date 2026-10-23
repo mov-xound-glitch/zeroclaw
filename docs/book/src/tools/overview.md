@@ -229,8 +229,9 @@ Sizes are checked on the bytes actually read. Every file is checked and loaded
 before the message is sent, so one refused file means no message and no partial
 delivery. A failure in the channel itself after sending has started, such as a
 network error halfway through an upload, can still leave part of the message
-delivered. The limits are read when the tool registry is built. Reload the
-configuration after changing them.
+delivered. The limits are read from the live configuration on every call, so a
+change applies to the next send and to the limits the tool advertises to the
+model, without rebuilding the tool registry.
 
 `send_via` messages are sent with inline attachments off. Several channels
 (among them Slack, Matrix, Telegram and Discord) normally turn file markers such
