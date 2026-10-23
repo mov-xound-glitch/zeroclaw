@@ -946,10 +946,17 @@ impl SessionBackend for SqliteSessionBackend {
     /// failure part-way changes nothing: an error after the first insert no
     /// longer leaves a message the metadata does not count, or half of an
     /// exchange, behind.
+    ///
+    /// The write lock is taken up front (`IMMEDIATE`) so the busy timeout
+    /// applies to getting it. A deferred transaction starts from a read
+    /// snapshot, and SQLite refuses to turn that into a write at once when
+    /// another connection committed in between, without waiting.
     fn append_exchange(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
         let mut conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
-        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
         for message in messages {
             Self::append_on(&tx, session_key, message, &now).map_err(std::io::Error::other)?;
         }
