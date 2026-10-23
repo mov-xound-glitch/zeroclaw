@@ -2847,11 +2847,10 @@ fn all_tools_with_runtime_on_thread(
         };
         register_tool!(
             "send_via",
-            Arc::new(SendViaTool::new(
-                security.clone(),
-                ask_user_tool_handle,
-                agent_peer_groups,
-            ))
+            Arc::new(
+                SendViaTool::new(security.clone(), ask_user_tool_handle, agent_peer_groups)
+                    .with_attachment_limits(root_config.tools.send_via.clone())
+            )
         );
     }
 
@@ -3625,6 +3624,7 @@ mod tests {
     fn optional_builtin_is_not_constructed_or_exposed_until_selected() {
         let mut selection = zeroclaw_config::builtin_tools::BuiltinToolsConfig {
             optional: Vec::new(),
+            ..zeroclaw_config::builtin_tools::BuiltinToolsConfig::default()
         };
         let constructions = std::cell::Cell::new(0);
         let mut registry = Vec::new();
@@ -3664,6 +3664,7 @@ mod tests {
         let mut config = Config {
             tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
                 optional: Vec::new(),
+                ..zeroclaw_config::builtin_tools::BuiltinToolsConfig::default()
             },
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
@@ -3750,6 +3751,7 @@ mod tests {
         Config {
             tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
                 optional: vec!["*".into()],
+                ..zeroclaw_config::builtin_tools::BuiltinToolsConfig::default()
             },
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),

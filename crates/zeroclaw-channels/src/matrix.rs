@@ -4910,6 +4910,11 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
+    /// Outbound attachments are uploaded to the room, in the reply's thread.
+    fn supports_outbound_attachments(&self) -> bool {
+        true
+    }
+
     fn supports_draft_updates(&self) -> bool {
         // The orchestrator's streaming pipeline is gated on this returning
         // true. Partial, SingleMessage, and MultiMessage all need streaming

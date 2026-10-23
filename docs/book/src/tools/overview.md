@@ -185,6 +185,60 @@ Selected tools also retain these prerequisites:
 | `sop_*` tools | Registered when the SOP runtime is enabled (`sop.sops_dir` set to a non-empty value; unset by default, which disables it; the documented value is `shared/sops`): run and inspect SOPs |
 | `discord_search` | Registered when a Discord alias has `archive` enabled |
 
+## Sending files with send_via
+
+`send_via` sends an extra message to another channel during a turn (`target`
+plus `body`). In that immediate mode it also accepts `attachments`, a list of
+file paths:
+
+```json
+{
+  "target": "client_mail",
+  "body": "The report you asked for is attached.",
+  "attachments": ["out/report.pdf", "out/figures.zip"]
+}
+```
+
+The `attachments` list is off until the operator allows it. All of these must
+hold, or the call is refused and nothing is sent:
+
+- The call is an immediate send. A routing instruction (no `body`) cannot carry
+  files.
+- The target channel can deliver files. Email (IMAP/SMTP), Slack and Matrix
+  can; every other channel, including plugin channels, is refused by name.
+  The channel's own limits still apply: Slack takes at most 8 files of up to
+  20 MiB each and refuses empty files, and it refuses the whole send before
+  posting anything when a file breaks those limits.
+- The peer group the target resolves to sets `attachments_enabled = true`
+  (see [Peer groups](../channels/peer-groups.md)). The default is `false`.
+- Every path passes the same read policy as `file_read`: relative paths resolve
+  from the workspace, `..` components are refused, symlinks are resolved before
+  the check, and the file must be inside the workspace or a readable allowed
+  root. Runtime configuration files such as `config.toml` are always refused.
+  Each path must name a regular file.
+- The call stays within the limits in `[tools.send_via]`:
+
+```toml
+[tools.send_via]
+max_attachments = 10                       # files per call
+max_attachment_bytes = 10485760            # 10 MiB per file
+max_total_attachment_bytes = 20971520      # 20 MiB per call
+```
+
+Sizes are checked on the bytes actually read. Every file is checked and loaded
+before the message is sent, so one refused file means no message and no partial
+delivery. A failure in the channel itself after sending has started, such as a
+network error halfway through an upload, can still leave part of the message
+delivered. The limits are read when the tool registry is built. Reload the
+configuration after changing them.
+
+A `send_via` body may not carry file markers such as `[FILE:/path]` or
+`[IMAGE:/path]`. Several channels (among them Slack, Matrix, Telegram and
+Discord) turn those markers into uploads, which would bypass the rules above, so
+an immediate send whose body contains one is refused and nothing is sent. Files
+go through `attachments` only. Ordinary replies keep their channel's marker
+handling.
+
 ## Built-in schema discovery
 
 Enable `deferred_builtin_tools` on the agent's runtime profile through the ZeroCode Config editor to reduce the built-in tool catalog sent to the model. It defaults to `false`, which preserves eager schema loading. The setting is independent of MCP's `deferred_loading` option.

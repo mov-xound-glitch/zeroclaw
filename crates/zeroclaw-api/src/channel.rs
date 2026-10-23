@@ -1074,6 +1074,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         true
     }
 
+    /// Whether `send` delivers the files in [`SendMessage::attachments`]. Default
+    /// `false`: a channel that does not override this would drop them silently, so
+    /// a caller that must deliver files (such as the `send_via` tool) refuses
+    /// instead of sending the text alone. A channel that returns `true` must send
+    /// every entry of `SendMessage::attachments` from its `send`, using only the
+    /// bytes in `MediaAttachment::data`.
+    fn supports_outbound_attachments(&self) -> bool {
+        false
+    }
+
     /// Self-loop guard for multi-agent runs: the bot's own handle/identity on
     /// this channel, so the orchestrator can drop inbound events whose
     /// `sender` matches. A bot must never respond to its own messages, even
