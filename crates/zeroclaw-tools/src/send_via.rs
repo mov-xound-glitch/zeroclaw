@@ -247,8 +247,9 @@ impl SendViaTool {
 
     /// Check that `channel` may carry attachments to this peer group, then load
     /// every path within the configured limits. All or nothing: the first
-    /// refusal is returned and no attachment is kept.
-    fn load_attachments(
+    /// refusal is returned and no attachment is kept. The file reads run on one
+    /// blocking task so a slow filesystem never stalls the async worker.
+    async fn load_attachments(
         &self,
         channel_key: &str,
         channel: &dyn Channel,
@@ -256,92 +257,82 @@ impl SendViaTool {
         paths: &[String],
     ) -> Result<Vec<MediaAttachment>, String> {
         if !channel.supports_outbound_attachments() {
-            return Err(format!(
-                "Channel '{channel_key}' cannot deliver file attachments; \
-                 send without `attachments` or pick a channel that supports them"
+            return Err(crate::i18n::get_required_tool_string_with_args(
+                "tool-send-via-error-channel-no-attachments",
+                &[("channel", channel_key)],
             ));
         }
         if !peer_group.attachments_enabled {
-            return Err(format!(
-                "Attachments are not enabled for peer group '{}'; \
-                 the operator must set `attachments_enabled = true` on it",
-                peer_group.name
+            return Err(crate::i18n::get_required_tool_string_with_args(
+                "tool-send-via-error-attachments-disabled",
+                &[("peer_group", &peer_group.name)],
             ));
         }
 
         let limits = &self.attachment_limits;
         let max_attachments = usize::try_from(limits.max_attachments).unwrap_or(usize::MAX);
         if paths.len() > max_attachments {
-            return Err(format!(
-                "Too many attachments: {} (limit: {max_attachments} per call)",
-                paths.len()
+            return Err(crate::i18n::get_required_tool_string_with_args(
+                "tool-send-via-error-too-many-attachments",
+                &[
+                    ("count", &paths.len().to_string()),
+                    ("limit", &max_attachments.to_string()),
+                ],
             ));
         }
 
-        let mut total: u64 = 0;
-        let mut attachments = Vec::with_capacity(paths.len());
-        for path in paths {
-            let attachment =
-                read_workspace_attachment(&self.security, path, limits.max_attachment_bytes)?;
-            total = total.saturating_add(attachment.data.len() as u64);
-            if total > limits.max_total_attachment_bytes {
-                return Err(format!(
-                    "Attachments exceed the combined limit of {} bytes per call \
-                     (reached at '{path}')",
-                    limits.max_total_attachment_bytes
-                ));
-            }
-            attachments.push(attachment);
-        }
-        Ok(attachments)
+        let security = Arc::clone(&self.security);
+        let paths = paths.to_vec();
+        let max_attachment_bytes = limits.max_attachment_bytes;
+        let max_total_attachment_bytes = limits.max_total_attachment_bytes;
+        tokio::task::spawn_blocking(move || {
+            read_attachments(
+                &security,
+                &paths,
+                max_attachment_bytes,
+                max_total_attachment_bytes,
+            )
+        })
+        .await
+        .unwrap_or_else(|join_error| {
+            Err(crate::i18n::get_required_tool_string_with_args(
+                "tool-send-via-error-attachments-load-failed",
+                &[("err", &join_error.to_string())],
+            ))
+        })
     }
+}
+
+/// Read every path from the workspace, refusing the whole set as soon as one
+/// file is refused or the running total passes `max_total_attachment_bytes`.
+/// Blocking: call it from a blocking task.
+fn read_attachments(
+    security: &SecurityPolicy,
+    paths: &[String],
+    max_attachment_bytes: u64,
+    max_total_attachment_bytes: u64,
+) -> Result<Vec<MediaAttachment>, String> {
+    let mut total: u64 = 0;
+    let mut attachments = Vec::with_capacity(paths.len());
+    for path in paths {
+        let attachment = read_workspace_attachment(security, path, max_attachment_bytes)?;
+        total = total.saturating_add(attachment.data.len() as u64);
+        if total > max_total_attachment_bytes {
+            return Err(crate::i18n::get_required_tool_string_with_args(
+                "tool-send-via-error-attachments-total-too-large",
+                &[
+                    ("limit", &max_total_attachment_bytes.to_string()),
+                    ("path", path),
+                ],
+            ));
+        }
+        attachments.push(attachment);
+    }
+    Ok(attachments)
 }
 
 /// Read the optional `attachments` argument as a list of path strings. Absent or
 /// `null` means none.
-/// File-marker kinds that some channel turns into an upload when it finds
-/// `[KIND:target]` in a message's text, across every channel's own parser.
-const OUTBOUND_FILE_MARKER_KINDS: &[&str] = &[
-    "ATTACHMENT",
-    "AUDIO",
-    "DOC",
-    "DOCUMENT",
-    "FILE",
-    "GIF",
-    "IMAGE",
-    "IMG",
-    "PHOTO",
-    "VIDEO",
-    "VOICE",
-];
-
-/// The first `[KIND:target]` file marker in `body`, matched the way the
-/// channels match them (kind trimmed, any case, non-empty target).
-///
-/// A marker in a `send_via` body would let a channel upload a file outside
-/// the `attachments` argument, and so outside the peer-group opt-in, the
-/// limits and the read policy. Files go through `attachments` only.
-fn outbound_file_marker(body: &str) -> Option<&str> {
-    let mut rest = body;
-    while let Some(open) = rest.find('[') {
-        let after = &rest[open + 1..];
-        let close = after.find(']')?;
-        let inner = &after[..close];
-        if let Some((kind, target)) = inner.split_once(':') {
-            let kind = kind.trim();
-            if !target.trim().is_empty()
-                && OUTBOUND_FILE_MARKER_KINDS
-                    .iter()
-                    .any(|known| known.eq_ignore_ascii_case(kind))
-            {
-                return Some(&rest[open..open + 1 + close + 1]);
-            }
-        }
-        rest = &after[close + 1..];
-    }
-    None
-}
-
 fn attachment_paths(args: &serde_json::Value) -> Result<Vec<String>, String> {
     match args.get("attachments") {
         None | Some(serde_json::Value::Null) => Ok(Vec::new()),
@@ -349,11 +340,15 @@ fn attachment_paths(args: &serde_json::Value) -> Result<Vec<String>, String> {
             .iter()
             .map(|item| {
                 item.as_str().map(str::to_string).ok_or_else(|| {
-                    "`attachments` must be an array of file path strings".to_string()
+                    crate::i18n::get_required_tool_string(
+                        "tool-send-via-error-attachments-not-array",
+                    )
                 })
             })
             .collect(),
-        Some(_) => Err("`attachments` must be an array of file path strings".to_string()),
+        Some(_) => Err(crate::i18n::get_required_tool_string(
+            "tool-send-via-error-attachments-not-array",
+        )),
     }
 }
 
@@ -455,16 +450,22 @@ impl Tool for SendViaTool {
                 "attachments": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": format!(
-                        "Workspace file paths to attach to an immediate send. Only accepted \
-                         together with body and target; refused for routing instructions. \
-                         Paths follow the same read policy as file_read. The target channel \
-                         must support attachments and the recipient's peer group must enable \
-                         them. At most {} files, {} bytes per file, {} bytes in total; any \
-                         refused file means nothing is sent.",
-                        self.attachment_limits.max_attachments,
-                        self.attachment_limits.max_attachment_bytes,
-                        self.attachment_limits.max_total_attachment_bytes,
+                    "description": crate::i18n::get_required_tool_string_with_args(
+                        "tool-send-via-param-attachments",
+                        &[
+                            (
+                                "max_attachments",
+                                &self.attachment_limits.max_attachments.to_string(),
+                            ),
+                            (
+                                "max_attachment_bytes",
+                                &self.attachment_limits.max_attachment_bytes.to_string(),
+                            ),
+                            (
+                                "max_total_attachment_bytes",
+                                &self.attachment_limits.max_total_attachment_bytes.to_string(),
+                            ),
+                        ],
                     )
                 }
             }
@@ -521,19 +522,6 @@ impl Tool for SendViaTool {
 
         // ── Immediate send mode (body present) ───────────────────────────────
         if let Some(body) = body {
-            if let Some(marker) = outbound_file_marker(&body) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::json(json!({
-                        "status": "rejected",
-                        "reason": format!(
-                            "`body` contains the file marker `{marker}`; send files through \
-                             `attachments` instead"
-                        )
-                    })),
-                    error: None,
-                });
-            }
             let target_key = match target {
                 Some(ref t) => t.clone(),
                 None => {
@@ -587,12 +575,15 @@ impl Tool for SendViaTool {
             let attachments = if attachment_paths.is_empty() {
                 Vec::new()
             } else {
-                match self.load_attachments(
-                    &channel_key,
-                    channel.as_ref(),
-                    &peer_group,
-                    &attachment_paths,
-                ) {
+                match self
+                    .load_attachments(
+                        &channel_key,
+                        channel.as_ref(),
+                        &peer_group,
+                        &attachment_paths,
+                    )
+                    .await
+                {
                     Ok(attachments) => attachments,
                     Err(reason) => {
                         return Ok(ToolResult {
@@ -618,7 +609,8 @@ impl Tool for SendViaTool {
                 OutputModality::Text => SendMessage::new(&body, &recipient).suppress_voice(),
                 OutputModality::Mirror => SendMessage::new(&body, &recipient),
             }
-            .with_attachments(attachments);
+            .with_attachments(attachments)
+            .with_inline_attachments(false);
 
             return match channel.send(&message).await {
                 Ok(()) => {
@@ -655,8 +647,9 @@ impl Tool for SendViaTool {
                 success: false,
                 output: ToolOutput::json(json!({
                     "status": "rejected",
-                    "reason": "`attachments` need an immediate send: pass `body` and `target` \
-                               with them; a routing instruction cannot carry files"
+                    "reason": crate::i18n::get_required_tool_string(
+                        "tool-send-via-error-attachments-need-immediate-send"
+                    )
                 })),
                 error: None,
             });
@@ -1790,16 +1783,16 @@ mod tests {
         assert_eq!(sent[0].attachments[0].data, b"a");
     }
 
-    /// A file marker in `body` would let a channel upload the file outside the
-    /// attachment gates, so an immediate send refuses it and sends nothing,
-    /// whatever the case or spacing of the marker's kind.
+    /// An immediate send turns off the channel's inline attachments, so a
+    /// file marker or a bare path in `body` arrives as text and only
+    /// `attachments` can carry files.
     #[tokio::test]
-    async fn body_file_markers_are_refused() {
+    async fn immediate_send_delivers_body_as_text_without_inline_attachments() {
         for body in [
-            "report: [FILE:/workspace/out/report.pdf]",
+            "report [FILE:/x]",
             "see [ image : chart.png ]",
-            "[doc:notes.md] attached",
-            "[Attachment:secret.txt]",
+            "[IMA<tool></tool>GE:chart.png]",
+            "out/report.pdf",
         ] {
             let fx = AttachmentFixture::new();
             let ch = Arc::new(StubChannel::with_attachments("email"));
@@ -1816,33 +1809,14 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(!result.success, "{body}: {}", result.output);
-            assert!(
-                result.output.to_string().contains("attachments"),
-                "{body}: {}",
-                result.output
-            );
-            assert!(sent.read().is_empty(), "{body}");
+            assert!(result.success, "{body}: {}", result.output);
+            let sent = sent.read();
+            assert_eq!(sent.len(), 1, "{body}");
+            assert_eq!(sent[0].content, body);
+            assert!(sent[0].attachments.is_empty(), "{body}");
+            assert!(!sent[0].inline_attachments, "{body}");
         }
     }
-
-    #[test]
-    fn ordinary_brackets_are_not_file_markers() {
-        for body in [
-            "see [the report] and [1]",
-            "time [10:30] meeting",
-            "[LOCATION:51.5,-0.1]",
-            "[FILE:]",
-            "unclosed [FILE:x",
-        ] {
-            assert_eq!(outbound_file_marker(body), None, "{body}");
-        }
-        assert_eq!(
-            outbound_file_marker("a [b] [Photo:x.png] c"),
-            Some("[Photo:x.png]")
-        );
-    }
-
     #[tokio::test]
     async fn attachments_refused_in_routing_mode() {
         let fx = AttachmentFixture::new();

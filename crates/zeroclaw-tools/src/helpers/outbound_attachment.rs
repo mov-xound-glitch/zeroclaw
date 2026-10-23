@@ -26,53 +26,63 @@ pub(crate) fn read_workspace_attachment(
     max_bytes: u64,
 ) -> Result<MediaAttachment, String> {
     if path.trim().is_empty() {
-        return Err("attachment path is empty".to_string());
+        return Err(tool_text("tool-outbound-attachment-error-empty-path"));
     }
     if path.contains('\0') {
-        return Err(format!(
-            "attachment '{}' is not allowed: the path contains a NUL byte",
-            path.escape_debug()
+        return Err(tool_text_path(
+            "tool-outbound-attachment-error-nul-byte",
+            &path.escape_debug().to_string(),
         ));
     }
     if Path::new(path)
         .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
-        return Err(format!(
-            "attachment '{path}' is not allowed: '..' path components are refused"
+        return Err(tool_text_path(
+            "tool-outbound-attachment-error-parent-dir",
+            path,
         ));
     }
     if !security.is_path_allowed(path) {
-        return Err(format!(
-            "attachment '{path}' is not allowed by security policy"
+        return Err(tool_text_path(
+            "tool-outbound-attachment-error-policy",
+            path,
         ));
     }
 
     let candidate = security.resolve_tool_path(path);
     let resolved = std::fs::canonicalize(&candidate)
-        .map_err(|e| format!("attachment '{path}' cannot be resolved: {e}"))?;
+        .map_err(|e| tool_text_path_err("tool-outbound-attachment-error-resolve", path, &e))?;
     if !security.is_resolved_path_readable(&resolved) {
-        return Err(format!(
-            "attachment '{path}' is outside the readable workspace"
+        return Err(tool_text_path(
+            "tool-outbound-attachment-error-outside-readable",
+            path,
         ));
     }
     if security.is_runtime_config_path(&resolved) {
-        return Err(format!(
-            "attachment '{path}' is a runtime configuration file and cannot be sent"
+        return Err(tool_text_path(
+            "tool-outbound-attachment-error-runtime-config",
+            path,
         ));
     }
 
     let metadata = std::fs::metadata(&resolved)
-        .map_err(|e| format!("attachment '{path}' cannot be inspected: {e}"))?;
+        .map_err(|e| tool_text_path_err("tool-outbound-attachment-error-inspect", path, &e))?;
     if !metadata.is_file() {
-        return Err(format!("attachment '{path}' is not a regular file"));
+        return Err(tool_text_path(
+            "tool-outbound-attachment-error-not-regular",
+            path,
+        ));
     }
     if metadata.len() > max_bytes {
         return Err(too_large(path, metadata.len(), max_bytes));
     }
 
     let (Some(parent), Some(name)) = (resolved.parent(), resolved.file_name()) else {
-        return Err(format!("attachment '{path}' has no file name"));
+        return Err(tool_text_path(
+            "tool-outbound-attachment-error-no-file-name",
+            path,
+        ));
     };
     let file = open_absolute_dir_nofollow(parent)
         .and_then(|dir| open_file_nofollow(&dir, Path::new(name)))
@@ -81,7 +91,7 @@ pub(crate) fn read_workspace_attachment(
     let mut data = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut data)
-        .map_err(|e| format!("attachment '{path}' cannot be read: {e}"))?;
+        .map_err(|e| tool_text_path_err("tool-outbound-attachment-error-read", path, &e))?;
     let read_len = data.len() as u64;
     if read_len > max_bytes {
         return Err(too_large(path, read_len, max_bytes));
@@ -98,19 +108,43 @@ pub(crate) fn read_workspace_attachment(
 }
 
 fn too_large(path: &str, len: u64, max_bytes: u64) -> String {
-    format!("attachment '{path}' is too large: {len} bytes (limit: {max_bytes} bytes per file)")
+    crate::i18n::get_required_tool_string_with_args(
+        "tool-outbound-attachment-error-too-large",
+        &[
+            ("path", path),
+            ("len", &len.to_string()),
+            ("limit", &max_bytes.to_string()),
+        ],
+    )
 }
 
 fn boundary_error(path: &str, error: &FilesystemBoundaryError) -> String {
     match error {
-        FilesystemBoundaryError::Denied { key, .. } if key.ends_with("-symlink") => format!(
-            "attachment '{path}' was refused: a symlink appeared on its path while it was opened"
-        ),
-        FilesystemBoundaryError::Denied { .. } => {
-            format!("attachment '{path}' is not a regular file")
+        FilesystemBoundaryError::Denied { key, .. } if key.ends_with("-symlink") => {
+            tool_text_path("tool-outbound-attachment-error-symlink", path)
         }
-        FilesystemBoundaryError::Io(e) => format!("attachment '{path}' cannot be opened: {e}"),
+        FilesystemBoundaryError::Denied { .. } => {
+            tool_text_path("tool-outbound-attachment-error-not-regular", path)
+        }
+        FilesystemBoundaryError::Io(e) => {
+            tool_text_path_err("tool-outbound-attachment-error-open", path, e)
+        }
     }
+}
+
+fn tool_text(key: &str) -> String {
+    crate::i18n::get_required_tool_string(key)
+}
+
+fn tool_text_path(key: &str, path: &str) -> String {
+    crate::i18n::get_required_tool_string_with_args(key, &[("path", path)])
+}
+
+fn tool_text_path_err(key: &str, path: &str, error: &std::io::Error) -> String {
+    crate::i18n::get_required_tool_string_with_args(
+        key,
+        &[("path", path), ("err", &error.to_string())],
+    )
 }
 
 #[cfg(test)]

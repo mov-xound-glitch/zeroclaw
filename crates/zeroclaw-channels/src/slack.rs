@@ -5340,7 +5340,11 @@ impl Channel for SlackChannel {
             }
             body
         } else {
-            let (cleaned_content, markers) = parse_outbound_attachment_markers(&message.content);
+            let (cleaned_content, markers) = if message.inline_attachments {
+                parse_outbound_attachment_markers(&message.content)
+            } else {
+                (message.content.clone(), Vec::new())
+            };
             for marker in &markers {
                 outbound_attachments.push(self.resolve_outbound_attachment_marker(marker).await?);
             }
@@ -6312,7 +6316,7 @@ impl Channel for SlackChannel {
                 .map(|_| ())
                 .map_err(anyhow::Error::from)
         } else {
-            self.send(&SendMessage::new(
+            self.send(&crate::util::approval_prompt_message(
                 crate::util::build_yesno_approval_prompt(
                     &token,
                     &request.tool_name,
@@ -7727,6 +7731,179 @@ mod tests {
             err.to_string()
                 .contains("files.completeUploadExternal failed: complete_failed"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// With inline attachments off, a file marker is posted as literal text
+    /// and never resolved or uploaded, even when it is the whole message or
+    /// names a file that does not exist.
+    #[tokio::test]
+    async fn send_without_inline_attachments_posts_markers_as_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let attachment_path = tmp.path().join("report.txt");
+        tokio::fs::write(&attachment_path, b"report-bytes")
+            .await
+            .unwrap();
+        let missing_path = tmp.path().join("missing.txt");
+
+        for content in [
+            format!("Done [FILE:{}]", attachment_path.display()),
+            format!("[FILE:{}]", attachment_path.display()),
+            format!("[IMAGE:{}]", missing_path.display()),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat.postMessage"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "ts": "1710000000.000100",
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let ch = test_slack_channel(&server, tmp.path());
+            let msg = SendMessage::new(content.clone(), "C123").with_inline_attachments(false);
+
+            SlackChannel::send(&ch, &msg).await.unwrap();
+
+            let requests = server.received_requests().await.unwrap();
+            let post = requests
+                .iter()
+                .find(|req| req.url.path() == "/chat.postMessage")
+                .expect("chat.postMessage should be called");
+            let post_body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+            assert_eq!(post_body["text"], content.as_str());
+            assert!(
+                requests.iter().all(|req| {
+                    req.url.path() != "/files.getUploadURLExternal"
+                        && req.url.path() != "/files.completeUploadExternal"
+                }),
+                "{content}: nothing may be uploaded"
+            );
+        }
+    }
+
+    /// With inline attachments off, explicit attachments are still uploaded
+    /// and a marker beside them stays in the text.
+    #[tokio::test]
+    async fn send_without_inline_attachments_still_uploads_explicit_attachments() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_path = tmp.path().join("marker.txt");
+        tokio::fs::write(&marker_path, b"marker-bytes")
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "1710000000.000100",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_slack_upload_flow(
+            &server,
+            "F_EXPLICIT",
+            "/upload/explicit",
+            200,
+            serde_json::json!({"ok": true}),
+        )
+        .await;
+
+        let ch = test_slack_channel(&server, tmp.path());
+        let content = format!("See [FILE:{}]", marker_path.display());
+        let msg = SendMessage::new(content.clone(), "C123")
+            .with_attachments(vec![MediaAttachment {
+                file_name: "explicit.txt".to_string(),
+                data: b"explicit-bytes".to_vec(),
+                mime_type: Some("text/plain".to_string()),
+                marker: None,
+            }])
+            .with_inline_attachments(false);
+
+        SlackChannel::send(&ch, &msg).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let post = requests
+            .iter()
+            .find(|req| req.url.path() == "/chat.postMessage")
+            .expect("chat.postMessage should be called");
+        let post_body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        assert_eq!(post_body["text"], content.as_str());
+
+        let get_upload = requests
+            .iter()
+            .find(|req| req.url.path() == "/files.getUploadURLExternal")
+            .expect("getUploadURLExternal should be called");
+        let get_upload_body = String::from_utf8_lossy(&get_upload.body);
+        assert!(get_upload_body.contains("filename=explicit.txt"));
+        assert!(!get_upload_body.contains("marker.txt"));
+    }
+
+    /// The polling-mode approval prompt quotes the tool's arguments, so a file
+    /// marker in them is posted as text and the file is never uploaded before
+    /// the call is decided.
+    #[tokio::test]
+    async fn polling_approval_prompt_keeps_file_markers_from_arguments_as_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let attachment_path = tmp.path().join("secret.txt");
+        tokio::fs::write(&attachment_path, b"secret-bytes")
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "1710000000.000100",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = test_slack_channel(&server, tmp.path()).with_approval_timeout_secs(0);
+        let marker = format!("[FILE:{}]", attachment_path.display());
+        let request = ChannelApprovalRequest {
+            tool_name: "send_via".to_string(),
+            arguments_summary: format!("body: {marker}"),
+            raw_arguments: None,
+            position: None,
+        };
+
+        ch.request_approval_attributed("C123", &request)
+            .await
+            .expect("the prompt is delivered and the request then times out");
+
+        let requests = server.received_requests().await.unwrap();
+        let post = requests
+            .iter()
+            .find(|req| req.url.path() == "/chat.postMessage")
+            .expect("the approval prompt should be posted");
+        let post_body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        let text = post_body["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains(&marker),
+            "the marker must stay in the prompt text: {text:?}"
+        );
+        assert!(
+            requests.iter().all(|req| {
+                req.url.path() != "/files.getUploadURLExternal"
+                    && req.url.path() != "/files.completeUploadExternal"
+            }),
+            "an approval prompt must not upload files named in its arguments"
         );
     }
 

@@ -232,12 +232,19 @@ network error halfway through an upload, can still leave part of the message
 delivered. The limits are read when the tool registry is built. Reload the
 configuration after changing them.
 
-A `send_via` body may not carry file markers such as `[FILE:/path]` or
-`[IMAGE:/path]`. Several channels (among them Slack, Matrix, Telegram and
-Discord) turn those markers into uploads, which would bypass the rules above, so
-an immediate send whose body contains one is refused and nothing is sent. Files
-go through `attachments` only. Ordinary replies keep their channel's marker
-handling.
+`send_via` messages are sent with inline attachments off. Several channels
+(among them Slack, Matrix, Telegram and Discord) normally turn file markers such
+as `[FILE:/path]` or `[IMAGE:/path]`, or a message that is only a file path,
+into uploads. For a `send_via` message the built-in channels do not: markers
+and bare paths in `body` are delivered as plain text and never become uploads.
+Files go through `attachments` only. Ordinary replies keep their channel's
+marker handling.
+
+A plugin channel receives `body` as written, with no inline-attachments flag,
+because the plugin interface does not carry one. A plugin that turns markers
+into media still does so for a `send_via` message. A plugin runs in its own
+sandbox with no access to host files, so it cannot upload a file from the
+workspace this way.
 
 ## Built-in schema discovery
 
