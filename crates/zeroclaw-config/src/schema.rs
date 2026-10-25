@@ -13094,22 +13094,6 @@ pub fn validate_memory_semantics(
         ));
     }
 
-    // The proposed rerank stage was never landed, so these knobs remain inert.
-    // `DefaultMemoryStrategy::new` logs the same fact at agent start; this
-    // config-time copy reaches `config validate` and dashboard callers too.
-    if memory.rerank_enabled {
-        inert.push((
-            "memory.rerank_enabled",
-            "the rerank stage is not yet implemented",
-        ));
-    }
-    if memory.rerank_threshold != default_rerank_threshold() {
-        inert.push((
-            "memory.rerank_threshold",
-            "the rerank stage is not yet implemented",
-        ));
-    }
-
     inert
         .into_iter()
         .map(|(path, reason)| {
@@ -50814,38 +50798,30 @@ group_policy = "all"
         );
     }
 
+    /// The rerank stage is wired into memory injection, so its knobs are live
+    /// and must not be reported as having no effect.
     #[test]
-    async fn validate_memory_semantics_warns_for_rerank_enabled() {
+    async fn validate_memory_semantics_does_not_report_live_rerank_knobs() {
         let mut config = Config::default();
         config.memory.rerank_enabled = true;
-
-        let warnings = warnings_with_code(&config, INERT_MEMORY_KNOB_WARNING);
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].path, "memory.rerank_enabled");
-        assert!(
-            warnings[0].message.contains("currently has no effect"),
-            "warning should state the knob has no effect: {}",
-            warnings[0].message
-        );
-    }
-
-    #[test]
-    async fn validate_memory_semantics_warns_for_non_default_rerank_threshold() {
-        let mut config = Config::default();
         config.memory.rerank_threshold = 10;
 
-        assert_eq!(inert_knob_paths(&config), vec!["memory.rerank_threshold"]);
+        assert!(
+            inert_knob_paths(&config).is_empty(),
+            "{:?}",
+            inert_knob_paths(&config)
+        );
     }
 
     #[test]
     async fn validate_memory_semantics_reports_each_set_knob() {
         let mut config = Config::default();
-        config.memory.rerank_enabled = true;
-        config.memory.rerank_threshold = 10;
+        config.memory.retrieval_stages = vec!["fts".into()];
+        config.memory.fts_early_return_score = 0.5;
 
         assert_eq!(
             inert_knob_paths(&config),
-            vec!["memory.rerank_enabled", "memory.rerank_threshold"]
+            vec!["memory.retrieval_stages", "memory.fts_early_return_score"]
         );
     }
 
