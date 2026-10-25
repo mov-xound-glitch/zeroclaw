@@ -104,7 +104,7 @@ pub fn run(
 /// `min_relevance_score` are dropped here, so they are never sent to the
 /// endpoint. `finish` on this result is exactly what [`run`] returns for the
 /// `None` strategy, which is the fallback when the endpoint fails.
-pub fn prepare_for_external(
+pub(crate) fn prepare_for_external(
     pool: Vec<MemoryEntry>,
     config: &RerankConfig,
     is_eligible: impl Fn(&MemoryEntry) -> bool,
@@ -120,7 +120,7 @@ pub fn prepare_for_external(
 /// follow in their prepared order, and the unsent tail keeps its order after
 /// them. Scores are left untouched.
 #[must_use]
-pub fn apply_external_order(
+pub(crate) fn apply_external_order(
     candidates: Vec<MemoryEntry>,
     sent: usize,
     order: &[usize],
@@ -141,7 +141,7 @@ pub fn apply_external_order(
 
 /// Trim a prepared or reordered pool to the configured final limit.
 #[must_use]
-pub fn finish(mut candidates: Vec<MemoryEntry>, config: &RerankConfig) -> Vec<MemoryEntry> {
+pub(crate) fn finish(mut candidates: Vec<MemoryEntry>, config: &RerankConfig) -> Vec<MemoryEntry> {
     candidates.truncate(bounded_final_limit(config.final_limit));
     candidates
 }

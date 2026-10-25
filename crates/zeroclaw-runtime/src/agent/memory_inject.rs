@@ -375,7 +375,9 @@ pub async fn render_memory_context(
         };
         entries = match (&cfg.external_rerank, cfg.rerank.strategy) {
             (Some(external), rerank::RerankStrategy::External) => {
-                external_rerank(entries, cfg, external, is_eligible, user_msg, &turn).await
+                external
+                    .rerank_pool(entries, &cfg.rerank, is_eligible, user_msg, turn.turn_id)
+                    .await
             }
             _ => rerank::run(entries, &cfg.rerank, is_eligible),
         };
@@ -440,80 +442,6 @@ pub async fn render_memory_context(
     }
 
     context
-}
-
-/// The external rerank step: prepare the pool deterministically (floor
-/// included), send its head to the endpoint, and select from the returned
-/// order. Any failure keeps the prepared order, which is the block the
-/// `none` strategy renders. The record names the reason and the candidate
-/// count, never memory text.
-async fn external_rerank(
-    entries: Vec<MemoryEntry>,
-    cfg: &MemoryInjectConfig,
-    external: &zeroclaw_memory::ExternalRerankSettings,
-    is_eligible: impl Fn(&MemoryEntry) -> bool,
-    query: &str,
-    turn: &TurnMeta<'_>,
-) -> Vec<MemoryEntry> {
-    let prepared = rerank::prepare_for_external(entries, &cfg.rerank, is_eligible);
-    // Nothing to order with fewer than two candidates, and the strategy runs
-    // only once the pool reaches the configured threshold, as `run` does.
-    if prepared.len() < 2 || prepared.len() < cfg.rerank.threshold {
-        return rerank::finish(prepared, &cfg.rerank);
-    }
-    let sent = prepared
-        .len()
-        .min(external.max_candidates)
-        .min(rerank::bounded_pool_cap(
-            cfg.rerank.final_limit,
-            cfg.rerank.candidate_pool_cap,
-        ));
-    let documents: Vec<&str> = prepared[..sent]
-        .iter()
-        .map(|entry| entry.content.as_str())
-        .collect();
-
-    let started = Instant::now();
-    match external.rerank(query, &documents).await {
-        Ok(order) => {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "candidates": sent,
-                        "ranked": order.len(),
-                        "elapsed_ms": started.elapsed().as_millis(),
-                        "turn_id": turn.turn_id,
-                    })),
-                "memory external rerank applied"
-            );
-            rerank::finish(
-                rerank::apply_external_order(prepared, sent, &order),
-                &cfg.rerank,
-            )
-        }
-        Err(failure) => {
-            let status = match failure {
-                zeroclaw_memory::RerankFailure::Status(code) => Some(code),
-                _ => None,
-            };
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "reason": failure.reason(),
-                        "status": status,
-                        "candidates": sent,
-                        "elapsed_ms": started.elapsed().as_millis(),
-                        "turn_id": turn.turn_id,
-                    })),
-                "memory external rerank failed; kept the local order"
-            );
-            rerank::finish(prepared, &cfg.rerank)
-        }
-    }
 }
 
 /// Strip a `render_memory_context` preamble off the front of `content`.

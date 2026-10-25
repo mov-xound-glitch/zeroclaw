@@ -7,11 +7,14 @@
 //! Jina-style APIs share: a request `{query, documents, top_n, model?}` and a
 //! reply `{results: [{index, relevance_score}]}`.
 //!
-//! The client only orders. Every failure is returned as a [`RerankFailure`]
-//! so the caller can keep its local order; nothing here logs memory text.
+//! The client only orders. [`ExternalRerankSettings::rerank_pool`] runs the
+//! whole external strategy over a recall pool and falls back to the local
+//! order on any failure; nothing here logs memory text.
 
+use crate::rerank::{self, RerankConfig};
+use crate::traits::MemoryEntry;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Longest text sent for the query or for one candidate, in characters.
 pub const MAX_RERANK_TEXT_CHARS: usize = 1_500;
@@ -67,19 +70,99 @@ impl RerankFailure {
 impl ExternalRerankSettings {
     /// The URL the request goes to. An endpoint whose path already ends in
     /// `/rerank` is used as given; one with another explicit path gets
-    /// `/rerank` appended; a bare origin gets `/v1/rerank`.
+    /// `/rerank` appended; a bare origin gets `/v1/rerank`. Only the path
+    /// changes, so a query string stays where it was.
     #[must_use]
     pub fn rerank_url(&self) -> String {
-        let base = self.endpoint.trim().trim_end_matches('/');
-        let path = reqwest::Url::parse(base)
-            .map(|url| url.path().trim_end_matches('/').to_string())
-            .unwrap_or_default();
-        if path.ends_with("/rerank") {
-            base.to_string()
-        } else if path.is_empty() || path == "/" {
-            format!("{base}/v1/rerank")
+        let endpoint = self.endpoint.trim();
+        let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+            // Config validation rejects this; the request then fails as a
+            // transport error and the local order is kept.
+            return endpoint.to_string();
+        };
+        let path = url.path().trim_end_matches('/').to_string();
+        let route = if path.ends_with("/rerank") {
+            path
+        } else if path.is_empty() {
+            "/v1/rerank".to_string()
         } else {
-            format!("{base}/rerank")
+            format!("{path}/rerank")
+        };
+        url.set_path(&route);
+        url.to_string()
+    }
+
+    /// The external strategy over a recall pool: prepare it as
+    /// [`rerank::run`] does (floor included), send the head to the endpoint,
+    /// and select from the returned order. Any failure keeps the prepared
+    /// order, which is what the `none` strategy returns. The record names the
+    /// reason and the candidate count, never memory text.
+    pub async fn rerank_pool(
+        &self,
+        pool: Vec<MemoryEntry>,
+        config: &RerankConfig,
+        is_eligible: impl Fn(&MemoryEntry) -> bool,
+        query: &str,
+        turn_id: &str,
+    ) -> Vec<MemoryEntry> {
+        let prepared = rerank::prepare_for_external(pool, config, is_eligible);
+        // Nothing to order with fewer than two candidates, and the strategy
+        // runs only once the pool reaches the configured threshold, as `run`
+        // does.
+        if prepared.len() < 2 || prepared.len() < config.threshold {
+            return rerank::finish(prepared, config);
+        }
+        let sent = prepared
+            .len()
+            .min(self.max_candidates)
+            .min(rerank::bounded_pool_cap(
+                config.final_limit,
+                config.candidate_pool_cap,
+            ));
+        let documents: Vec<&str> = prepared[..sent]
+            .iter()
+            .map(|entry| entry.content.as_str())
+            .collect();
+
+        let started = Instant::now();
+        match self.rerank(query, &documents).await {
+            Ok(order) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Memory)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({
+                            "candidates": sent,
+                            "ranked": order.len(),
+                            "elapsed_ms": started.elapsed().as_millis(),
+                            "turn_id": turn_id,
+                        })),
+                    "memory external rerank applied"
+                );
+                rerank::finish(rerank::apply_external_order(prepared, sent, &order), config)
+            }
+            Err(failure) => {
+                let status = match failure {
+                    RerankFailure::Status(code) => Some(code),
+                    _ => None,
+                };
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Memory)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "reason": failure.reason(),
+                            "status": status,
+                            "candidates": sent,
+                            "elapsed_ms": started.elapsed().as_millis(),
+                            "turn_id": turn_id,
+                        })),
+                    "memory external rerank failed; kept the local order"
+                );
+                rerank::finish(prepared, config)
+            }
         }
     }
 
@@ -104,7 +187,7 @@ impl ExternalRerankSettings {
         }
 
         let client = zeroclaw_config::schema::build_runtime_proxy_client(RERANK_PROXY_SERVICE_KEY);
-        let response = client
+        let mut response = client
             .post(self.rerank_url())
             .timeout(self.timeout)
             .json(&body)
@@ -121,9 +204,14 @@ impl ExternalRerankSettings {
         {
             return Err(RerankFailure::Malformed);
         }
-        let bytes = response.bytes().await.map_err(classify_error)?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(RerankFailure::Malformed);
+        // Read in chunks so a reply without a length, or with a false one,
+        // is refused before it grows past the cap.
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(classify_error)? {
+            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(RerankFailure::Malformed);
+            }
+            bytes.extend_from_slice(&chunk);
         }
         parse_order(&bytes, documents.len())
     }
@@ -218,6 +306,54 @@ mod tests {
             settings("http://127.0.0.1:8098/v1/rerank").rerank_url(),
             "http://127.0.0.1:8098/v1/rerank"
         );
+    }
+
+    #[test]
+    fn a_query_string_stays_after_the_route() {
+        assert_eq!(
+            settings("https://rank.example/api?tenant=blue").rerank_url(),
+            "https://rank.example/api/rerank?tenant=blue"
+        );
+        assert_eq!(
+            settings("https://rank.example/?tenant=blue").rerank_url(),
+            "https://rank.example/v1/rerank?tenant=blue"
+        );
+        assert_eq!(
+            settings("https://rank.example/v1/rerank/?tenant=blue").rerank_url(),
+            "https://rank.example/v1/rerank?tenant=blue"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_over_the_cap_without_a_length_is_refused() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+            );
+            let chunk = vec![b' '; 64 * 1024];
+            for _ in 0..(MAX_RESPONSE_BYTES / chunk.len() + 2) {
+                let header = format!("{:x}\r\n", chunk.len());
+                if stream.write_all(header.as_bytes()).is_err()
+                    || stream.write_all(&chunk).is_err()
+                    || stream.write_all(b"\r\n").is_err()
+                {
+                    return;
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+        });
+
+        let result = settings(&format!("http://{address}"))
+            .rerank("query", &["one", "two"])
+            .await;
+        assert_eq!(result, Err(RerankFailure::Malformed));
+        server.join().unwrap();
     }
 
     #[test]
