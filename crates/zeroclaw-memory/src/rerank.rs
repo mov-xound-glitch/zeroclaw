@@ -37,10 +37,10 @@ pub enum RerankStrategy {
         lambda: f64,
     },
     /// Order the prepared pool by an operator-configured rerank endpoint.
-    /// The call is async and lives with the caller: [`run`] treats this
-    /// strategy as [`RerankStrategy::None`], which is exactly the result the
-    /// caller falls back to when the endpoint fails. The external path uses
-    /// [`prepare_for_external`], [`apply_external_order`] and [`finish`].
+    /// The call is async, so it runs in
+    /// [`ExternalRerankSettings::rerank_pool`](crate::ExternalRerankSettings::rerank_pool):
+    /// [`run`] treats this strategy as [`RerankStrategy::None`], which is
+    /// exactly the result that path falls back to when the endpoint fails.
     External,
 }
 
