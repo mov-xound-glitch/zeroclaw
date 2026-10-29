@@ -18,7 +18,7 @@ use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd, html};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::DnsName;
 use sha2::{Digest, Sha256};
@@ -1009,8 +1009,13 @@ fn markdown_to_html(md: &str, image_domains: &[String]) -> String {
             dropping_image = false;
             None
         }
-        Event::Start(Tag::Link { ref dest_url, .. }) => {
-            let allowed = link_target_allowed(dest_url);
+        Event::Start(Tag::Link {
+            link_type,
+            ref dest_url,
+            ..
+        }) => {
+            // An email autolink carries the bare address; the writer adds `mailto:`.
+            let allowed = link_type == LinkType::Email || link_target_allowed(dest_url);
             dropped_links.push(!allowed);
             allowed.then_some(event)
         }
@@ -2522,6 +2527,15 @@ mod tests {
         assert!(!out.contains("javascript"), "{out}");
         assert!(out.contains("click"), "{out}");
         assert!(out.contains("href=\"https://example.invalid\""), "{out}");
+    }
+
+    #[test]
+    fn email_autolinks_stay_clickable() {
+        let out = html("Write to <person@example.invalid>.");
+        assert!(
+            out.contains("href=\"mailto:person@example.invalid\""),
+            "{out}"
+        );
     }
 
     #[test]
