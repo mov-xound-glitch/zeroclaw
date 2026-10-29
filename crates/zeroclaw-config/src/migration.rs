@@ -244,7 +244,8 @@ pub fn migrate_to_current_resilient(input: &str) -> Config {
 /// Salvage still drops them (so the daemon boots) but logs ERROR and reports
 /// them in [`ResilientLoad::dropped_security`] for exposure gating.
 /// `tools.send_via` is here because its defaults are looser than a tightened
-/// limit, such as `max_attachments = 0`.
+/// limit, such as `max_attachments = 0`. Dropping a parent, such as the whole
+/// `[tools]` table, counts as dropping a nested path the document had set.
 pub const SECURITY_CRITICAL_KEYS: &[&str] = &[
     "security",
     "risk_profiles",
@@ -357,6 +358,7 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
         };
     }
 
+    let nested_security = present_nested_security_paths(&value);
     let mut salvaged = value;
     let mut dropped: Vec<String> = Vec::new();
     prune_bad_channel_aliases(&mut salvaged, &mut dropped);
@@ -389,7 +391,11 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
         dropped_security.push(WHOLE_CONFIG_SENTINEL.to_string());
     }
     for path in dropped {
-        if SECURITY_CRITICAL_KEYS.contains(&path.as_str()) {
+        let loses_nested = nested_security.iter().any(|key| {
+            key.strip_prefix(path.as_str())
+                .is_some_and(|rest| rest.starts_with('.'))
+        });
+        if SECURITY_CRITICAL_KEYS.contains(&path.as_str()) || loses_nested {
             dropped_security.push(path);
         } else {
             dropped_plain.push(path);
@@ -430,6 +436,21 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
         dropped: dropped_plain,
         dropped_security,
     }
+}
+
+/// Nested [`SECURITY_CRITICAL_KEYS`] paths, such as `tools.send_via`, that the
+/// document sets before salvage. Dropping their parent section loses them too.
+fn present_nested_security_paths(value: &toml::Value) -> Vec<&'static str> {
+    SECURITY_CRITICAL_KEYS
+        .iter()
+        .copied()
+        .filter(|key| key.contains('.'))
+        .filter(|key| {
+            key.split('.')
+                .try_fold(value, |node, part| node.get(part))
+                .is_some()
+        })
+        .collect()
 }
 
 /// Drop top-level `[section]`s that block deserialization (each → `Default`).
@@ -1078,6 +1099,26 @@ mod tests {
                 crate::schema::SendViaToolConfig::default().max_attachments
             );
         }
+    }
+
+    #[test]
+    fn dropping_the_tools_table_with_send_via_set_is_degraded_security() {
+        for tools in [
+            "[tools]\noptional = \"bad\"\n[tools.send_via]\nmax_attachments = 0\n",
+            "[tools]\noptional = []\nsend_via = 5\n",
+            "[tools]\nsend_via = \"off\"\n",
+        ] {
+            let raw = format!("schema_version = 3\n{tools}");
+            assert!(migrate_to_current(&raw).is_err(), "{raw}");
+            let salvaged = migrate_to_current_salvaged(&raw);
+            assert!(salvaged.dropped.is_empty(), "{raw}");
+            assert_eq!(salvaged.dropped_security, ["tools"], "{raw}");
+        }
+
+        let raw = "schema_version = 3\n[tools]\noptional = \"bad\"\n";
+        let salvaged = migrate_to_current_salvaged(raw);
+        assert_eq!(salvaged.dropped, ["tools"]);
+        assert!(salvaged.dropped_security.is_empty());
     }
 
     #[test]
