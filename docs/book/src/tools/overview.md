@@ -214,7 +214,8 @@ hold, or the call is refused and nothing is sent:
 - Every path passes the same read policy as `file_read`: relative paths resolve
   from the workspace, `..` components are refused, symlinks are resolved before
   the check, and the file must be inside the workspace or a readable allowed
-  root. Runtime configuration files such as `config.toml` are always refused.
+  root. Runtime configuration files such as `config.toml` are refused by path;
+  a copy or hard link inside the workspace is not recognised.
   Each path must name a regular file.
 - The call stays within the limits in `[tools.send_via]`:
 

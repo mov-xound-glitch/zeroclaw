@@ -1060,6 +1060,7 @@ mod tests {
             "max_attachments = \"x\"\n",
             "max_attachment_bytes = \"10MiB\"\n",
             "max_total_attachment_bytes = -1\n",
+            "max_attachment_byte = 1048576\n",
         ] {
             let raw =
                 format!("schema_version = 3\n[tools]\noptional = []\n[tools.send_via]\n{limits}");

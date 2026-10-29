@@ -10476,6 +10476,7 @@ impl Default for FileUploadBundleConfig {
 /// that exceeds any limit sends nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 #[prefix = "tools.send_via"]
 pub struct SendViaToolConfig {
     /// Maximum number of files attached to one `send_via` call. Default: 10.
