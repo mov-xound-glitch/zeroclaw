@@ -7452,12 +7452,14 @@ schedule = { kind = "every", every_ms = 300000 }
                 "CREATE TABLE warmup (x INTEGER); BEGIN IMMEDIATE; INSERT INTO warmup VALUES (1);",
             )
             .unwrap();
+        // Started before the release thread, so a slow spawn can only make
+        // the measured wait longer, never shorter than the writer's hold.
+        let started = std::time::Instant::now();
         let release = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
             holder.execute_batch("COMMIT").unwrap();
         });
 
-        let started = std::time::Instant::now();
         let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok");
         let waited = started.elapsed();
         release.join().unwrap();
