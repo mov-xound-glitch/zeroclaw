@@ -226,6 +226,11 @@ max_attachment_bytes = 10485760            # 10 MiB per file
 max_total_attachment_bytes = 20971520      # 20 MiB per call
 ```
 
+An unknown key or a wrong value in this table is handled like a broken
+security section: the defaults may be looser than a limit you tightened, such
+as `max_attachments = 0`, so the daemon refuses to start until the table is
+fixed, or until it is started with `--allow-degraded-security`.
+
 Sizes are checked on the bytes actually read. Every file is checked and loaded
 before the message is sent, so one refused file means no message and no partial
 delivery. A failure in the channel itself after sending has started, such as a

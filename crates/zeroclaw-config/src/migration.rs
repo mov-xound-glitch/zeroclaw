@@ -239,10 +239,12 @@ pub fn migrate_to_current_resilient(input: &str) -> Config {
     migrate_to_current_salvaged(input).config
 }
 
-/// Top-level keys whose silent loss could *weaken* security posture: dropping
+/// Section paths whose silent loss could *weaken* security posture: dropping
 /// a malformed one to its `Default` may grant a broader posture than intended.
 /// Salvage still drops them (so the daemon boots) but logs ERROR and reports
 /// them in [`ResilientLoad::dropped_security`] for exposure gating.
+/// `tools.send_via` is here because its defaults are looser than a tightened
+/// limit, such as `max_attachments = 0`.
 pub const SECURITY_CRITICAL_KEYS: &[&str] = &[
     "security",
     "risk_profiles",
@@ -250,6 +252,7 @@ pub const SECURITY_CRITICAL_KEYS: &[&str] = &[
     "users",
     "oidc",
     "permission_profiles",
+    "tools.send_via",
 ];
 
 pub const WHOLE_CONFIG_SENTINEL: &str = "<entire-config>";
@@ -1061,14 +1064,15 @@ mod tests {
             "max_attachment_bytes = \"10MiB\"\n",
             "max_total_attachment_bytes = -1\n",
             "max_attachment_byte = 1048576\n",
+            "max_attachments = 0\nmax_attachment_byte = 1048576\n",
         ] {
             let raw =
                 format!("schema_version = 3\n[tools]\noptional = []\n[tools.send_via]\n{limits}");
             assert!(migrate_to_current(&raw).is_err(), "{raw}");
             let salvaged = migrate_to_current_salvaged(&raw);
             assert!(salvaged.config.tools.optional.is_empty(), "{raw}");
-            assert_eq!(salvaged.dropped, ["tools.send_via"], "{raw}");
-            assert!(salvaged.dropped_security.is_empty(), "{raw}");
+            assert!(salvaged.dropped.is_empty(), "{raw}");
+            assert_eq!(salvaged.dropped_security, ["tools.send_via"], "{raw}");
             assert_eq!(
                 salvaged.config.tools.send_via.max_attachments,
                 crate::schema::SendViaToolConfig::default().max_attachments
