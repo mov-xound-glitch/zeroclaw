@@ -501,11 +501,15 @@ impl Tool for SkillBuiltinTool {
         if crate::security::channel_restriction::active_restriction_excludes(
             self.target_tool.name(),
         ) {
-            return Ok(ToolResult::err(format!(
-                "Tool not available in this turn: {} runs {}, which this channel excludes",
-                self.tool_name,
-                self.target_tool.name()
-            )));
+            return Ok(ToolResult::err(
+                crate::i18n::get_required_cli_string_with_args(
+                    "skill-tool-target-excluded",
+                    &[
+                        ("tool", self.tool_name.as_str()),
+                        ("target", self.target_tool.name()),
+                    ],
+                ),
+            ));
         }
         let merged = merge_locked_args(&self.locked_args, args);
         self.target_tool.execute_with_context(merged, context).await
