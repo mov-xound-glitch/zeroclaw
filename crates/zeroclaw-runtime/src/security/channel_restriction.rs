@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use zeroclaw_api::tool::Tool;
 
 /// Tools that start work a task-carried restriction cannot follow: work that
 /// runs later (cron, schedule, SOP steps), as another agent (peer, A2A,
@@ -88,9 +89,108 @@ pub fn merge_active_channel_restriction(excluded_tools: &[String]) -> Option<Vec
     Some(merged)
 }
 
+/// True when the channel restriction this task runs under excludes `tool`.
+#[must_use]
+pub fn active_restriction_excludes(tool: &str) -> bool {
+    CHANNEL_TOOL_RESTRICTION
+        .try_with(|restriction| restriction.iter().any(|name| same_tool(name, tool)))
+        .unwrap_or(false)
+}
+
+/// Add to `excluded` every tool in `tools` that wraps an excluded tool under
+/// another name, such as a skill's builtin wrapper of an excluded
+/// `http_request`. The turn then neither offers nor lists what it would
+/// refuse to run.
+pub fn exclude_wrappers_of_excluded(tools: &[Box<dyn Tool>], excluded: &mut Vec<String>) {
+    let wrappers: Vec<String> = tools
+        .iter()
+        .filter(|tool| {
+            tool.wrapped_tool_name()
+                .is_some_and(|target| excluded.iter().any(|name| same_tool(name, target)))
+        })
+        .map(|tool| tool.name().to_string())
+        .collect();
+    excluded.extend(wrappers);
+    excluded.sort();
+    excluded.dedup();
+}
+
+fn same_tool(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool that runs `wraps` under its own name, like a skill wrapper.
+    struct Wrapper {
+        name: &'static str,
+        wraps: Option<&'static str>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for Wrapper {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Wrapper {
+        fn wrapped_tool_name(&self) -> Option<&str> {
+            self.wraps
+        }
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "wrapper"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            Ok(zeroclaw_api::tool::ToolResult::ok("ran"))
+        }
+    }
+
+    #[test]
+    fn wrappers_of_an_excluded_tool_are_excluded_with_it() {
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(Wrapper {
+                name: "ops__fetch",
+                wraps: Some("HTTP_request"),
+            }),
+            Box::new(Wrapper {
+                name: "ops__read",
+                wraps: Some("file_read"),
+            }),
+            Box::new(Wrapper {
+                name: "shell",
+                wraps: None,
+            }),
+        ];
+        let mut excluded = vec!["http_request".to_string()];
+        exclude_wrappers_of_excluded(&tools, &mut excluded);
+        assert_eq!(excluded, vec!["http_request", "ops__fetch"]);
+    }
+
+    #[tokio::test]
+    async fn the_active_restriction_answers_by_tool_name() {
+        assert!(!active_restriction_excludes("shell"));
+        let restriction: Arc<[String]> = vec!["shell".to_string()].into();
+        with_channel_tool_restriction(restriction, async {
+            assert!(active_restriction_excludes(" Shell "));
+            assert!(!active_restriction_excludes("file_read"));
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn no_restriction_outside_a_channel_turn() {

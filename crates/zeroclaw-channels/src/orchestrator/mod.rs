@@ -3934,7 +3934,8 @@ fn channel_tool_restriction(
 
 /// Tools a channel turn may not use: the risk profile's exclusions (lifted
 /// for CLI turns and `Full` autonomy, as before) plus the channel instance's
-/// restriction ([`channel_tool_restriction`]).
+/// restriction ([`channel_tool_restriction`]), and the skill wrappers of any
+/// tool on that list.
 fn channel_turn_excluded_tools(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -3947,8 +3948,10 @@ fn channel_turn_excluded_tools(
             ctx.non_cli_excluded_tools.as_ref().clone()
         };
     excluded.extend(restriction.iter().cloned());
-    excluded.sort();
-    excluded.dedup();
+    zeroclaw_runtime::security::channel_restriction::exclude_wrappers_of_excluded(
+        ctx.tools_registry.as_ref(),
+        &mut excluded,
+    );
     excluded
 }
 
@@ -43573,6 +43576,49 @@ BTC is currently around $65,000 based on latest tool output."#
                 .any(|t| t == "delegate" || t == "spawn_subagent")
         );
         // An instance that restricts nothing keeps every tool.
+        assert!(turn_excluded(&ctx, &turn_from("email", Some("other"))).is_empty());
+    }
+
+    #[test]
+    fn a_channel_exclusion_drops_the_skill_wrappers_of_an_excluded_tool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = excluded_tools_ctx(
+            tmp.path(),
+            &["http_request"],
+            &[],
+            AutonomyLevel::Supervised,
+        );
+        let wrapper = |name: &str, target: &'static str| -> Box<dyn Tool> {
+            let manifest = zeroclaw_runtime::skills::SkillTool {
+                name: name.into(),
+                description: "skill wrapper".into(),
+                kind: "builtin".into(),
+                command: String::new(),
+                args: HashMap::new(),
+                target: Some(target.into()),
+                locked_args: HashMap::new(),
+                timeout_secs: None,
+            };
+            Box::new(zeroclaw_runtime::tools::SkillBuiltinTool::new(
+                "ops",
+                &manifest,
+                Arc::new(NamedMockTool(target)),
+                HashMap::new(),
+            ))
+        };
+        ctx.tools_registry = Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                Box::new(NamedMockTool("http_request")),
+                wrapper("fetch", "http_request"),
+                wrapper("read", "file_read"),
+            ]),
+        );
+
+        assert_eq!(
+            turn_excluded(&ctx, &turn_from("email", Some("assistant"))),
+            vec!["http_request", "ops__fetch"],
+        );
+        // An instance that excludes nothing keeps the wrapper.
         assert!(turn_excluded(&ctx, &turn_from("email", Some("other"))).is_empty());
     }
 

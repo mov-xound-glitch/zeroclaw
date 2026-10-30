@@ -5367,6 +5367,10 @@ impl Tool for ToolArcRef {
         self.inner.requires_unrestricted_principal()
     }
 
+    fn wrapped_tool_name(&self) -> Option<&str> {
+        self.inner.wrapped_tool_name()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
